@@ -667,7 +667,8 @@ private:
                 ui_message_ = "HW Slot " + std::to_string(hw_emu_slot_ + 1);
                 render_all();
             } else if (kind == nfc_app::DeviceKind::GroveNFC ||
-                       kind == nfc_app::DeviceKind::NFCUnit) {
+                       kind == nfc_app::DeviceKind::NFCUnit ||
+                       kind == nfc_app::DeviceKind::ST25RNFC) {
                 // Scroll entire right panel content (header + dump) as one block
                 const int delta = (raw_key == KEY_X) ? 1 : -1;
                 auto dump_lines = service_.i2c_emulator_dump_lines(service_.current_emulator_protocol());
@@ -2853,14 +2854,11 @@ private:
             const bool is_grove_or_nfcunit =
                 !is_st25r && (emu_device_kind == nfc_app::DeviceKind::GroveNFC || is_nfc_unit);
             create_text(left, 6, 4,  is_st25r ? "SPI EMU" : "SW EMU", is_st25r ? 0x00B4FF : 0x00FF88, 12);
-            if (is_st25r) {
-                create_text(left, 6, 18, "Profile mode", 0xFFFFFF, 12);
-            } else {
-                create_text(left, 6, 18, proto_name.c_str(), 0xFFFFFF, 12);
-            }
-            create_text(left, 6, 38, is_st25r ? "Tab:profile" : "Tab:proto", 0xD8D8D8, 10);
+            create_text(left, 6, 18, proto_name.c_str(), 0xFFFFFF, 12);
+            create_text(left, 6, 38, "Tab:proto", 0xD8D8D8, 10);
             if (is_st25r) {
                 create_text(left, 6, 50, "OK:start", 0xF7A600, 10);
+                create_text(left, 6, 62, "P:stop", 0xD8D8D8, 10);
             } else {
                 create_text(left, 6, 50, "F/X:scroll", 0xD8D8D8, 10);
                 create_text(left, 6, 62, "OK:menu", 0xF7A600, 10);
@@ -2868,20 +2866,69 @@ private:
             create_text(left, 6, 80, is_st25r ? "M5 NFC CAP SPI" : (is_nfc_unit ? "NFC Unit I2C" : "GroveNFC I2C"), is_st25r ? 0x00B4FF : 0x00FF88, 10);
 
             if (is_st25r) {
-                create_text(right, 6, 4, service_.spi_profile_label().c_str(), 0x00D2FF, 12);
-                const int spi_profile = service_.spi_profile_index();
-                const bool running = service_.spi_listener_active();
-                create_text(right, 6, 20, "S:start P:stop OK:menu", 0xD8D8D8, 10);
-                create_text(right, 6, 34, running ? "Status: RUNNING" : "Status: READY", running ? 0x00FF88 : 0x9E9E9E, 10);
-                if (spi_profile == 0) {
-                    create_text(right, 6, 52, "UID:11223344 ATQA:0004", 0x9E9E9E, 10);
-                    create_text(right, 6, 66, "SAK:08 (MFC profile)", 0x9E9E9E, 10);
-                } else if (spi_profile == 1) {
-                    create_text(right, 6, 52, "UID:04512233445566", 0x9E9E9E, 10);
-                    create_text(right, 6, 66, "ATQA:0044 SAK:00", 0x9E9E9E, 10);
+                // SPI EMU: same dump format as I2C with ASCII + scrolling
+                service_.load_spi_ntag_memory_if_empty();  // eager load from JSON
+                const auto &mem = service_.spi_ntag_memory();
+                const size_t pages = mem.size() / 4;
+
+                // Build dump_lines from memory (same "pp:HEX" format as I2C)
+                std::vector<std::string> dump_lines;
+                std::string uid_str;
+                for (size_t p = 0; p < pages; ++p) {
+                    char line[32];
+                    std::snprintf(line, sizeof(line), "%02zu:%02X%02X%02X%02X",
+                                  p, mem[p*4], mem[p*4+1], mem[p*4+2], mem[p*4+3]);
+                    dump_lines.push_back(line);
+                }
+                if (pages >= 2) {
+                    char u[16];
+                    std::snprintf(u, sizeof(u), "%02X%02X%02X%02X%02X%02X%02X",
+                                  mem[0], mem[1], mem[2], mem[4], mem[5], mem[6], mem[7]);
+                    uid_str = u;
+                }
+                if (uid_str.empty()) uid_str = "-";
+
+                // Same ContentLine + render as I2C below (see is_grove_or_nfcunit)
+                struct ContentLine { std::string text; uint32_t color; bool mono; };
+                std::vector<ContentLine> lines;
+                lines.push_back({service_.spi_profile_label(), 0x00D2FF, true});
+                lines.push_back({std::string("UID:") + uid_str, 0x00D2FF, true});
+                if (!uid_str.empty() && uid_str != "-") {
+                    lines.push_back({"ATQA:0044 SAK:00", 0xD8D8D8, true});
+                }
+                lines.push_back({"Dump:", 0x9E9E9E, true});
+
+                if (dump_lines.empty()) {
+                    lines.push_back({"(no dump data)", 0x666666, true});
                 } else {
-                    create_text(right, 6, 52, "UID:0452A1B2C3D4E5", 0x9E9E9E, 10);
-                    create_text(right, 6, 66, "ATQA:0044 SAK:00", 0x9E9E9E, 10);
+                    for (size_t i = 0; i < dump_lines.size(); ++i) {
+                        const std::string &raw = dump_lines[i];
+                        size_t colon = raw.find(':');
+                        std::string hex = (colon != std::string::npos) ? raw.substr(colon + 1) : raw;
+                        // ASCII column
+                        std::string ascii = "|";
+                        std::string pure;
+                        for (char c : hex) if (std::isxdigit((unsigned char)c)) pure += (char)std::toupper((unsigned char)c);
+                        for (size_t bi = 0; bi + 1 < pure.size(); bi += 2) {
+                            unsigned long v = std::strtoul(pure.substr(bi, 2).c_str(), nullptr, 16);
+                            char ch = static_cast<char>(v & 0xFF);
+                            ascii += (ch >= 32 && ch <= 126) ? ch : '.';
+                        }
+                        lines.push_back({raw + " " + ascii, 0xC0C0C0, true});
+                    }
+                }
+
+                // Scroll & render (same as I2C)
+                static constexpr int ROW_H = 9;
+                static constexpr int PANEL_H = 104;
+                const int MAX_VISIBLE = (PANEL_H - 4) / ROW_H;
+                int total = (int)lines.size();
+                int max_scroll = std::max(0, total - MAX_VISIBLE);
+                int scroll = std::max(0, std::min(emu_dump_scroll_, max_scroll));
+                for (int i = 0; i < MAX_VISIBLE && (scroll + i) < total; ++i) {
+                    const auto &l = lines[scroll + i];
+                    int y = 2 + i * ROW_H;
+                    create_text_mono(right, 4, y, l.text.c_str(), l.color, 7);
                 }
             } else if (is_grove_or_nfcunit) {
                 // Show card info + dump blocks — all content scrolls as one block
@@ -3018,7 +3065,8 @@ private:
 
         std::string footer_text = ui_message_;
         if (emu_device_kind == nfc_app::DeviceKind::GroveNFC ||
-            emu_device_kind == nfc_app::DeviceKind::NFCUnit) {
+            emu_device_kind == nfc_app::DeviceKind::NFCUnit ||
+            emu_device_kind == nfc_app::DeviceKind::ST25RNFC) {
             footer_text = "Load from " + emulator_source_filename(protocol);
         }
         create_footer(parent, footer_text);

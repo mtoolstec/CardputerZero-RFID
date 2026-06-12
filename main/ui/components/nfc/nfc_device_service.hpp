@@ -2401,6 +2401,33 @@ public:
             if (error) *error = "Unknown SPI profile";
             return false;
         }
+
+        // Load NTAG memory for NTAG profiles
+        const ProtocolKind proto = spi_profile_protocol_for_index(profile);
+        if (proto == ProtocolKind::Iso14443A) {
+            // Try loading from emulator JSON first, then fall back to default
+            std::vector<uint8_t> mem = storage_.load_ntag_emulator_memory();
+            if (mem.empty()) {
+                // Generate default NTAG memory with URI
+                const size_t pages = (profile == 1) ? kNfcUnitNtag213Pages : 135; // NTAG213=45, NTAG215=135
+                std::string uri = "https://m5stack.com";
+                mem = default_nfcunit_ntag_memory(pages, uri);
+                // Override UID bytes with profile UID
+                for (size_t i = 0; i < uid.size() && i < 9; ++i) mem[i] = uid[i];
+                // Fix BCC for the new UID
+                const uint8_t bcc0 = static_cast<uint8_t>(0x88 ^ uid[0] ^ uid[1] ^ uid[2]);
+                mem[3] = bcc0;
+                if (uid.size() == 7) {
+                    const uint8_t bcc1 = static_cast<uint8_t>(uid[3] ^ uid[4] ^ uid[5] ^ uid[6]);
+                    mem[8] = bcc1;
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                spi_ntag_mem_ = std::move(mem);
+            }
+        }
+
         return spi_start_listener_a(uid, atqa, sak, error);
     }
 
@@ -2477,6 +2504,28 @@ public:
     {
         std::lock_guard<std::mutex> lock(mutex_);
         return spi_device_ && spi_device_->listener_active();
+    }
+
+    // SPI NTAG emulation memory buffer (loaded from JSON at profile start)
+    std::vector<uint8_t> spi_ntag_memory() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return spi_ntag_mem_;
+    }
+
+    // Load NTAG memory from JSON if not already loaded (call from UI render)
+    void load_spi_ntag_memory_if_empty()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!spi_ntag_mem_.empty()) return;
+        const ProtocolKind proto = spi_profile_protocol_for_index(spi_emu_profile_);
+        if (proto != ProtocolKind::Iso14443A) return;
+        std::vector<uint8_t> mem = storage_.load_ntag_emulator_memory();
+        if (mem.empty()) {
+            const size_t pages = (spi_emu_profile_ == 1) ? kNfcUnitNtag213Pages : 135;
+            mem = default_nfcunit_ntag_memory(pages, "https://m5stack.com");
+        }
+        spi_ntag_mem_ = std::move(mem);
     }
 
     bool can_dump_last_scan(std::string *error = nullptr) const
@@ -3115,13 +3164,13 @@ public:
             *atqa = 0x0004;
             *sak = 0x08;
             return true;
-        case 1: // NTAG215
-            *uid = {0x04, 0x51, 0x22, 0x33, 0x44, 0x55, 0x66};
+        case 1: // NTAG213
+            *uid = {0x04, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC};
             *atqa = 0x0044;
             *sak = 0x00;
             return true;
-        case 2: // NTAG216
-            *uid = {0x04, 0x52, 0xA1, 0xB2, 0xC3, 0xD4, 0xE5};
+        case 2: // NTAG215
+            *uid = {0x04, 0x51, 0x22, 0x33, 0x44, 0x55, 0x66};
             *atqa = 0x0044;
             *sak = 0x00;
             return true;
@@ -3162,8 +3211,8 @@ public:
     {
         switch (profile) {
         case 0: return "MFC 1K";
-        case 1: return "NTAG215";
-        case 2: return "NTAG216";
+        case 1: return "NTAG213";
+        case 2: return "NTAG215";
         default: return "MFC 1K";
         }
     }
@@ -4631,6 +4680,10 @@ private:
         };
 
         bool anticollision_started = false;
+        bool anticollision_done    = false;  // SAK sent, now in data-exchange state
+
+        // NTAG version page (GET_VERSION response)
+        static const uint8_t ntag_version[8] = {0x00, 0x04, 0x04, 0x02, 0x01, 0x00, 0x0B, 0x03};
 
         while (!spi_emu_cancel_.load()) {
             std::vector<uint8_t> frame;
@@ -4662,10 +4715,18 @@ private:
 
                 const bool is_short_poll = (cmd0 == 0x26 || cmd0 == 0x52);
                 const bool is_shifted_short_poll = (cmd0 == 0x13 || cmd0 == 0x29);
+
+                // ── REQA/WUPA resets the state machine ──────────────────────
+                if (is_short_poll && !is_shifted_short_poll) {
+                    anticollision_started = false;
+                    anticollision_done    = false;
+                }
+
                 if (anticollision_started && (is_short_poll || is_shifted_short_poll)) {
                     std::fprintf(stderr, "[SPI-EMU] reset anticollision on short poll cmd=%02X\n", cmd0);
                     std::fflush(stderr);
                     anticollision_started = false;
+                    anticollision_done    = false;
                 }
 
                 if ((cmd0 == 0x93 && (cmd1 == 0x20 || cmd1 == 0x70)) ||
@@ -4674,6 +4735,7 @@ private:
                 }
                 if (cmd0 == 0x50 && cmd1 == 0x00) {
                     anticollision_started = false;
+                    anticollision_done    = false;
                 }
 
                 // Some readers can expose a right-shifted echo of short frames
@@ -4688,51 +4750,131 @@ private:
                 bool with_crc = false;
                 bool handled = false;
 
-                // REQA / WUPA short frame: ATQA (2 bytes, no CRC).
-                if (is_short_poll) {
-                    response = {
-                        static_cast<uint8_t>((atqa >> 8) & 0xFF),
-                        static_cast<uint8_t>(atqa & 0xFF)
-                    };
-                    handled = true;
-                }
-                // ANTICOLLISION CL1 -> UID CL1/BCC (no CRC)
-                else if (cmd0 == 0x93 && cmd1 == 0x20) {
-                    if (uid.size() == 4) {
-                        response = {uid[0], uid[1], uid[2], uid[3],
-                                    calc_bcc(uid[0], uid[1], uid[2], uid[3])};
-                    } else if (uid.size() == 7) {
-                        response = {0x88, uid[0], uid[1], uid[2],
-                                    calc_bcc(0x88, uid[0], uid[1], uid[2])};
+                // ── Anticollision phase ────────────────────────────────────
+                if (!anticollision_done) {
+                    // REQA / WUPA short frame: ATQA (2 bytes, no CRC).
+                    if (is_short_poll) {
+                        response = {
+                            static_cast<uint8_t>((atqa >> 8) & 0xFF),
+                            static_cast<uint8_t>(atqa & 0xFF)
+                        };
+                        handled = true;
                     }
-                    with_crc = false;
-                    handled = !response.empty();
-                }
-                // SELECT CL1 -> SAK (with CRC)
-                else if (cmd0 == 0x93 && cmd1 == 0x70) {
-                    const uint8_t sak_cl1 = (uid.size() == 7)
-                        ? static_cast<uint8_t>(sak | 0x04)
-                        : static_cast<uint8_t>(sak & static_cast<uint8_t>(~0x04));
-                    response = {sak_cl1};
-                    with_crc = true;
-                    handled = true;
-                    // 4-byte UID selection completes at CL1; allow fresh REQA/WUPA.
-                    if (uid.size() == 4) {
+                    // ANTICOLLISION CL1 -> UID CL1/BCC (no CRC)
+                    else if (cmd0 == 0x93 && cmd1 == 0x20) {
+                        if (uid.size() == 4) {
+                            response = {uid[0], uid[1], uid[2], uid[3],
+                                        calc_bcc(uid[0], uid[1], uid[2], uid[3])};
+                        } else if (uid.size() == 7) {
+                            response = {0x88, uid[0], uid[1], uid[2],
+                                        calc_bcc(0x88, uid[0], uid[1], uid[2])};
+                        }
+                        with_crc = false;
+                        handled = !response.empty();
+                    }
+                    // SELECT CL1 -> SAK (with CRC)
+                    else if (cmd0 == 0x93 && cmd1 == 0x70) {
+                        const uint8_t sak_cl1 = (uid.size() == 7)
+                            ? static_cast<uint8_t>(sak | 0x04)
+                            : static_cast<uint8_t>(sak & static_cast<uint8_t>(~0x04));
+                        response = {sak_cl1};
+                        with_crc = true;
+                        handled = true;
+                        // 4-byte UID selection completes at CL1; enter data-exchange
+                        if (uid.size() == 4) {
+                            anticollision_started = false;
+                            anticollision_done    = true;
+                        }
+                    }
+                    // ANTICOLLISION CL2 (for 7-byte UID)
+                    else if (uid.size() == 7 && cmd0 == 0x95 && cmd1 == 0x20) {
+                        response = {uid[3], uid[4], uid[5], uid[6],
+                                    calc_bcc(uid[3], uid[4], uid[5], uid[6])};
+                        handled = true;
+                    }
+                    // SELECT CL2 -> final SAK (with CRC), enter data-exchange
+                    else if (uid.size() == 7 && cmd0 == 0x95 && cmd1 == 0x70) {
+                        response = {static_cast<uint8_t>(sak & static_cast<uint8_t>(~0x04))};
+                        with_crc = true;
+                        handled = true;
                         anticollision_started = false;
+                        anticollision_done    = true;
                     }
                 }
-                // ANTICOLLISION CL2 (for 7-byte UID)
-                else if (uid.size() == 7 && cmd0 == 0x95 && cmd1 == 0x20) {
-                    response = {uid[3], uid[4], uid[5], uid[6],
-                                calc_bcc(uid[3], uid[4], uid[5], uid[6])};
-                    handled = true;
-                }
-                // SELECT CL2 -> final SAK (with CRC)
-                else if (uid.size() == 7 && cmd0 == 0x95 && cmd1 == 0x70) {
-                    response = {static_cast<uint8_t>(sak & static_cast<uint8_t>(~0x04))};
-                    with_crc = true;
-                    handled = true;
-                    anticollision_started = false;
+
+                // ── NTAG Data-exchange phase (after anticollision) ─────────
+                if (!handled && anticollision_done) {
+                    const std::vector<uint8_t> &mem = spi_ntag_mem_;
+                    const size_t pages = mem.size() / 4;
+
+                    if (cmd0 == 0x30 && frame.size() >= 2) {
+                        // READ (4 pages)
+                        const size_t start = frame[1];
+                        if (start < pages) {
+                            response.reserve(16);
+                            for (size_t p = start; p < start + 4; ++p) {
+                                if (p < pages) {
+                                    response.insert(response.end(),
+                                        mem.begin() + static_cast<ptrdiff_t>(p * 4),
+                                        mem.begin() + static_cast<ptrdiff_t>(p * 4 + 4));
+                                } else {
+                                    response.insert(response.end(), 4, 0x00);
+                                }
+                            }
+                        }
+                        with_crc = true;
+                        handled = !response.empty();
+                    } else if (cmd0 == 0x3A && frame.size() >= 3 && frame[1] <= frame[2]) {
+                        // FAST_READ
+                        const size_t start = frame[1];
+                        const size_t end = std::min(static_cast<size_t>(frame[2]),
+                                                    pages > 0 ? pages - 1 : 0);
+                        if (start < pages && start <= end) {
+                            const size_t len = (end - start + 1) * 4;
+                            if (len <= 0xFF) {
+                                response.assign(
+                                    mem.begin() + static_cast<ptrdiff_t>(start * 4),
+                                    mem.begin() + static_cast<ptrdiff_t>(start * 4 + len));
+                                with_crc = true;
+                                handled = true;
+                            }
+                        }
+                    } else if (cmd0 == 0x60 && frame.size() == 1) {
+                        // GET_VERSION
+                        response.assign(ntag_version, ntag_version + sizeof(ntag_version));
+                        with_crc = true;
+                        handled = true;
+                    } else if (cmd0 == 0x3C && frame.size() >= 2 && frame[1] == 0x00) {
+                        // READ_SIG
+                        response.assign(32, 0x00);
+                        with_crc = true;
+                        handled = true;
+                    } else if (cmd0 == 0xA2 && frame.size() == 6) {
+                        // WRITE (pages 4-39 for NTAG213)
+                        const uint8_t page = frame[1];
+                        const size_t off = static_cast<size_t>(page) * 4;
+                        if (page >= 4 && off + 4 <= mem.size()) {
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            std::memcpy(spi_ntag_mem_.data() + off, frame.data() + 2, 4);
+                            response = {0x0A};  // ACK
+                            with_crc = true;
+                            handled = true;
+                        }
+                    } else if (cmd0 == 0x1B && frame.size() >= 5) {
+                        // PWD_AUTH: return PACK (pages 44-45 = bytes 176-177)
+                        if (mem.size() >= 180) {
+                            response = {mem[176], mem[177]};
+                            with_crc = true;
+                            handled = true;
+                        }
+                    }
+
+                    if (!handled) {
+                        // Unrecognized data-exchange command: NAK
+                        response = {0x00};  // NAK
+                        with_crc = true;
+                        handled = true;
+                    }
                 }
 
                 if (handled && !response.empty()) {
@@ -4755,6 +4897,11 @@ private:
                                  cmd1,
                                  bytes_to_hex_string(response.data(), response.size()).c_str());
                     std::fflush(stderr);
+
+                    // If tx failed, reset state to allow fresh anticollision
+                    if (!tx_ok) {
+                        anticollision_done = false;
+                    }
                 } else {
                     std::fprintf(stderr, "[SPI-EMU] unhandled cmd=%02X/%02X len=%zu data=%s\n",
                                  cmd0,
@@ -6904,10 +7051,11 @@ private:
     std::atomic<bool> nfc_unit_emu_cancel_{false};
     std::thread spi_emu_thread_;
     std::atomic<bool> spi_emu_cancel_{false};
-    int spi_emu_profile_ = 0;  // 0=MFC 1K, 1=NTAG215, 2=NTAG216
+    int spi_emu_profile_ = 1;  // 0=MFC 1K, 1=NTAG213, 2=NTAG215
     std::vector<uint8_t> spi_emu_uid_;
     uint16_t spi_emu_atqa_ = 0;
     uint8_t spi_emu_sak_ = 0;
+    std::vector<uint8_t> spi_ntag_mem_;  // NTAG emulation memory buffer (180 bytes for NTAG213)
     std::atomic<bool> nfc_unit_emu_running_{false};
     ProtocolKind nfc_unit_emu_protocol_ = ProtocolKind::Iso14443A;
     int nfc_unit_emu_profile_ = 0;  // 0=NTAG213, 1=ISO15693

@@ -991,6 +991,75 @@ public:
         return {};
     }
 
+    // Load NTAG emulator memory from JSON (PM3 blocks format) as linear bytes.
+    // Tries: user JSON → default JSON → app-bundled config.
+    std::vector<uint8_t> load_ntag_emulator_memory() const
+    {
+        // Try user emulator JSON first (ntag213_0.json)
+        const std::string user_path = emulator_json_path(ProtocolKind::Iso14443A);
+        std::string src_path;
+        if (::access(user_path.c_str(), F_OK) == 0) {
+            src_path = user_path;
+        } else {
+            // Try default/
+            const std::string default_path = emulator_json_default_path(ProtocolKind::Iso14443A);
+            if (::access(default_path.c_str(), F_OK) == 0) {
+                src_path = default_path;
+            } else {
+                // Fallback: app-bundled config/defaults/
+                std::string app_path = std::string(hal_path_data_dir()) + "/config/defaults/ntag213.json";
+                if (::access(app_path.c_str(), F_OK) == 0) {
+                    src_path = app_path;
+                }
+            }
+        }
+        return src_path.empty()
+            ? std::vector<uint8_t>{}
+            : ntag_blocks_to_bytes(src_path);
+    }
+
+    // Read a PM3-format JSON file and convert blocks → linear byte vector.
+    static std::vector<uint8_t> ntag_blocks_to_bytes(const std::string &path)
+    {
+        std::ifstream in(path.c_str());
+        if (!in.is_open()) return {};
+        try {
+            nlohmann::json j;
+            in >> j;
+            if (j.contains("data_hex") && j["data_hex"].is_string())
+                return hex_string_to_bytes(j["data_hex"].get<std::string>());
+
+            if (j.contains("blocks") && j["blocks"].is_object()) {
+                std::vector<std::pair<int, std::string>> blocks;
+                for (auto it = j["blocks"].begin(); it != j["blocks"].end(); ++it) {
+                    if (!it.value().is_string()) continue;
+                    char *end = nullptr;
+                    long idx = std::strtol(it.key().c_str(), &end, 10);
+                    if (!end || *end != '\0' || idx < 0) continue;
+                    std::string hex;
+                    for (char c : it.value().get<std::string>()) {
+                        if (std::isxdigit(static_cast<unsigned char>(c))) {
+                            hex.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+                        }
+                    }
+                    if ((hex.size() % 2) != 0) hex.pop_back();
+                    if (!hex.empty()) blocks.emplace_back(static_cast<int>(idx), std::move(hex));
+                }
+                std::sort(blocks.begin(), blocks.end(),
+                          [](const std::pair<int, std::string> &a, const std::pair<int, std::string> &b) {
+                              return a.first < b.first;
+                          });
+                std::vector<uint8_t> out;
+                for (const auto &entry : blocks) {
+                    auto chunk = hex_string_to_bytes(entry.second);
+                    out.insert(out.end(), chunk.begin(), chunk.end());
+                }
+                return out;
+            }
+        } catch (...) {}
+        return {};
+    }
+
     void migrate_legacy_emulator_config() const
     {
         const std::string current = emulator_config_path();
