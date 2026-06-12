@@ -741,8 +741,9 @@ public:
         if (out.is_open()) out << j.dump(2);
     }
 
-    // Reset user JSON to default by copying from default/ directory.
-    // Falls back to config/defaults/ if default/ file doesn't exist yet.
+    // Reset user JSON to default: always copy from app-bundled config/defaults/
+    // (guaranteed correct PM3 format). Falls back to local default/ only if
+    // app-bundled files are unavailable (e.g. dev environment).
     bool reset_emulator_json(ProtocolKind protocol) const
     {
         const std::string user_path = emulator_json_path(protocol);
@@ -750,17 +751,16 @@ public:
         ensure_dir(emulator_json_dir());
         ensure_dir(emulator_json_default_dir());
 
-        // If default doesn't exist, populate from app-bundled config/defaults first
-        if (::access(default_path.c_str(), F_OK) != 0) {
-            std::string app_default_dir = std::string(hal_path_data_dir()) + "/config/defaults";
-            std::string app_path = app_default_dir + "/" + emulator_file_stem(protocol) + ".json";
-            if (::access(app_path.c_str(), F_OK) == 0) {
-                if (!copy_file(app_path, default_path)) return false;
-            } else {
-                return false;  // no default source available
-            }
+        // Prefer app-bundled config/defaults/ (correct PM3 format, never data_hex)
+        std::string app_default_dir = std::string(hal_path_data_dir()) + "/config/defaults";
+        std::string app_path = app_default_dir + "/" + emulator_file_stem(protocol) + ".json";
+        if (::access(app_path.c_str(), F_OK) == 0) {
+            if (!copy_file(app_path, default_path)) return false;
+            return copy_file(default_path, user_path);
         }
 
+        // Fallback: use local default file (may be legacy format)
+        if (::access(default_path.c_str(), F_OK) != 0) return false;
         return copy_file(default_path, user_path);
     }
 
@@ -785,43 +785,43 @@ public:
 
     std::string emulator_json_path(ProtocolKind protocol) const
     {
-        ensure_dir(emulator_json_dir());
+        ensure_dir_recursive(emulator_json_dir());
         return emulator_json_dir() + "/" + emulator_file_stem(protocol) + "_0.json";
     }
 
     std::string emulator_json_default_path(ProtocolKind protocol) const
     {
-        ensure_dir(emulator_json_default_dir());
+        ensure_dir_recursive(emulator_json_default_dir());
         // Note: default files are named without _0 suffix (e.g. mfc1k.json)
         return emulator_json_default_dir() + "/" + emulator_file_stem(protocol) + ".json";
     }
 
-    // Ensure user JSONs exist: if {p}_0.json missing, copy from default/
+    // Ensure user JSONs exist: if {p}_0.json missing, copy from app-bundled
+    // config/defaults/ (preferred, guaranteed correct PM3 format) or local
+    // default/ as fallback.
     void ensure_emulator_jsons() const
     {
-        ensure_dir(emulator_json_dir());
-        ensure_dir(emulator_json_default_dir());
+        ensure_dir_recursive(emulator_json_dir());
+        ensure_dir_recursive(emulator_json_default_dir());
 
         for (auto protocol : {ProtocolKind::Iso14443A, ProtocolKind::MifareClassic, ProtocolKind::Iso15693}) {
             const std::string user_path = emulator_json_path(protocol);
             if (::access(user_path.c_str(), F_OK) == 0) continue;  // already exists
 
-            // Try default/ first, then app-bundled config/defaults/
-            const std::string default_path = emulator_json_default_path(protocol);
-            if (::access(default_path.c_str(), F_OK) == 0) {
-                // Copy default → user
-                copy_file(default_path, user_path);
-                continue;
-            }
-
-            // Fallback: try app-bundled config/defaults/ directory
+            // Prefer app-bundled config/defaults/ (correct PM3 format, never data_hex)
             std::string app_default_dir = std::string(hal_path_data_dir()) + "/config/defaults";
             std::string app_path = app_default_dir + "/" + emulator_file_stem(protocol) + ".json";
             if (::access(app_path.c_str(), F_OK) == 0) {
-                // Copy from app bundle to user emulator dir
+                // Copy from app bundle to user emulator dir + populate default/
                 copy_file(app_path, user_path);
-                // Also populate default/ for future
-                copy_file(app_path, default_path);
+                copy_file(app_path, emulator_json_default_path(protocol));
+                continue;
+            }
+
+            // Fallback: try local default/ file
+            const std::string default_path = emulator_json_default_path(protocol);
+            if (::access(default_path.c_str(), F_OK) == 0) {
+                copy_file(default_path, user_path);
             }
         }
     }
@@ -894,16 +894,19 @@ public:
         });
     }
 
-    void write_default_if_missing(ProtocolKind protocol, const std::vector<uint8_t> &data) const
+    void write_default_if_missing(ProtocolKind protocol, const std::vector<uint8_t> & /*data*/) const
     {
         const std::string path = emulator_default_path(protocol);
         if (::access(path.c_str(), F_OK) == 0) return; // already exists
-        std::ofstream out(path.c_str(), std::ios::out | std::ios::trunc | std::ios::binary);
-        if (!out.is_open()) return;
-        nlohmann::json j;
-        j["protocol"] = to_string(protocol);
-        j["data_hex"] = bytes_to_hex_string(data);
-        out << j.dump(2);
+
+        // Copy from app-bundled config/defaults/ (correct PM3 format)
+        // Never write legacy data_hex format — hardcoded byte data ignored.
+        std::string app_default_dir = std::string(hal_path_data_dir()) + "/config/defaults";
+        std::string app_path = app_default_dir + "/" + emulator_file_stem(protocol) + ".json";
+        if (::access(app_path.c_str(), F_OK) == 0) {
+            ensure_dir_recursive(emulator_json_default_dir());
+            copy_file(app_path, path);
+        }
     }
 
     std::string emulator_default_path(ProtocolKind protocol) const

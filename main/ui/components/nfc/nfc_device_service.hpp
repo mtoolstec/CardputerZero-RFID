@@ -84,6 +84,10 @@ public:
 
     NfcDeviceService()
     {
+        // Ensure emulator default JSON files exist at app startup
+        // (copies from app-bundled config/defaults/ if needed)
+        storage_.ensure_emulator_jsons();
+
         refresh_endpoints();
         emulator_slots_by_protocol_ = storage_.load_emulator_slots_by_protocol();
         uart_config_ = storage_.load_uart_config();
