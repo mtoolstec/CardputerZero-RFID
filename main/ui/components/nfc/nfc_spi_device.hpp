@@ -1677,7 +1677,488 @@ public:
 #endif
     }
 
-    // ── ST25R3916 SPI passive-target (listener / EMU) ─────────────────────────
+    // Standard NTAG/MFU dump without Gen1A backdoor. Reads pages via READ cmd.
+    bool scan_and_dump_mfu(I2cCardInfo *out_info,
+                           std::vector<std::vector<uint8_t>> *out_blocks,
+                           int *out_pages,
+                           std::string *error)
+    {
+#if defined(__linux__)
+        if (fd_ < 0) {
+            if (error) *error = "SPI device not open";
+            return false;
+        }
+
+        I2cCardInfo local_info;
+        if (!select_card_iso14443a(out_info ? out_info : &local_info, true)) {
+            if (error) *error = "No card detected";
+            return false;
+        }
+
+        const auto &info = out_info ? *out_info : local_info;
+        // SPI returns ATQA in LSB-first wire order ("4400" for NTAG).
+        // Normalize to canonical "0044" for comparison.
+        auto norm4 = [](const std::string &s) -> std::string {
+            if (s.size() == 4) return s.substr(2, 2) + s.substr(0, 2);
+            return s;
+        };
+        const std::string atqa_norm = norm4(info.atqa_hex);
+        const bool is_ntag = (info.sak_hex == "00" && atqa_norm == "0044");
+        if (!is_ntag) {
+            set_rf_field(false);
+            if (error) *error = "Not an NTAG/MFU card";
+            return false;
+        }
+
+        // Default NTAG213 = 45 pages
+        int total_pages = 45;
+        uint8_t version[8] = {0};
+        if (mfu_read_block(0x60, 0, version, 8)) {
+            if (version[6] == 0x0B || version[6] == 0x0E ||
+                version[6] == 0x0F || version[6] == 0x11) total_pages = 45;
+            else if (version[6] == 0x12) total_pages = 135;
+            else if (version[6] == 0x13) total_pages = 231;
+        }
+
+        if (out_pages) *out_pages = total_pages;
+
+        if (!out_blocks) {
+            set_rf_field(false);
+            return true;
+        }
+
+        out_blocks->clear();
+        int failures = 0;
+        for (int pg = 0; pg < total_pages; pg += 4) {
+            uint8_t buf[16] = {0};
+            if (mfu_read_block(0x30, static_cast<uint8_t>(pg), buf, 16)) {
+                for (int i = 0; i < 4 && (pg + i) < total_pages; ++i) {
+                    std::vector<uint8_t> block(buf + i*4, buf + i*4 + 4);
+                    out_blocks->push_back(std::move(block));
+                }
+            } else {
+                ++failures;
+                for (int i = 0; i < 4 && (pg + i) < total_pages; ++i) {
+                    out_blocks->push_back({0x00, 0x00, 0x00, 0x00});
+                }
+            }
+        }
+
+        set_rf_field(false);
+        if (failures > 0 && error) {
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "dump completed with %d page read errors", failures);
+            *error = buf;
+        }
+        return true;
+#else
+        if (error) *error = "SPI not supported";
+        return false;
+#endif
+    }
+
+private:
+    bool mfu_read_block(uint8_t cmd, uint8_t param, uint8_t *data, size_t data_len)
+    {
+#if defined(__linux__)
+        if (fd_ < 0) return false;
+
+        auto try_read = [&](uint8_t iso_mode, bool with_crc_cmd, bool append_crc) -> bool {
+            direct_cmd(st25r_cmd::CLEAR_FIFO);
+            direct_cmd(st25r_cmd::CLEAR);
+            write_reg(st25r_reg::ISO14443A_NFC, iso_mode);
+
+            uint8_t tx[4] = {cmd, param, 0x00, 0x00};
+            size_t tx_len = 2;
+            if (append_crc) {
+                const uint16_t crc = crc_a(tx, 2);
+                tx[2] = static_cast<uint8_t>(crc & 0xFF);
+                tx[3] = static_cast<uint8_t>((crc >> 8) & 0xFF);
+                tx_len = 4;
+            }
+
+            write_reg(st25r_reg::NUM_TX_BYTES1, 0x00);
+            write_reg(st25r_reg::NUM_TX_BYTES2, static_cast<uint8_t>(tx_len * 8));
+            write_fifo(tx, tx_len);
+            direct_cmd(with_crc_cmd ? st25r_cmd::TRANSMIT_WITH_CRC
+                                    : st25r_cmd::TRANSMIT_WITHOUT_CRC);
+
+            if (!wait_fifo_bytes(static_cast<uint8_t>(data_len), 90)) return false;
+
+            size_t got = 0;
+            uint8_t buf[32] = {0};
+            if (!read_fifo(buf, sizeof(buf), &got) || got < data_len) return false;
+            std::memcpy(data, buf, data_len);
+            return true;
+        };
+
+        if (try_read(0x00, true,  false)) return true;
+        if (try_read(0x40, true,  false)) return true;
+        if (try_read(0x00, false, true )) return true;
+        if (try_read(0x40, false, true )) return true;
+        return false;
+#else
+        (void)cmd; (void)param; (void)data; (void)data_len;
+        return false;
+#endif
+    }
+
+public:
+    // ── ISO15693 / NFC-V support (SubCarrierStream mode) ───────────────────────
+
+    // ISO15693 CRC-16 (poly=0x8408 reflected, init=0xFFFF, xor-out=0xFFFF)
+    static uint16_t crc16_iso15693(const uint8_t *data, size_t len)
+    {
+        uint16_t crc = 0xFFFF;
+        for (size_t i = 0; i < len; i++) {
+            uint8_t b = data[i];
+            for (int j = 0; j < 8; j++) {
+                uint8_t mix = (uint8_t)((crc ^ b) & 1);
+                crc >>= 1;
+                if (mix) crc ^= 0x8408;
+                b >>= 1;
+            }
+        }
+        return crc ^ 0xFFFF;
+    }
+
+    // Decode Manchester-encoded ISO15693 response from raw FIFO bytes.
+    static bool decode_vicc_manchester(const uint8_t *buf, uint8_t len,
+                                       uint8_t *out, uint8_t &out_len)
+    {
+        if (!buf || len == 0) return false;
+        if ((buf[0] & 0x1F) != 0x17) return false;
+
+        const uint32_t manBits    = (uint32_t)len * 8;
+        const uint32_t maxPayBits = (manBits > 5) ? ((manBits - 5) / 2) : 0;
+        const uint32_t outBufLen  = (maxPayBits + 7) / 8;
+        if (outBufLen == 0) return false;
+        std::memset(out, 0, outBufLen < 32 ? outBufLen : 32);
+
+        uint16_t mp = 5, bp = 0;
+        for (; mp < (uint16_t)(manBits - 2); mp += 2) {
+            bool isEOF = false;
+            uint8_t man = (buf[mp / 8] >> (mp % 8)) & 1;
+            man |= (uint8_t)(((buf[(mp + 1) / 8] >> ((mp + 1) % 8)) & 1) << 1);
+
+            if (man == 1) { bp++; }
+            else if (man == 2) {
+                uint16_t bpos = bp / 8;
+                if (bpos < outBufLen && bpos < 32) out[bpos] |= (uint8_t)(1 << (bp % 8));
+                bp++;
+            }
+
+            if ((bp % 8) == 0) {
+                uint16_t byte_pos = (uint16_t)(mp / 8);
+                if (byte_pos + 1 < len) {
+                    if (((buf[byte_pos] & 0xE0) == 0xA0) && (buf[byte_pos + 1] == 0x03)) {
+                        isEOF = true;
+                    }
+                }
+            }
+            if ((man == 0 || man == 3) && !isEOF) return false;
+            if (bp >= (uint16_t)(outBufLen * 8) || isEOF) break;
+        }
+
+        uint8_t out_bytes = (uint8_t)(bp / 8);
+        if (out_bytes < 3) return false;
+        if ((bp % 8) != 0) return false;
+
+        uint16_t crc_calc = crc16_iso15693(out, out_bytes - 2);
+        uint16_t crc_rx   = ((uint16_t)out[out_bytes - 1] << 8) | out[out_bytes - 2];
+        if (crc_calc != crc_rx) return false;
+
+        out_len = out_bytes - 2;
+        return true;
+    }
+
+    // Encode ISO15693 command as PPM stream for SubCarrierStream TX.
+    static uint8_t encode_nfcv_1of4(uint8_t *out, const uint8_t *data, uint8_t len)
+    {
+        static const uint8_t SYM4[4] = {0x02, 0x08, 0x20, 0x80};
+        uint16_t crc = crc16_iso15693(data, len);
+        uint8_t frame[64], flen = 0;
+        for (uint8_t i = 0; i < len && flen < 60; i++) frame[flen++] = data[i];
+        frame[flen++] = (uint8_t)(crc & 0xFF);
+        frame[flen++] = (uint8_t)(crc >> 8);
+
+        uint8_t pos = 0;
+        out[pos++] = 0x21;  // SOF_1OF4
+        for (uint8_t i = 0; i < flen; i++) {
+            uint8_t b = frame[i];
+            for (int j = 0; j < 4; j++) { out[pos++] = SYM4[b & 3]; b >>= 2; }
+        }
+        out[pos++] = 0x04;  // EOF
+        return pos;
+    }
+
+    // Configure ST25R3916 for ISO15693 SubCarrierStream mode.
+    bool configure_nfcv()
+    {
+        direct_cmd(st25r_cmd::STOP);  // 0xC2
+        usleep(5000);
+        write_reg(st25r_reg::OP_CONTROL, 0x80);
+        usleep(5000);
+
+        write_reg(st25r_reg::RX_CONF1, 0x13);
+        write_reg(st25r_reg::RX_CONF2, 0x2D);
+        write_reg(st25r_reg::RX_CONF3, 0x00);
+        write_reg(st25r_reg::RX_CONF4, 0x00);
+        write_reg(0x28, 0x70);               // TX driver 40% modulation
+        write_reg(st25r_reg::IO_CONF1, 0x07);
+        write_reg(st25r_reg::IO_CONF2, 0x20); // AAT enable
+        write_reg(st25r_reg::OP_CONTROL, 0x83); // OSC + en_fd
+        write_reg(st25r_reg::STREAM_MODE, 0x38);
+        write_reg(st25r_reg::AUX, 0x02);
+        write_spaceb(0x05, 0x40);
+        write_spaceb(0x06, 0x14);
+        write_spaceb(0x0B, 0x0C);
+        write_spaceb(0x0C, 0x13);
+        write_spaceb(0x0D, 0x01);
+        write_spaceb(0x0E, 0x00);
+        write_spaceb(0x0F, 0x00);
+        write_spaceb(0x10, 0x10);
+        write_spaceb(0x11, 0x7C);
+        write_spaceb(0x12, 0x80);
+        write_reg(st25r_reg::MODE, 0x70);     // SubCarrierStream mode
+
+        direct_cmd(st25r_cmd::NFCA_INITIAL_RF_COLLISION_AVOID);  // 0xC8 NFC Init Field On
+        usleep(5000);
+        uint8_t op = 0;
+        read_reg(st25r_reg::OP_CONTROL, &op);
+        write_reg(st25r_reg::OP_CONTROL, op | 0x40);  // rx_en
+        return true;
+    }
+
+    // Restore ST25R3916 to ISO14443A mode after ISO15693.
+    void restore_iso14443a()
+    {
+        direct_cmd(st25r_cmd::STOP);
+        usleep(5000);
+        write_reg(st25r_reg::IO_CONF2, 0x00);
+        write_reg(st25r_reg::AUX, 0x00);
+        write_spaceb(0x0B, 0x00);
+        write_spaceb(0x0C, 0x00);
+        write_spaceb(0x0D, 0x00);
+        write_reg(st25r_reg::OP_CONTROL, 0x80);
+    }
+
+    // SubCarrierStream transceive for ISO15693.
+    bool nfcv_transceive(const uint8_t *req, uint8_t req_len,
+                         uint8_t *decoded, uint8_t &decoded_len,
+                         int timeout_ms)
+    {
+        if (!req || req_len == 0 || !decoded) return false;
+
+        uint8_t encoded[96] = {0};
+        uint8_t enc_len = encode_nfcv_1of4(encoded, req, req_len);
+
+        direct_cmd(st25r_cmd::CLEAR_FIFO);
+        { uint8_t d = 0; read_reg(st25r_reg::IRQ_MAIN, &d); }  // clear pending IRQ
+        usleep(200);
+
+        write_fifo(encoded, enc_len);
+        // NUM_TX_BYTES = (full_bytes << 3) | rest_bits = enc_len * 8
+        uint16_t ntx = static_cast<uint16_t>(enc_len) * 8;
+        write_reg(st25r_reg::NUM_TX_BYTES1, static_cast<uint8_t>((ntx >> 8) & 0x1F));
+        write_reg(st25r_reg::NUM_TX_BYTES2, static_cast<uint8_t>(ntx & 0xFF));
+        { uint8_t d = 0; read_reg(st25r_reg::IRQ_MAIN, &d); }  // clear IRQ again
+        usleep(200);
+
+        direct_cmd(st25r_cmd::TRANSMIT_WITHOUT_CRC);
+
+        // Step 1: wait for TX complete (irq bit 3, txe=0x08)
+        uint8_t irq = 0;
+        {
+            const auto deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::milliseconds(20);
+            while (std::chrono::steady_clock::now() < deadline) {
+                if (!read_reg(st25r_reg::IRQ_MAIN, &irq)) return false;
+                if (irq & 0x08) break;
+                usleep(200);
+            }
+            if (!(irq & 0x08)) return false;
+        }
+
+        // Step 2: wait for RX complete or collision (irq bit 4/2, rxe=0x10, col=0x04)
+        {
+            const auto deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::milliseconds(timeout_ms);
+            while (std::chrono::steady_clock::now() < deadline) {
+                if (!read_reg(st25r_reg::IRQ_MAIN, &irq)) return false;
+                if (irq & (0x10 | 0x04)) break;
+                usleep(500);
+            }
+            if (!(irq & 0x10)) return false;  // no RX complete
+        }
+
+        // Step 3: read FIFO
+        size_t got = 0;
+        uint8_t raw[96] = {0};
+        if (!read_fifo(raw, sizeof(raw), &got) || got < 3) return false;
+
+        uint8_t out_len = 0;
+        if (!decode_vicc_manchester(raw, (uint8_t)got, decoded, out_len)) return false;
+        decoded_len = out_len;
+        return true;
+    }
+
+    // Scan ISO15693 card via inventory, optionally dump all blocks.
+    struct Iso15Info { uint16_t block_count=64; uint8_t block_bytes=4;
+                       std::string dsfid, afi, ic_ref; };
+    bool scan_and_dump_iso15693(I2cCardInfo *out_info,
+                                std::vector<std::vector<uint8_t>> *out_blocks,
+                                std::string *error,
+                                Iso15Info *iso15 = nullptr)
+    {
+#if defined(__linux__)
+        if (fd_ < 0) {
+            if (error) *error = "SPI device not open";
+            return false;
+        }
+
+        if (!configure_nfcv()) {
+            if (error) *error = "ISO15693 init failed";
+            return false;
+        }
+
+        // Inventory
+        uint8_t inv_req[3] = {0x26, 0x01, 0x00};
+        uint8_t inv_dec[48] = {0};
+        uint8_t inv_len = 0;
+        if (!nfcv_transceive(inv_req, 3, inv_dec, inv_len, 80) || inv_len < 10) {
+            restore_iso14443a();
+            if (error) *error = "ISO15693 inventory failed";
+            return false;
+        }
+
+        // Extract UID (LSB first from response)
+        uint8_t uid_lsb[8];
+        for (size_t i = 0; i < 8; ++i) uid_lsb[i] = inv_dec[2 + i];
+
+        char uid_hex[17];
+        for (int i = 7; i >= 0; --i)
+            std::snprintf(uid_hex + (7 - i) * 2, 3, "%02X", uid_lsb[i]);
+        uid_hex[16] = '\0';
+
+        // Get system info for block count, DSFID, AFI
+        uint16_t block_count = 64;
+        uint8_t block_bytes = 4;
+        std::string dsfid_hex = "00", afi_hex = "00", ic_ref_hex;
+        uint8_t sys_info_flags = 0, sys_resp_len = 0;
+        uint8_t sys_dec_first[16] = {0};
+        {
+            uint8_t sys_req[10] = {0x22, 0x2B};
+            for (size_t i = 0; i < 8; ++i) sys_req[2 + i] = uid_lsb[i];
+            uint8_t sys_dec[64] = {0};
+            uint8_t sys_len = 0;
+            bool sys_ok = nfcv_transceive(sys_req, sizeof(sys_req), sys_dec, sys_len, 100);
+            sys_resp_len = sys_len;
+            if (sys_ok && sys_len >= 10 && (sys_dec[0] & 0x01) == 0) {
+                sys_info_flags = sys_dec[1];
+                size_t idx = 2 + 8;
+                auto hex2 = [](uint8_t v) {
+                    char buf[3];
+                    std::snprintf(buf, sizeof(buf), "%02X", v);
+                    return std::string(buf);
+                };
+                if ((sys_info_flags & 0x01) && idx < sys_len) dsfid_hex = hex2(sys_dec[idx++]);
+                if ((sys_info_flags & 0x02) && idx < sys_len) afi_hex = hex2(sys_dec[idx++]);
+                if ((sys_info_flags & 0x04) && idx + 1 < sys_len) {
+                    block_count = static_cast<uint16_t>(sys_dec[idx++]) + 1;
+                    block_bytes = static_cast<uint8_t>(sys_dec[idx++] & 0x1F) + 1;
+                }
+                if ((sys_info_flags & 0x08) && idx < sys_len) ic_ref_hex = hex2(sys_dec[idx++]);
+            }
+            block_count = std::min<uint16_t>(block_count, 256);
+            // Capture first 16 bytes for debug
+            for (uint8_t i = 0; i < std::min(sys_len, uint8_t(16)); ++i)
+                sys_dec_first[i] = sys_dec[i];
+        }
+
+        if (iso15) {
+            iso15->block_count = block_count;
+            iso15->block_bytes = block_bytes;
+            iso15->dsfid = dsfid_hex;
+            iso15->afi = afi_hex;
+            iso15->ic_ref = ic_ref_hex;
+        }
+
+        if (out_info) {
+            out_info->valid = true;
+            out_info->uid = uid_hex;
+            out_info->protocol = "ISO15693";
+            out_info->sak_hex = "";
+            out_info->atqa_hex = "";
+            std::string detail = "ISO15693 DSFID:" + dsfid_hex + " AFI:" + afi_hex;
+            if (!ic_ref_hex.empty()) detail += " IC_REF:" + ic_ref_hex;
+            detail += " Blk:" + std::to_string(block_count) + " Bsz:" + std::to_string(block_bytes);
+            out_info->detail = detail;
+        }
+
+        if (!out_blocks) {
+            restore_iso14443a();
+            return true;
+        }
+
+        out_blocks->clear();
+        int consec_fails = 0;
+        for (uint16_t block = 0; block < block_count; ++block) {
+            uint8_t req[11] = {0x22, 0x20};
+            for (size_t i = 0; i < 8; ++i) req[2 + i] = uid_lsb[i];
+            req[10] = static_cast<uint8_t>(block & 0xFF);
+
+            uint8_t dec[64] = {0};
+            uint8_t dec_len = 0;
+            bool ok = nfcv_transceive(req, sizeof(req), dec, dec_len, 80);
+            // Retry once on transient failure
+            if (!ok || dec_len < 2) {
+                usleep(2000);
+                ok = nfcv_transceive(req, sizeof(req), dec, dec_len, 80);
+            }
+            if (!ok || dec_len < 2) {
+                ++consec_fails;
+                if (block == 0 || consec_fails >= 3) {
+                    if (block == 0) restore_iso14443a();
+                    if (error && block > 0) *error = "ISO15693 read block failed mid-dump";
+                    break;
+                }
+                // Fill with zeros and continue
+                out_blocks->push_back(std::vector<uint8_t>(block_bytes, 0x00));
+                continue;
+            }
+            consec_fails = 0;
+            if (dec[0] & 0x01) {
+                if (block == 0) {
+                    restore_iso14443a();
+                    if (error) {
+                        char msg[48];
+                        std::snprintf(msg, sizeof(msg), "ISO15693 error 0x%02X", dec_len > 1 ? dec[1] : 0xFF);
+                        *error = msg;
+                    }
+                    return false;
+                }
+                break;
+            }
+
+            std::vector<uint8_t> block_data(dec + 1, dec + dec_len);
+            out_blocks->push_back(std::move(block_data));
+            usleep(1000);  // small gap between blocks
+        }
+
+        restore_iso14443a();
+        if (out_blocks->empty()) {
+            if (error) *error = "ISO15693 dump empty";
+            return false;
+        }
+        return true;
+#else
+        if (error) *error = "SPI not supported";
+        return false;
+#endif
+    }
+
+public:
     // Reference: ST25R3916 datasheet §11 (Passive target mode)
     // Note: no slot concept – the chip emulates exactly one card identity.
 

@@ -2563,8 +2563,10 @@ public:
                 return false;
             }
             const auto p = scan_.last_record.tag.protocol;
-            if (p != ProtocolKind::MifareClassic && p != ProtocolKind::Iso14443A) {
-                if (error) *error = "SPI dump supports MFC/MFU only";
+            if (p != ProtocolKind::MifareClassic &&
+                p != ProtocolKind::Iso14443A &&
+                p != ProtocolKind::Iso15693) {
+                if (error) *error = "SPI dump supports MFC/MFU/ISO15693 only";
                 return false;
             }
             return true;
@@ -6022,9 +6024,41 @@ private:
                 record = make_record_from_tag(tag, endpoint, false, "st25r");
                 success = true;
             } else {
-                push_log("No card detected");
-                emit_scan_tail();
-                error = card_ok ? "no card present" : card.detail;
+                // ISO14443A failed → try ISO15693 SubCarrierStream
+                push_log("ISO14443A no response, trying ISO15693...");
+                I2cCardInfo iso15_info;
+                std::string iso15_err;
+                NfcSpiDevice::Iso15Info iso15;
+                if (spi_dev->scan_and_dump_iso15693(&iso15_info, nullptr, &iso15_err, &iso15)) {
+                    TagInfo tag;
+                    std::string uid_norm;
+                    uid_norm.reserve(iso15_info.uid.size());
+                    for (char ch : iso15_info.uid) {
+                        if (std::isxdigit(static_cast<unsigned char>(ch))) {
+                            uid_norm.push_back(static_cast<char>(
+                                std::toupper(static_cast<unsigned char>(ch))));
+                        }
+                    }
+                    tag.uid = uid_norm.empty() ? iso15_info.uid : uid_norm;
+                    tag.protocol = ProtocolKind::Iso15693;
+                    tag.tag_type = "ISO15693";
+                    tag.identity_fields["DSFID"] = iso15.dsfid.empty() ? "00" : iso15.dsfid;
+                    tag.identity_fields["AFI"] = iso15.afi.empty() ? "00" : iso15.afi;
+                    tag.identity_fields["BLOCK_SIZE"] = std::to_string(iso15.block_count);
+                    tag.identity_fields["BLOCK_BYTES"] = std::to_string(iso15.block_bytes);
+                    if (!iso15.ic_ref.empty()) tag.identity_fields["IC_REF"] = iso15.ic_ref;
+                    if (!iso15_info.detail.empty()) {
+                        push_log(iso15_info.detail);
+                    }
+                    emit_scan_summary(tag);
+                    emit_scan_tail();
+                    record = make_record_from_tag(tag, endpoint, false, "st25r-iso15");
+                    success = true;
+                } else {
+                    push_log(iso15_err.empty() ? "No card detected" : iso15_err);
+                    emit_scan_tail();
+                    error = iso15_err.empty() ? "no card present" : iso15_err;
+                }
             }
             std::lock_guard<std::mutex> lock(mutex_);
             scan_.running = false;
@@ -6380,20 +6414,57 @@ private:
                 error = "SPI device not open";
                 push_log(std::string("ERR ") + error);
             } else {
-                // Current SPI ST25R dump path is Gen1A-focused.
-                push_log("> Dumping SPI ST25R (Gen1A)...");
+                // Determine card type from scan result to pick dump method
+                const auto p = base_record.tag.protocol;
+                const auto &id = base_record.tag.identity_fields;
+                const bool is_mfc = (p == ProtocolKind::MifareClassic);
+                // SPI returns ATQA in wire order (LSB first: "4400" for NTAG)
+                auto norm_atqa = [](const std::string &s) -> std::string {
+                    if (s.size() == 4) return s.substr(2, 2) + s.substr(0, 2);
+                    return s;
+                };
+                const bool is_ntag = (p == ProtocolKind::Iso14443A &&
+                    id.count("SAK") && id.at("SAK") == "00" &&
+                    id.count("ATQA") &&
+                    (id.at("ATQA") == "0044" || norm_atqa(id.at("ATQA")) == "0044"));
+
                 I2cCardInfo card_info;
                 std::vector<std::vector<uint8_t>> blocks;
                 std::string dump_err;
-                if (spi_dev->scan_and_dump_gen1a(&card_info, &blocks, &dump_err)) {
+                bool dumped = false;
+
+                if (is_ntag) {
+                    push_log("> Dumping SPI ST25R (NTAG/MFU)...");
+                    int pages = 0;
+                    dumped = spi_dev->scan_and_dump_mfu(&card_info, &blocks, &pages, &dump_err);
+                } else if (p == ProtocolKind::Iso15693) {
+                    push_log("> Dumping SPI ST25R (ISO15693)...");
+                    dumped = spi_dev->scan_and_dump_iso15693(&card_info, &blocks, &dump_err);
+                } else {
+                    push_log("> Dumping SPI ST25R (Gen1A)...");
+                    dumped = spi_dev->scan_and_dump_gen1a(&card_info, &blocks, &dump_err);
+                }
+
+                if (dumped) {
+                    const bool is_iso15 = (p == ProtocolKind::Iso15693);
+
                     record.tag.uid = card_info.uid;
                     const auto proto = i2c_protocol_to_kind(card_info.protocol);
                     if (proto != ProtocolKind::Unknown) record.tag.protocol = proto;
                     const std::string type = i2c_protocol_to_tag_type(card_info.protocol);
                     if (!type.empty()) record.tag.tag_type = type;
-                    record.tag.magic_type = "Gen1A";
+                    if (!is_iso15) {
+                        if (is_ntag) record.tag.magic_type = "Normal";
+                        else record.tag.magic_type = "Gen1A";
+                    }
                     if (!card_info.atqa_hex.empty()) record.tag.identity_fields["ATQA"] = card_info.atqa_hex;
                     if (!card_info.sak_hex.empty()) record.tag.identity_fields["SAK"] = card_info.sak_hex;
+                    if (is_iso15) {
+                        record.tag.identity_fields.erase("ATQA");
+                        record.tag.identity_fields.erase("SAK");
+                        record.tag.identity_fields["DSFID"] = "00";
+                        record.tag.identity_fields["AFI"] = "00";
+                    }
 
                     std::vector<std::string> dump_lines;
                     dump_lines.reserve(blocks.size());
@@ -6406,7 +6477,7 @@ private:
                     }
 
                     record.mifare_dump = MifareClassicDump{};
-                    record.mifare_dump->sector_count = 16;
+                    record.mifare_dump->sector_count = is_mfc ? 16 : 0;
                     record.mifare_dump->block_count = static_cast<int>(dump_lines.size());
                     record.mifare_dump->blocks_hex = dump_lines;
                     record.mifare_dump->attack.method = AttackMethod::None;
@@ -6418,7 +6489,7 @@ private:
                     push_log("Tip: Press Ctrl+S to save dump.");
                     success = !record.tag.raw_data.empty();
                 } else {
-                    error = dump_err.empty() ? "SPI dump failed (not Gen1A?)" : dump_err;
+                    error = dump_err.empty() ? "SPI dump failed" : dump_err;
                     push_log(std::string("ERR ") + error);
                 }
             }
