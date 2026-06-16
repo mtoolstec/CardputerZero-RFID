@@ -404,8 +404,9 @@ public:
                 starts_with(name, "cu.usbserial-")) {
                 kind = TransportKind::UsbSerial;
                 matched = true;
-            } else if (starts_with(name, "ttyS") || starts_with(name, "ttyAMA") ||
-                       starts_with(name, "serial") || starts_with(name, "ttyTHS")) {
+            } else if (entry->d_type != DT_DIR &&
+                       (starts_with(name, "ttyS") || starts_with(name, "ttyAMA") ||
+                        starts_with(name, "serial") || starts_with(name, "ttyTHS"))) {
                 kind = TransportKind::UartSerial;
                 matched = true;
             }

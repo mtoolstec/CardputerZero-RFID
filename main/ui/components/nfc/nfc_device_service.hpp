@@ -482,11 +482,18 @@ public:
             }
             const int baud = 115200; // fixed baud rate
 
-            // Open log file
+            // Open log file — use date-based naming like USB PN532Killer logs
             const std::string log_dir = storage_.root_dir() + "/logs";
             ::mkdir(log_dir.c_str(), 0755);
-            const std::string log_path = log_dir + "/uart_test_latest.log";
-            FILE *fp = fopen(log_path.c_str(), "w");
+            time_t t = time(nullptr);
+            struct tm tm_info;
+            localtime_r(&t, &tm_info);
+            char date_buf[20];
+            std::snprintf(date_buf, sizeof(date_buf), "%04d-%02d-%02d",
+                          tm_info.tm_year + 1900, tm_info.tm_mon + 1, tm_info.tm_mday);
+            const std::string log_path = log_dir + "/uart-" + date_buf + ".txt";
+            // NfcHexLog mode is already set by connect_async; no need to set again here
+            FILE *fp = fopen(log_path.c_str(), "a");
             auto log_line = [&](const std::string &s) {
                 {
                     std::lock_guard<std::mutex> lk(pending_log_mutex_);
@@ -559,6 +566,7 @@ public:
 
             Pn532KillerClient client(&logging_transport);
             std::string probe_error, firmware;
+            log_line("=== Probing device... ===");
             const DeviceKind kind = client.detect_device(&firmware, &probe_error);
             raw_transport.close();
 

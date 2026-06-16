@@ -1935,11 +1935,11 @@ public:
     {
         direct_cmd(st25r_cmd::STOP);
         usleep(5000);
-        write_reg(st25r_reg::IO_CONF2, 0x00);
-        write_reg(st25r_reg::AUX, 0x00);
-        write_spaceb(0x0B, 0x00);
-        write_spaceb(0x0C, 0x00);
-        write_spaceb(0x0D, 0x00);
+        // Full software reset to recover from SubCarrierStream mode
+        direct_cmd(st25r_cmd::SET_DEFAULT);
+        usleep(2000);
+        write_reg(st25r_reg::IO_CONF2, 0x04);
+        direct_cmd(st25r_cmd::ADJUST_REGULATORS);
         write_reg(st25r_reg::OP_CONTROL, 0x80);
     }
 

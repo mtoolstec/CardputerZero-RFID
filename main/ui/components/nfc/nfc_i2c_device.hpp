@@ -4031,6 +4031,36 @@ private:
                           " " + std::to_string(read_ok) + "/" + std::to_string(sector_blocks));
         }
 
+        // Post-process: replace zero trailer keys with authenticated key
+        for (int sector = 0; sector < sector_count; ++sector) {
+            const auto &plan = sector_auth[static_cast<size_t>(sector)];
+            if (!plan.valid) continue;
+            const int tb = mfc_sector_trailer_block(sector);
+            if (tb < 0 || (size_t)tb >= out_lines.size()) continue;
+            const std::string &line = out_lines[static_cast<size_t>(tb)];
+            if (line.empty() || line.size() < 35) continue;
+            // Trailer format: "NN: AAAAAAAAAAAA XX XX XX XX KKKKKKKKKKKK"
+            // Key A at offset 3-14, Key B at offset 21-32 (after access bits)
+            std::string key_a_hex, key_b_hex;
+            for (int i = 0; i < 6; i++) {
+                char h[3];
+                std::snprintf(h, sizeof(h), "%02X", plan.key[i]);
+                key_a_hex += h;
+                key_b_hex += h;
+            }
+            // Check if key A portion is all zeros → replace
+            std::string trailer = line;
+            std::string old_keyA = trailer.substr(3, 12);
+            if (old_keyA == "000000000000") {
+                trailer.replace(3, 12, (plan.auth_cmd == 0x60) ? key_a_hex : "000000000000");
+            }
+            std::string old_keyB = trailer.substr(23, 12);
+            if (old_keyB == "000000000000") {
+                trailer.replace(23, 12, (plan.auth_cmd == 0x61) ? key_b_hex : "000000000000");
+            }
+            out_lines[static_cast<size_t>(tb)] = trailer;
+        }
+
         st25r_write_reg(0x02, 0x80);
         if (!any_block_ok) {
             if (error) {
