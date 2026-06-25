@@ -343,8 +343,8 @@ static void init_input(void)
 // ---------------------------------------------------------------------------
 int main(void)
 {
-    std::signal(SIGINT,  on_signal);
-    std::signal(SIGTERM, on_signal);
+    ::std::signal(SIGINT,  on_signal);
+    ::std::signal(SIGTERM, on_signal);
 
     hal_paths_init(nullptr);
     lv_init();

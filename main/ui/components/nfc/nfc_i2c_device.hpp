@@ -85,12 +85,13 @@ namespace i2c_mode {
     static constexpr uint16_t READER     = 0x0100;
     static constexpr uint16_t MIFARE1_READER = 0x0300;
     static constexpr uint16_t TAG_NONE   = 0x0000;
+    static constexpr uint16_t TAG_MODE  = 0x0200;
     static constexpr uint16_t TAG_NTAG213 = 0x0001;
     static constexpr uint16_t TAG_NTAG215 = 0x0002;
     static constexpr uint16_t TAG_NTAG216 = 0x0003;
     static constexpr uint16_t TAG_MFC1K  = 0x0004;
-    static constexpr uint16_t TAG_CHINA2 = 0x0020;
     static constexpr uint16_t TAG_ISO15  = 0x000C;
+    static constexpr uint16_t TAG_CHINA2 = 0x0020;
 }
 
 // RF config constants
@@ -260,11 +261,18 @@ public:
 
         if (!is_nfc_unit()) {
             switch (protocol) {
-            case ProtocolKind::Iso14443A:
+            case ProtocolKind::Iso15693:
+                return dumpGroveISO15(uid_hint, out_lines, error);
+            case ProtocolKind::Iso14443A: {
+                std::string ntag_err;
+                if (dumpGroveNTAG(uid_hint, tag_type, out_lines, &ntag_err))
+                    return true;
+                return dumpGroveMFC(uid_hint, tag_type, mfc_key_hex, out_lines, progress, error);
+            }
             case ProtocolKind::MifareClassic:
                 return dumpGroveMFC(uid_hint, tag_type, mfc_key_hex, out_lines, progress, error);
             default:
-                if (error) *error = "GroveNFC dump currently supports MFC only";
+                if (error) *error = "GroveNFC dump supports MFC/NTAG/ISO15 only";
                 return false;
             }
         }
@@ -1020,7 +1028,6 @@ public:
 
         (void)writeSysReg(i2c_reg::SET_MODE, i2c_mode::DEFAULT | i2c_mode::TAG_NONE);
         delay_ms(3);
-        (void)writeSysReg(i2c_reg::SET_MODE, i2c_mode::DEFAULT | i2c_mode::TAG_ISO15);
         delay_ms(3);
         (void)writeSysReg(i2c_reg::SET_MODE, i2c_mode::DEFAULT | i2c_mode::TAG_NONE);
         delay_ms(3);
@@ -5566,6 +5573,222 @@ private:
         char buf[48];
         std::snprintf(buf, sizeof(buf), "FeliCa IDm:%s", card.uid.c_str());
         card.detail = buf;
+        return true;
+    }
+
+    // ── hex_from_line — extract hex digits from raw_data line ──────────────
+    static std::string hex_from_line(const std::string &s)
+    {
+        std::string result;
+        size_t start = 0;
+        const size_t colon = s.find(':');
+        if (colon != std::string::npos) start = colon + 1;
+        for (size_t i = start; i < s.size(); ++i)
+            if (std::isxdigit(static_cast<unsigned char>(s[i])))
+                result += static_cast<char>(std::toupper(static_cast<unsigned char>(s[i])));
+        return result;
+    }
+
+    // ── dumpGroveNTAG — read NTAG213/215/216 blocks via ISO14443A ─────────────
+        bool dumpGroveNTAG(const std::string &uid_hint,
+                       const std::string &tag_type,
+                       std::vector<std::string> &out_lines,
+                       std::string *error)
+    {
+        I2cCardInfo card;
+        if (!readISO14A(card)) {
+            if (error) *error = "GroveNFC ISO14443A select failed";
+            stopRF(); return false;
+        }
+        const bool is_ntag = (card.protocol.find("NTAG") != std::string::npos) ||
+                              tag_type.find("NTAG") != std::string::npos ||
+                              card.protocol.find("MFUL") != std::string::npos;
+        if (!is_ntag) { stopRF(); return false; }
+
+        const std::string suid = normalize_uid_hex(card.uid);
+        const std::string euid = normalize_uid_hex(uid_hint);
+        if (!euid.empty() && euid != suid) { stopRF(); return false; }
+
+        bool is_215 = (card.protocol == "NTAG215" || tag_type.find("NTAG215") != std::string::npos);
+        bool is_216 = (card.protocol == "NTAG216" || tag_type.find("NTAG216") != std::string::npos);
+        int total = is_216 ? 231 : (is_215 ? 135 : 45);
+
+        // RF stays ON from readISO14A(). Use 14A CRC for READ (0x30).
+        writeSysReg(i2c_reg::SET_TXCRCE, 0x0001);
+        writeSysReg(i2c_reg::SET_RXCRCE, 0x0001);
+        writeMiscReg(i2c_reg::MISC_TXLAST, 0x00);
+        delay_ms(5);
+
+        out_lines.clear();
+        // READ(0x30, block) returns 16 bytes = 4 blocks of 4 bytes each.
+        for (int start = 0; start < total; start += 4) {
+            const uint8_t cmd[2] = {0x30, static_cast<uint8_t>(start)};
+            uint8_t rx[32] = {0}; uint16_t rl = sizeof(rx);
+            if (txrx(cmd, 2, rx, rl, 30) && rl >= 4) {
+                int got = (rl < 16) ? (int)rl : 16;
+                char buf[80];
+                for (int i = 0; i < got && (start + i/4) < total; i += 4) {
+                    int blk = start + i/4;
+                    if (blk >= total) break;
+                    std::snprintf(buf, sizeof(buf), "%02d: %02X%02X%02X%02X",
+                                  blk, rx[i], rx[i+1], rx[i+2], rx[i+3]);
+                    out_lines.push_back(buf);
+                }
+            } else {
+                // Fill failed read with zero blocks
+                for (int i = 0; i < 4 && start+i < total; ++i) {
+                    char pad[40];
+                    std::snprintf(pad, sizeof(pad), "%02d: 00000000", start+i);
+                    out_lines.push_back(pad);
+                }
+            }
+        }
+        stopRF();
+        return !out_lines.empty();
+    }
+
+                        bool dumpGroveISO15(const std::string &uid_hint,
+                        std::vector<std::string> &out_lines,
+                        std::string *error)
+    {
+        I2cCardInfo card;
+        if (!readISO15(card)) { if (error) *error = "ISO15693 select failed"; stopRF(); return false; }
+
+        const std::string suid = normalize_uid_hex(card.uid);
+        const std::string euid = normalize_uid_hex(uid_hint);
+        if (!euid.empty() && euid != suid) { stopRF(); return false; }
+
+        /* Parse UID from scan result for Address flag */
+        std::vector<uint8_t> uid_bytes;
+        for (size_t i = 0; i + 1 < suid.size(); i += 2) {
+            char buf[3] = {suid[i], suid[i+1], 0};
+            uid_bytes.push_back((uint8_t)strtol(buf, nullptr, 16));
+        }
+
+        /* Full reset for clean state */
+        writeMiscReg(i2c_reg::MISC_RFON, 0x00); delay_ms(5);
+        writeSysReg(i2c_reg::SET_MODE, i2c_mode::DEFAULT | i2c_mode::TAG_NONE); delay_ms(5);
+        writeSysReg(i2c_reg::SET_MODE, i2c_mode::READER | i2c_mode::TAG_NONE); delay_ms(5);
+        writeSysReg(i2c_reg::SET_RFCFG, i2c_rfcfg::R15 | i2c_rfcfg::T15);
+        writeSysReg(i2c_reg::SET_TXCRCE, 0x0008);
+        writeSysReg(i2c_reg::SET_RXCRCE, 0x0008);
+        writeMiscReg(i2c_reg::MISC_TXLAST, 0x00);
+        writeMiscReg(i2c_reg::MISC_RFON, 0x01); delay_ms(15);
+
+        /* Re-inventory */
+        uint8_t inv_rx[64] = {0}; uint16_t inv_rl = sizeof(inv_rx);
+        const uint8_t inv[] = {0x26, 0x01, 0x00};
+        if (!txrx(inv, 3, inv_rx, inv_rl, 50) || inv_rl < 10) {
+            if (error) *error = "Re-inventory failed";
+            stopRF(); return false;
+        }
+
+        out_lines.clear();
+
+        /* Strategy: try READ_MULTIPLE_BLOCKS(0x23) with 2 blocks (9 byte response).
+         * If it fails, fall back to single block READ(0x20). */
+        for (int start = 0; start < 80; start += 2) {
+            /* Try read 2 blocks at once: {flags=0x26, cmd=0x23, start, count=2} */
+            bool got = false;
+            uint8_t rx[32] = {0}; uint16_t rl = sizeof(rx);
+
+            const uint8_t cmd_multi[4] = {0x26, 0x23, static_cast<uint8_t>(start), 2};
+            if (txrx(cmd_multi, 4, rx, rl, 80) && rl >= 9) {
+                for (int i = 0; i < 2 && start + i < 80; ++i) {
+                    int off = 1 + i * 4;
+                    char buf[40];
+                    std::snprintf(buf, sizeof(buf), "%02d: %02X%02X%02X%02X",
+                                 start + i, rx[off], rx[off+1], rx[off+2], rx[off+3]);
+                    out_lines.push_back(buf);
+                }
+                got = true;
+            }
+
+            if (!got) {
+                /* Fallback: single block READ(0x20) with Address flag + UID */
+                uint8_t cmd_single[11] = {0x36, 0x20, static_cast<uint8_t>(start)};
+                if (uid_bytes.size() >= 8) {
+                    /* flags=0x36 = 0x06(dual+high) + 0x10(Address) + 0x20(Option) */
+                    for (int j = 0; j < 8 && j < (int)uid_bytes.size(); ++j)
+                        cmd_single[3 + j] = uid_bytes[j];
+                    if (txrx(cmd_single, 11, rx, rl, 80) && rl >= 5) {
+                        char buf[40];
+                        std::snprintf(buf, sizeof(buf), "%02d: %02X%02X%02X%02X",
+                                     start, rx[1], rx[2], rx[3], rx[4]);
+                        out_lines.push_back(buf);
+                        got = true;
+                    }
+                }
+            }
+
+            if (!got) break;
+        }
+        stopRF();
+        return !out_lines.empty();
+    }
+
+    // ── emulateDump — write Saved dump data to GroveNFC EEPROM + start emu ────
+    bool emulateDump(ProtocolKind protocol,
+                     const std::string &tag_type,
+                     const std::vector<std::string> &raw_data,
+                     std::string *error)
+    {
+        if (!is_open() || is_nfc_unit()) {
+            if (error) *error = "GroveNFC required for emulate";
+            return false;
+        }
+
+        // Determine tag type register and EEPROM address
+        uint16_t type_reg = 0;
+        uint16_t eeprom_addr = 0;
+        size_t blk_sz = 0;
+
+        if (protocol == ProtocolKind::Iso15693) {
+            type_reg = i2c_mode::TAG_ISO15; eeprom_addr = TAG_ADDR_ISO15; blk_sz = 4;
+        } else if (tag_type.find("NTAG216") != std::string::npos) {
+            type_reg = i2c_mode::TAG_NTAG216; eeprom_addr = TAG_ADDR_NTAG216; blk_sz = 4;
+        } else if (tag_type.find("NTAG215") != std::string::npos) {
+            type_reg = i2c_mode::TAG_NTAG215; eeprom_addr = TAG_ADDR_NTAG215; blk_sz = 4;
+        } else if (tag_type.find("NTAG213") != std::string::npos) {
+            type_reg = i2c_mode::TAG_NTAG213; eeprom_addr = TAG_ADDR_NTAG213; blk_sz = 4;
+        } else if (protocol == ProtocolKind::MifareClassic ||
+                   tag_type.find("1K") != std::string::npos ||
+                   tag_type.find("4K") != std::string::npos) {
+            type_reg = i2c_mode::TAG_MFC1K; eeprom_addr = TAG_ADDR_MFC1K; blk_sz = 16;
+        } else {
+            if (error) *error = "Unsupported tag type for emulate";
+            return false;
+        }
+
+        // Stop RF, set default mode
+        writeMiscReg(i2c_reg::MISC_RFON, 0);
+        writeSysReg(i2c_reg::SET_MODE, i2c_mode::DEFAULT | i2c_mode::TAG_NONE);
+        delay_ms(10);
+
+        // Write data to EEPROM (I2cEpromReg_Addr 0x1000 + offset)
+        uint8_t block_buf[16] = {0};
+        size_t offset = 0;
+        for (const auto &line : raw_data) {
+            const std::string hex = hex_from_line(line);
+            size_t bytes = 0;
+            memset(block_buf, 0, sizeof(block_buf));
+            for (size_t i = 0; i + 1 < hex.size() && bytes < sizeof(block_buf); i += 2) {
+                unsigned int v = 0;
+                std::sscanf(hex.c_str() + i, "%02x", &v);
+                block_buf[bytes++] = static_cast<uint8_t>(v);
+            }
+            if (bytes > 0) {
+                writeData(i2c_reg::EPROM + eeprom_addr + offset, block_buf, static_cast<uint16_t>(bytes));
+                offset += bytes;
+            }
+        }
+
+        // Set tag address and start tag mode
+        writeSysReg(i2c_reg::SET_TAGADDR, eeprom_addr); delay_ms(5);
+        writeSysReg(i2c_reg::SET_MODE, i2c_mode::TAG_MODE | type_reg); delay_ms(10);
+        writeMiscReg(i2c_reg::MISC_RFON, 1);
+
+        if (error) error->clear();
         return true;
     }
 };
