@@ -127,6 +127,8 @@ private:
     uint32_t held_scroll_key_      = 0;
     uint32_t held_scroll_start_ms_ = 0;
     uint32_t held_scroll_last_ms_  = 0;
+    // ESC hold-to-exit tracking (0 = not held)
+    uint32_t esc_hold_start_ms_    = 0;
     // Hardware EMU slot (PN532Killer)
     int hw_emu_slot_ = 0;
     // Dump panel scroll offset (line index within dump_lines)
@@ -229,7 +231,7 @@ private:
     static constexpr int CONTENT_H = 120;
     static constexpr int LOG_VISIBLE_LINES = 9;
     // HexLog overlay: 320×140 content area, 11px per line => ~12 lines
-    static constexpr int LOG_VISIBLE_HEX_LINES = 11;
+    static constexpr int LOG_VISIBLE_HEX_LINES = 9;
 
     void creat_UI()
     {
@@ -438,6 +440,16 @@ private:
                 }
             }
         }
+        // ESC hold-to-exit: exit after 3s continuous hold
+        if (self->esc_hold_start_ms_ != 0) {
+            const uint32_t now = lv_tick_get();
+            if (now - self->esc_hold_start_ms_ >= 3000) {
+                self->esc_hold_start_ms_ = 0;
+                if (self->go_back_home) self->go_back_home();
+                return;
+            }
+        }
+
         // Auto-clear expired toast
         if (!self->toast_msg_.empty() && self->toast_expire_tick_ != 0) {
             if (lv_tick_get() >= self->toast_expire_tick_) {
@@ -506,28 +518,22 @@ private:
                 std::string result;
                 std::vector<std::string> new_lines;
                 const bool done = self->service_.drain_uart_test_logs(new_lines, result);
-                // Split lines that are too wide for the display (~52 chars)
-                // TX[]/RX[] byte-dump lines go to the log file only, not the on-screen log
-                constexpr size_t WRAP_COLS = 52;
+                // NFC => / NFC <= log lines go to file only, not the on-screen log
+                // Only show the final test result when done.
                 for (auto &l : new_lines) {
+                    if (l.size() >= 6 && (l.substr(0, 6) == "NFC =>" || l.substr(0, 6) == "NFC <="))
+                        continue;
                     if (l.size() >= 2 && ((l[0] == 'T' && l[1] == 'X') || (l[0] == 'R' && l[1] == 'X')))
                         continue;
-                    if (l.size() <= WRAP_COLS) {
-                        self->scan_log_lines_.push_back(std::move(l));
-                    } else {
-                        self->scan_log_lines_.push_back(l.substr(0, WRAP_COLS));
-                        size_t pos = WRAP_COLS;
-                        while (pos < l.size()) {
-                            self->scan_log_lines_.push_back("  " + l.substr(pos, WRAP_COLS - 2));
-                            pos += WRAP_COLS - 2;
-                        }
-                    }
+                    if (l.find("=== Result:") != std::string::npos || l.find("=== UART") != std::string::npos || l.find("=== Probing") != std::string::npos)
+                        continue;
                 }
-                if (self->scan_log_lines_.size() > 2000)
-                    self->scan_log_lines_.erase(self->scan_log_lines_.begin(),
-                        self->scan_log_lines_.begin() + (int)self->scan_log_lines_.size() - 2000);
+                if (done) {
+                    self->uart_test_result_ = result;
+                    self->ui_message_ = result;
+                    self->scan_log_lines_.push_back("> " + result);
+                }
                 self->log_scroll_offset_ = std::max(0, (int)self->scan_log_lines_.size() - self->read_log_visible_lines());
-                if (done) self->uart_test_result_ = result;
             }
             self->last_uart_test_running_ = test_running_now;
         }
@@ -561,6 +567,15 @@ private:
                     held_scroll_last_ms_  = held_scroll_start_ms_;
                 }
             }
+            // Track ESC press for hold-to-exit
+            if (nk == KEY_ESC && modal_ == Modal::None) {
+                if (esc_hold_start_ms_ == 0) {
+                    esc_hold_start_ms_ = lv_tick_get();
+                } else if (lv_tick_get() - esc_hold_start_ms_ >= 3000) {
+                    if (go_back_home) go_back_home();
+                    return;
+                }
+            }
             return;
         }
 
@@ -569,8 +584,9 @@ private:
         // On release, clear held scroll key
         {
             const uint32_t nk = normalize_main_key(raw_key);
-            if (nk == KEY_UP || nk == KEY_DOWN) {
+            if (nk == KEY_UP || nk == KEY_DOWN || nk == KEY_ESC) {
                 held_scroll_key_ = 0;
+                if (nk == KEY_ESC) esc_hold_start_ms_ = 0;
             }
         }
 
@@ -921,8 +937,8 @@ private:
             }
             break;
         case KEY_ESC:
-            // Show hint: user must hold ESC for 5s to exit
-            show_toast("Press ESC for 5s to exit");
+            if (esc_hold_start_ms_ == 0)
+                show_toast("Press ESC for 3s to exit");
             break;
         default:
             break;
@@ -2066,7 +2082,6 @@ private:
             render_read_tab(content);
             if (modal_ == Modal::PostScan) render_post_scan_modal(content);
             else if (modal_ == Modal::ReadMenu) render_read_menu_modal(content);
-            else if (modal_ == Modal::PortSettings) render_port_settings_modal(content);
             else if (modal_ == Modal::UsbSelect) render_usb_select_modal(content);
             else if (modal_ == Modal::I2cSelect) render_i2c_select_modal(content);
             else if (modal_ == Modal::SpiSelect) render_spi_select_modal(content);
@@ -2306,7 +2321,7 @@ private:
             const auto conn = service_.connection_state();
             return conn.connected ? "Reconnect Device" : "Connect Device";
         }
-        case ReadMenuAction::PortSettings: return "Port Settings";
+        case ReadMenuAction::PortSettings: return "Test Connection";
         case ReadMenuAction::Scan:         return "Scan";
         case ReadMenuAction::ScanOnceUHF:  return "Scan Once (UHF)";
         case ReadMenuAction::StartUHFContinuous: return "Start Inventory";
@@ -3527,24 +3542,13 @@ private:
                 break;
             }
             case ReadMenuAction::PortSettings:
-                if (ep.kind == nfc_app::TransportKind::UartSerial) {
-                    uart_edit_buf_ = service_.uart_config();
-                    port_settings_field_ = 0;
-                    edit_buf_.clear();
-                    uart_test_result_.clear();
-                    modal_ = Modal::PortSettings;
-                    modal_idx_ = 0;
-                } else if (ep.kind == nfc_app::TransportKind::I2cBus) {
-                    scan_log_lines_.push_back("> Scanning I2C buses...");
-                    i2c_select_list_ = service_.scan_i2c_devices();
-                    if (i2c_select_list_.empty()) {
-                        ui_message_ = "No I2C device";
-                    } else {
-                        i2c_select_idx_ = 0;
-                        modal_ = Modal::I2cSelect;
-                        modal_idx_ = 0;
-                    }
-                }
+                scan_log_lines_.clear();
+                log_scroll_offset_ = 0;
+                uart_test_result_.clear();
+                scan_log_lines_.push_back("> Test Connection...");
+                modal_ = Modal::None;
+                modal_idx_ = 0;
+                service_.start_uart_test();
                 break;
             case ReadMenuAction::Scan: {
                 // Scan
@@ -3975,70 +3979,6 @@ private:
         }
     }
 
-    // ── PortSettings modal — device path info + Test Connection ─────────────
-    void render_port_settings_modal(lv_obj_t *parent)
-    {
-        lv_obj_t *overlay = lv_obj_create(parent);
-        lv_obj_remove_style_all(overlay);
-        lv_obj_set_size(overlay, 320, CONTENT_H);
-        lv_obj_set_pos(overlay, 0, 0);
-        lv_obj_set_style_radius(overlay, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_set_style_bg_color(overlay, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_set_style_bg_opa(overlay, 160, LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_set_style_border_width(overlay, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
-
-        lv_obj_t *card = make_modal_card(overlay, 260, 90, 0xF7A600);
-        create_text(card, 8, 4, "Port Settings", 0xF7A600, 12);
-
-        // Device path (read-only)
-        {
-            std::string dev = uart_edit_buf_.device_path;
-            if (dev.empty()) {
-                auto uart_eps = service_.uart_endpoints();
-                dev = uart_eps.empty() ? "(no UART port)" : uart_eps[0].path;
-            }
-            if (dev.rfind("/dev/", 0) == 0) dev = dev.substr(5);
-            create_text(card, 8, 24, (std::string("Dev: ") + dev).c_str(), 0x888888, 10);
-        }
-
-        // TX/RX pins — always read-only / fixed on this platform
-        create_text(card, 8, 38, "TX/RX: 14/15 (fixed by DT)", 0x888888, 10);
-
-        // Test Connection — always selected on open
-        {
-            const bool sel = true;
-            uint32_t col = 0x00FF88;
-            create_text(card, 8, 56, "[ Test Connection ]", col, 12);
-        }
-
-        // Test result
-        if (!uart_test_result_.empty()) {
-            const bool ok = uart_test_result_.rfind("OK:", 0) == 0;
-            create_text(card, 8, 74, uart_test_result_.c_str(), ok ? 0x00FF88 : 0xFF6060, 10);
-        }
-    }
-
-    void handle_port_settings_key(uint32_t key)
-    {
-        if (key == KEY_ESC) {
-            nfc_app::UartConfig cfg = service_.uart_config();
-            cfg.baud_rate = 115200;
-            service_.set_uart_config(cfg);
-            ui_message_ = "Port settings saved";
-            modal_ = Modal::ReadMenu;
-            modal_idx_ = 0;
-            edit_buf_.clear();
-            uart_test_result_.clear();
-            return;
-        }
-        if (key == KEY_ENTER) {
-            uart_test_result_ = "Testing...";
-            service_.start_uart_test();
-            return;
-        }
-    }
-
     // ── Tool info popup ('i' key) ────────────────────────────────────────────
     void render_tool_info_modal(lv_obj_t *parent)    {
         lv_obj_t *card = make_modal_card(parent, 300, 100, 0x00D2FF);
@@ -4121,7 +4061,7 @@ private:
     {
         // Full-width dark panel covering entire content area
         lv_obj_t *panel = lv_obj_create(parent);
-        lv_obj_set_size(panel, 320, 150);
+        lv_obj_set_size(panel, 320, CONTENT_H);
         lv_obj_set_pos(panel, 0, 0);
         lv_obj_set_style_radius(panel, 0, LV_PART_MAIN);
         lv_obj_set_style_bg_color(panel, lv_color_hex(0x050505), LV_PART_MAIN);
@@ -5294,9 +5234,6 @@ private:
             break;
         case Modal::ReadMenu:
             handle_read_menu_key(key);
-            break;
-        case Modal::PortSettings:
-            handle_port_settings_key(key);
             break;
         case Modal::UsbSelect:
             handle_usb_select_key(key);

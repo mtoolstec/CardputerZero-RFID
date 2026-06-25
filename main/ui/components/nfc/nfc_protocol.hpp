@@ -465,13 +465,11 @@ public:
             return false;
         }
 
-        // Drain any stale bytes (e.g. postamble from the preceding GetFirmwareVersion).
-        // UART kernel buffers are slower to drain than USB-CDC; use 5×50ms (250ms total)
-        // to ensure any late-arriving bytes from GetFirmwareVersion are fully flushed.
+        // Drain any stale bytes from preceding command.
         {
             uint8_t flush[128];
-            for (int i = 0; i < 5; ++i)
-                transport_->read_bytes(flush, sizeof(flush), 50, nullptr);
+            for (int i = 0; i < 2; ++i)
+                transport_->read_bytes(flush, sizeof(flush), 30, nullptr);
         }
         // Pn532KillerCommand.checkPn532Killer = 0xAA
         const std::vector<uint8_t> frame = Pn532FrameCodec::build_command(0xAA, {});
@@ -479,13 +477,12 @@ public:
             return false;
         }
 
-        // Read up to 8×200ms = 1600ms total.  UART PN532Killer can be slower than
-        // USB-CDC to process the vendor command, especially right after GetFirmwareVersion.
-        // We skip any D4-TFI frames (command echoes) and ACK frames (len=0, already
+        // Read up to 4×200ms = 800ms total.  Skip D4-TFI frames (command echoes)
+        // and ACK frames (len=0, already
         // skipped by parse_first_frame) and keep accumulating until we see a D5 response.
         std::vector<uint8_t> rx;
         uint8_t buf[128];
-        for (int i = 0; i < 8; ++i) {
+        for (int i = 0; i < 4; ++i) {
             ssize_t got = transport_->read_bytes(buf, sizeof(buf), 200, error);
             if (got > 0) rx.insert(rx.end(), buf, buf + got);
             std::vector<uint8_t> tmp;
@@ -494,6 +491,7 @@ public:
                 if (tmp.size() >= 1 && tmp[0] == 0xD5) break;
             }
         }
+        // Plain PN532 never responds to D4AA — return false immediately.
         if (rx.empty()) return false;
 
         std::vector<uint8_t> data;
@@ -519,12 +517,11 @@ public:
         return (data[1] == 0xAB);
     }
 
-    // Convenience: probe device kind in one call.
-    // Returns DeviceKind and fills firmware string.
-    // Flow (mirrors Python pn532_com.py open()):
-    //   wakeup → SAMConfig (wait for response) → GetFirmwareVersion → checkPN532Killer(0xAA)
-    //   → for PN532Killer: wakeup → SAMConfig → SetWorkMode(READER) → SetRFRetries
-    //   → for plain PN532: SetRFRetries
+    // Probe device kind: D402 (GetFirmwareVersion) → D4AA (checkKiller).
+    // Flow: wakeup → SAMConfig → GetFirmwareVersion → if fails → Unknown
+    //       → checkPN532Killer(0xAA) → if responds → PN532Killer
+    //       → else → PN532
+    //       → for PN532Killer: wakeup → SAMConfig → SetWorkMode(READER) → SetRFRetries
     DeviceKind detect_device(std::string *firmware_out, std::string *error)
     {
         if (firmware_out) firmware_out->clear();
@@ -536,63 +533,27 @@ public:
                 transport_->read_bytes(flush, sizeof(flush), 30, nullptr);
         }
 
-        // Step 1: Wakeup preamble → SAMConfiguration (like Python set_normal_mode).
-        // send_wakeup() writes the preamble bytes with NO delay so that sam_configuration()
-        // writes the SAMConfig frame immediately after — this is exactly what Python does:
-        //   communication.write(wakeup_bytes)   ← no sleep
-        //   send_cmd_sync(SAMConfiguration)     ← waits for D5 15 response
-        // On a cold USB connect the PN532 may need multiple attempts; retry up to 2×.
-        bool sam_ok = false;
-        for (int sam_try = 0; sam_try < 2 && !sam_ok; ++sam_try) {
-            if (sam_try > 0) {
-                // Drain any late bytes from the previous timed-out SAMConfig attempt.
-                uint8_t drain[256];
-                for (int i = 0; i < 5; ++i)
-                    transport_->read_bytes(drain, sizeof(drain), 50, nullptr);
-            }
-            send_wakeup();                        // write preamble – NO sleep after
-            sam_ok = sam_configuration(nullptr);  // write SAMConfig + wait ≤2500 ms
-        }
+        // Step 1: Wakeup → SAMConfig.
+        send_wakeup();
+        sam_configuration(nullptr);
 
-        // Drain any residual bytes (echo, extra ACK, or late SAMConfig when sam_ok=false).
+        // Drain residual bytes.
         {
             uint8_t drain[128];
             for (int i = 0; i < 2; ++i)
                 transport_->read_bytes(drain, sizeof(drain), 30, nullptr);
         }
 
-        // Step 2: GetFirmwareVersion.
-        // When sam_ok=true the SAMConfig response was already consumed by collect_response,
-        // so there are no stale bytes to poison this command.
-        // When sam_ok=false (all SAMConfig retries timed out) we still try once; the chip
-        // may have woken up during the retries even if the response was never seen.
-        std::optional<Pn532FirmwareInfo> fw = query_firmware(error);
-        if (!fw) {
-            // Last-resort extra cycle: drain late bytes, fresh wakeup+SAMConfig, retry firmware.
-            {
-                uint8_t drain[256];
-                for (int i = 0; i < 5; ++i)
-                    transport_->read_bytes(drain, sizeof(drain), 50, nullptr);
-            }
-            send_wakeup();
-            sam_configuration(nullptr);
-            {
-                uint8_t drain[64];
-                for (int i = 0; i < 2; ++i)
-                    transport_->read_bytes(drain, sizeof(drain), 30, nullptr);
-            }
-            fw = query_firmware(error);
-            if (!fw) return DeviceKind::Unknown;
-        }
+        // Step 2: GetFirmwareVersion first — detects both PN532 and PN532Killer.
+        auto fw = query_firmware(error);
+        if (!fw) return DeviceKind::Unknown;
 
-        // Build a preliminary firmware label (overridden below for PN532Killer).
+        // Build preliminary firmware label (overridden for PN532Killer).
         if (firmware_out) *firmware_out = fw->chip + " " + fw->version;
 
-        // Step 3: checkPn532Killer (0xAA) to distinguish PN532Killer from plain PN532.
-        // Must be done AFTER GetFirmwareVersion so the PN532 is in a known good state.
-        // Fallback: PN532Killer encodes the build date as vYEAR.MONTH (e.g. v26.03), while
-        // plain PN532 always reports v1.xx (NXP silicon revision). If the 0xAA vendor probe
-        // fails (e.g. UART timing differences), use the version major number as a heuristic.
+        // Step 3: checkPn532Killer (0xAA) to distinguish Killer from plain PN532.
+        // Fallback: PN532Killer encodes build date as vYEAR.MONTH (≥ v10), while
+        // plain PN532 reports v1.xx (NXP silicon revision).
         bool version_looks_like_killer = false;
         if (!fw->version.empty() && fw->version[0] == 'v') {
             int ver = std::atoi(fw->version.c_str() + 1);
@@ -600,22 +561,13 @@ public:
         }
         const bool is_killer = probe_pn532killer(nullptr) || version_looks_like_killer;
 
-        // Step 4: drain any bytes left over from the 0xAA probe before next commands.
-        {
-            uint8_t drain[128];
-            for (int i = 0; i < 4; ++i)
-                transport_->read_bytes(drain, sizeof(drain), 50, nullptr);
-        }
-
         if (is_killer) {
-            // Override firmware label: PN532Killer reports date as vYEAR.MONTH.DAY.
             if (firmware_out) {
                 char killer_ver[48];
                 std::snprintf(killer_ver, sizeof(killer_ver), "PN532Killer %s.%02d",
                               fw->version.c_str(), static_cast<int>(fw->day));
                 *firmware_out = killer_ver;
             }
-            // Step 5a: re-wakeup so PN532Killer responds cleanly to SetWorkMode.
             send_wakeup();
             sam_configuration(nullptr);
             set_work_mode(0x01, 0x01, 0x00, nullptr);
@@ -623,8 +575,6 @@ public:
             return DeviceKind::PN532Killer;
         }
 
-        // Step 5b: plain PN532 – set finite retry count so InListPassiveTarget
-        // returns within ~820 ms when no card is present (0x20 = 32 retries × 25.6 ms).
         set_rf_passive_retries(0x20, nullptr);
         return DeviceKind::PN532;
     }

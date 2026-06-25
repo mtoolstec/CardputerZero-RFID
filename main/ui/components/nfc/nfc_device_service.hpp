@@ -458,6 +458,7 @@ public:
             uart_test_running_ = true;
             uart_test_log_lines_.clear();
             uart_test_result_.clear();
+            NfcHexLog::get().clear();
         }
         if (uart_test_thread_.joinable()) uart_test_thread_.join();
         uart_test_thread_ = std::thread([this]() {
@@ -524,35 +525,61 @@ public:
             public:
                 INfcTransport *inner;
                 std::function<void(const std::string&)> log;
-                ssize_t write_bytes(const uint8_t *b, size_t n, std::string *err) override {
-                    std::string hex = "TX[" + std::to_string(n) + "] ";
-                    for (size_t i = 0; i < n && i < 64; ++i) {
-                        char buf[3]; std::snprintf(buf, sizeof(buf), "%02X", b[i]);
-                        hex += buf;
+               ssize_t write_bytes(const uint8_t *b, size_t n, std::string *err) override {
+                    std::string hex;
+                    // Strip HSU frame headers: preamble(3) + len(1) + lcs(1) + tfi(1)
+                    if (n >= 6 && b[0] == 0x00 && b[1] == 0x00 && b[2] == 0xFF && b[3] > 0) {
+                        const size_t data_start = 6;
+                        const size_t data_end = data_start + (size_t)(b[3] - 1);
+                        const size_t show_end = std::min(data_end, n);
+                        for (size_t i = data_start; i < show_end; ++i) {
+                            char buf[3]; std::snprintf(buf, sizeof(buf), "%02X", b[i]);
+                            hex += buf;
+                        }
+                    } else {
+                        for (size_t i = 0; i < n && i < 64; ++i) {
+                            char buf[3]; std::snprintf(buf, sizeof(buf), "%02X", b[i]);
+                            hex += buf;
+                        }
                     }
-                    if (n > 64) hex += "...";
-                    log(hex);
+                    NfcHexLog::get().log_tx("UART", b, n);
+                    log("NFC => " + hex);
                     return inner->write_bytes(b, n, err);
                 }
                 ssize_t read_bytes(uint8_t *b, size_t n, int timeout_ms, std::string *err) override {
                     ssize_t got = inner->read_bytes(b, n, timeout_ms, err);
                     if (got <= 0) return got;
-                    // After the first bytes arrive, drain any immediately available
-                    // continuation bytes (0 ms timeout) so the whole response frame
-                    // lands in a single log line instead of one-byte-per-line.
+                    // Drain any immediately available continuation bytes.
                     while ((size_t)got < n) {
                         ssize_t more = inner->read_bytes(b + got, n - (size_t)got, 0, nullptr);
                         if (more <= 0) break;
                         got += more;
                     }
-                    std::string hex = "RX[" + std::to_string(got) + "] ";
-                    constexpr ssize_t MAX_LOG = 64;
-                    for (ssize_t i = 0; i < got && i < MAX_LOG; ++i) {
-                        char buf[3]; std::snprintf(buf, sizeof(buf), "%02X", b[i]);
-                        hex += buf;
+                    std::string hex;
+                    // Find the first HSU frame in received bytes and log just its payload
+                    bool found_frame = false;
+                    for (ssize_t off = 0; off <= got - 6; ++off) {
+                        if (b[off] == 0x00 && b[off+1] == 0x00 && b[off+2] == 0xFF && b[off+3] >= 2) {
+                            const uint8_t len = b[off + 3];
+                            const size_t data_start = (size_t)off + 6;
+                            const size_t data_end = data_start + (len > 0 ? (size_t)(len - 1) : 0);
+                            if (data_end <= (size_t)got) {
+                                for (size_t i = data_start; i < data_end; ++i) {
+                                    char buf[3]; std::snprintf(buf, sizeof(buf), "%02X", b[i]);
+                                    hex += buf;
+                                }
+                                found_frame = true;
+                                break;
+                            }
+                        }
                     }
-                    if (got > MAX_LOG) hex += "...";
-                    log(hex);
+                    if (!found_frame) {
+                        // No valid HSU frame found — log raw bytes
+                        for (ssize_t ri = 0; ri < got && ri < 64; ++ri) { char buf[3]; std::snprintf(buf, sizeof(buf), "%02X", b[ri]); hex += buf; }
+                    }
+                    if (got > 64) hex += "...";
+                    NfcHexLog::get().log_rx("UART", b, got);
+                    log("NFC <= " + hex);
                     return got;
                 }
                 bool is_open() const override { return inner->is_open(); }
