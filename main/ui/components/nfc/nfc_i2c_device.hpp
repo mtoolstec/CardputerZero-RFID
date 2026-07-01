@@ -5251,20 +5251,23 @@ private:
         }
 
         if (!(status & STATUS_RECV_DONE)) {
-            stopRF();
-            delay_ms(2);
             return false;
         }
 
-        const uint16_t rx_len = readSysReg(i2c_reg::RX_LEN);
-        if (rx_len == 0 || rx_len > out_len) {
-            stopRF();
-            delay_ms(2);
+        uint16_t rx_len = readSysReg(i2c_reg::RX_LEN);
+        // RX_LEN=0 can happen on some GroveNFC firmware even when data is ready.
+        // Fallback: read a default buffer and determine length from data.
+        if (rx_len == 0) {
+            rx_len = out_len;
+            if (rx_len > 64) rx_len = 64;
+        }
+        if (rx_len > out_len) {
+            rx_len = out_len;
+        }
+        if (rx_len == 0) {
             return false;
         }
         if (!readData(i2c_reg::DATA, out, rx_len)) {
-            stopRF();
-            delay_ms(2);
             return false;
         }
         out_len = rx_len;
@@ -5619,12 +5622,66 @@ private:
         writeMiscReg(i2c_reg::MISC_TXLAST, 0x00);
         delay_ms(5);
 
+        // After readISO14A, the chip may have a stale TIMEOUT from
+        // GET_VERSION probe. Re-select the card via REQA+AC+SELECT
+        // (without GET_VERSION) to clear the chip state before reading.
+        {
+            writeSysReg(i2c_reg::SET_TXCRCE, 0x0000);
+            writeSysReg(i2c_reg::SET_RXCRCE, 0x0000);
+            writeMiscReg(i2c_reg::MISC_TXLAST, 0x07);
+            writeMiscReg(i2c_reg::MISC_RFON, 0x00); delay_ms(10);
+            writeMiscReg(i2c_reg::MISC_RFON, 0x01); delay_ms(15);
+            uint8_t rs_rx[64] = {0}; uint16_t rs_rl = sizeof(rs_rx);
+            const uint8_t rs_reqa[] = {0x52};
+            if (txrx(rs_reqa, 1, rs_rx, rs_rl, 10) && rs_rl >= 2) {
+                writeMiscReg(i2c_reg::MISC_TXLAST, 0x00);
+                const uint8_t rs_ac1[] = {0x93, 0x20};
+                rs_rl = sizeof(rs_rx); memset(rs_rx, 0, sizeof(rs_rx));
+                if (txrx(rs_ac1, 2, rs_rx, rs_rl, 10) && rs_rl >= 5) {
+                    writeSysReg(i2c_reg::SET_TXCRCE, 0x0001);
+                    writeSysReg(i2c_reg::SET_RXCRCE, 0x0001);
+                    uint8_t rs_sel1[] = {0x93, 0x70, rs_rx[0], rs_rx[1], rs_rx[2], rs_rx[3], rs_rx[4]};
+                    rs_rl = sizeof(rs_rx); memset(rs_rx, 0, sizeof(rs_rx));
+                    txrx(rs_sel1, 7, rs_rx, rs_rl, 10);
+                    if (rs_sel1[2] == 0x88) {
+                        writeSysReg(i2c_reg::SET_TXCRCE, 0x0000);
+                        writeSysReg(i2c_reg::SET_RXCRCE, 0x0000);
+                        const uint8_t rs_ac2[] = {0x95, 0x20};
+                        rs_rl = sizeof(rs_rx); memset(rs_rx, 0, sizeof(rs_rx));
+                        if (txrx(rs_ac2, 2, rs_rx, rs_rl, 10) && rs_rl >= 5) {
+                            writeSysReg(i2c_reg::SET_TXCRCE, 0x0001);
+                            writeSysReg(i2c_reg::SET_RXCRCE, 0x0001);
+                            uint8_t rs_sel2[] = {0x95, 0x70, rs_rx[0], rs_rx[1], rs_rx[2], rs_rx[3], rs_rx[4]};
+                            rs_rl = sizeof(rs_rx); memset(rs_rx, 0, sizeof(rs_rx));
+                            txrx(rs_sel2, 7, rs_rx, rs_rl, 10);
+                        }
+                    }
+                }
+            }
+        }
+
         out_lines.clear();
         // READ(0x30, block) returns 16 bytes = 4 blocks of 4 bytes each.
+        // If a read fails, re-select card and retry once before filling zeros.
+        bool need_reselect = false;
         for (int start = 0; start < total; start += 4) {
             const uint8_t cmd[2] = {0x30, static_cast<uint8_t>(start)};
             uint8_t rx[32] = {0}; uint16_t rl = sizeof(rx);
-            if (txrx(cmd, 2, rx, rl, 30) && rl >= 4) {
+            bool ok = txrx(cmd, 2, rx, rl, 30) && rl >= 4;
+            if (!ok && !need_reselect) {
+                // First failure: re-select the card and retry
+                I2cCardInfo recard;
+                if (readISO14A(recard)) {
+                    writeSysReg(i2c_reg::SET_TXCRCE, 0x0001);
+                    writeSysReg(i2c_reg::SET_RXCRCE, 0x0001);
+                    writeMiscReg(i2c_reg::MISC_TXLAST, 0x00);
+                    delay_ms(5);
+                    rl = sizeof(rx); memset(rx, 0, sizeof(rx));
+                    ok = txrx(cmd, 2, rx, rl, 30) && rl >= 4;
+                }
+                need_reselect = true;
+            }
+            if (ok) {
                 int got = (rl < 16) ? (int)rl : 16;
                 char buf[80];
                 for (int i = 0; i < got && (start + i/4) < total; i += 4) {

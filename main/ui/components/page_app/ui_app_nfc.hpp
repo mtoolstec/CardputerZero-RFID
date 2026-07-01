@@ -59,6 +59,7 @@ class UINfcPage : public app_base
         ConnectDevice,
         PortSettings,
         Scan,
+        Write,
         ScanOnceUHF,
         StartUHFContinuous,
         StopUHFContinuous,
@@ -143,6 +144,7 @@ private:
     bool last_hw_upload_running_  = false;
     int pending_hw_upload_slot_   = -1;
     // MFKey tool state
+    bool last_hw_write_running_  = false;
     bool last_hw_mfkey_running_  = false;
     std::vector<nfc_app::NfcDeviceService::MfkeyResult> mfkey_results_;
     int  mfkey_result_idx_ = 0;
@@ -231,7 +233,7 @@ private:
     static constexpr int CONTENT_H = 120;
     static constexpr int LOG_VISIBLE_LINES = 9;
     // HexLog overlay: 320×140 content area, 11px per line => ~12 lines
-    static constexpr int LOG_VISIBLE_HEX_LINES = 9;
+    static constexpr int LOG_VISIBLE_HEX_LINES = 8;
 
     void creat_UI()
     {
@@ -394,7 +396,7 @@ private:
             }
         }
         self->last_emu_probe_running_ = emu_probe_running_now;
-        // Long-press scroll: hold 400ms→scroll, hold 1500ms→fast scroll, hold 2000ms→jump to top/bottom
+        // Long-press scroll: hold 400ms→scroll (1 line), hold 1500ms→fast page scroll
         // Works for Read tab scan log AND for HexLog modal
         if (self->held_scroll_key_ != 0) {
             const bool is_read_scroll = self->modal_ == Modal::None && self->current_tab_ == Tab::Read;
@@ -402,41 +404,27 @@ private:
             if (is_read_scroll || is_hexlog_scroll) {
                 const uint32_t now = lv_tick_get();
                 const uint32_t held_ms = now - self->held_scroll_start_ms_;
-                if (held_ms > 2000 && now - self->held_scroll_last_ms_ > 200) {
-                    // Jump directly to top or bottom
-                    const bool to_bottom = (self->held_scroll_key_ == KEY_DOWN);
+                const int page_size = is_read_scroll ? self->read_log_visible_lines() : LOG_VISIBLE_HEX_LINES;
+                if (page_size < 1) { self->held_scroll_key_ = 0; return; }
+                const uint32_t interval = (held_ms > 800) ? 40 : 150;
+                if (held_ms > 400 && now - self->held_scroll_last_ms_ > interval) {
+                    const int dir   = (self->held_scroll_key_ == KEY_DOWN) ? 1 : -1;
+                    const int step  = (held_ms > 800) ? page_size : 1;
+                    const int delta = dir * step;
                     if (is_read_scroll) {
                         const int max_scroll = self->read_scroll_max_offset();
-                        self->log_scroll_offset_ = to_bottom ? max_scroll : 0;
-                        self->uhf_table_scroll_offset_ = to_bottom ? max_scroll : 0;
+                        if (self->read_uses_uhf_table()) {
+                            self->uhf_table_scroll_offset_ = std::max(0, std::min(max_scroll, self->uhf_table_scroll_offset_ + delta));
+                        } else {
+                            self->log_scroll_offset_ = std::max(0, std::min(max_scroll, self->log_scroll_offset_ + delta));
+                        }
                     } else {
                         const int total = nfc_app::NfcHexLog::get().total_lines();
                         const int max_scroll = std::max(0, total - LOG_VISIBLE_HEX_LINES);
-                        self->hex_log_scroll_ = to_bottom ? max_scroll : 0;
+                        self->hex_log_scroll_ = std::max(0, std::min(max_scroll, self->hex_log_scroll_ + delta));
                         self->render_all();
                     }
                     self->held_scroll_last_ms_ = now;
-                } else {
-                    const uint32_t interval = (held_ms > 1500) ? 50 : 150;
-                    if (held_ms > 400 && now - self->held_scroll_last_ms_ > interval) {
-                        const int dir   = (self->held_scroll_key_ == KEY_DOWN) ? 1 : -1;
-                        const int step  = (held_ms > 1500) ? 3 : 1;
-                        const int delta = dir * step;
-                        if (is_read_scroll) {
-                            const int max_scroll = self->read_scroll_max_offset();
-                            if (self->read_uses_uhf_table()) {
-                                self->uhf_table_scroll_offset_ = std::max(0, std::min(max_scroll, self->uhf_table_scroll_offset_ + delta));
-                            } else {
-                                self->log_scroll_offset_ = std::max(0, std::min(max_scroll, self->log_scroll_offset_ + delta));
-                            }
-                        } else {
-                            const int total = nfc_app::NfcHexLog::get().total_lines();
-                            const int max_scroll = std::max(0, total - LOG_VISIBLE_HEX_LINES);
-                            self->hex_log_scroll_ = std::max(0, std::min(max_scroll, self->hex_log_scroll_ + delta));
-                            self->render_all();
-                        }
-                        self->held_scroll_last_ms_ = now;
-                    }
                 }
             }
         }
@@ -511,6 +499,20 @@ private:
             self->show_toast(self->mfkey_results_.empty() ? "No results" : "Cracking done");
         }
         self->last_hw_mfkey_running_ = mfkey_running_now;
+        // Detect write card completion
+        {
+            const bool write_running_now = self->service_.write_card_running();
+            if (self->last_hw_write_running_ && !write_running_now) {
+            if (self->service_.write_card_ok()) {
+                self->scan_log_lines_.push_back("> Write OK");
+                self->ui_message_ = "Write OK";
+            } else {
+                self->scan_log_lines_.push_back("> Write FAIL: " + self->service_.write_card_error());
+                self->ui_message_ = "Write FAIL";
+            }
+            self->last_hw_write_running_ = write_running_now;
+        }
+        }
         // Detect UART test completion → drain logs to scan_log_lines_ and update result
         {
             const bool test_running_now = self->service_.uart_test_running();
@@ -581,12 +583,19 @@ private:
 
         if (!IS_KEY_RELEASED(e)) return;
 
-        // On release, clear held scroll key
+        // On release, clear held scroll key.
+        // Only check ESC hold-to-exit when no modal is open.
         {
             const uint32_t nk = normalize_main_key(raw_key);
             if (nk == KEY_UP || nk == KEY_DOWN || nk == KEY_ESC) {
                 held_scroll_key_ = 0;
-                if (nk == KEY_ESC) esc_hold_start_ms_ = 0;
+                if (nk == KEY_ESC && esc_hold_start_ms_ != 0) {
+                    if (modal_ == Modal::None && lv_tick_get() - esc_hold_start_ms_ >= 3000) {
+                        if (go_back_home) go_back_home();
+                        return;
+                    }
+                    esc_hold_start_ms_ = 0;
+                }
             }
         }
 
@@ -2322,6 +2331,7 @@ private:
             return conn.connected ? "Reconnect Device" : "Connect Device";
         }
         case ReadMenuAction::PortSettings: return "Test Connection";
+        case ReadMenuAction::Write:        return "Write Card";
         case ReadMenuAction::Scan:         return "Scan";
         case ReadMenuAction::ScanOnceUHF:  return "Scan Once (UHF)";
         case ReadMenuAction::StartUHFContinuous: return "Start Inventory";
@@ -2361,8 +2371,11 @@ private:
         const std::string prefix = line.substr(0, colon + 1);
         create_text(parent, x_base, y, prefix.c_str(), 0x606060, DUMP_FONT);
 
-        const int hx = x_base + static_cast<int>((colon + 1) * CW);  // hex data starts after "BB:"
-        const std::string hex = line.substr(colon + 1);
+        // hex data starts after "BB:" — strip any leading space
+        size_t hex_colon_skip = colon + 1;
+        while (hex_colon_skip < line.size() && line[hex_colon_skip] == ' ') hex_colon_skip++;
+        const int hx = x_base + static_cast<int>((hex_colon_skip) * CW);
+        const std::string hex = line.substr(hex_colon_skip);
 
         auto is_all_hex = [](const std::string &s) {
             if (s.empty()) return false;
@@ -2404,7 +2417,7 @@ private:
 
             const std::string ascii = ascii_from_hex(hex);
             create_text(parent, hx + 10 * CW, y, "|", 0x606060, DUMP_FONT);
-            create_text(parent, hx + 12 * CW, y, ascii.c_str(), 0x8FD0FF, DUMP_FONT);
+            create_text(parent, hx + 12 * CW, y, to_compact(ascii, 4).c_str(), 0x8FD0FF, DUMP_FONT);
             return;
         }
 
@@ -3550,6 +3563,12 @@ private:
                 modal_idx_ = 0;
                 service_.start_uart_test();
                 break;
+            case ReadMenuAction::Write:
+                scan_log_lines_.push_back("> Write card...");
+                service_.start_write_card();
+                modal_ = Modal::None;
+                modal_idx_ = 0;
+                break;
             case ReadMenuAction::Scan: {
                 // Scan
                 modal_ = Modal::None;
@@ -4108,7 +4127,7 @@ private:
         // Footer hint
         lv_obj_t *footer = lv_obj_create(panel);
         lv_obj_set_size(footer, 320, 13);
-        lv_obj_set_pos(footer, 0, 137);
+        lv_obj_set_pos(footer, 0, 15 + LOG_VISIBLE_HEX_LINES * 11 + 4);
         lv_obj_set_style_radius(footer, 0, LV_PART_MAIN);
         lv_obj_set_style_bg_color(footer, lv_color_hex(0x1A1A2E), LV_PART_MAIN);
         lv_obj_set_style_bg_opa(footer, 255, LV_PART_MAIN);
@@ -4941,7 +4960,7 @@ private:
         const bool has_first_action = is_i2c_dev || is_pn532killer;
         const int n_opts = has_first_action ? (show_write_to_tag ? 5 : 4)
                                             : (show_write_to_tag ? 4 : 3);
-        const lv_coord_t card_h = static_cast<lv_coord_t>(24 + n_opts * 20);
+        const lv_coord_t card_h = static_cast<lv_coord_t>(24 + std::min(n_opts, 4) * 20 + (n_opts > 4 ? 12 : 0));
         lv_obj_t *card = make_modal_card(parent, 220, card_h, 0xF7A600);
         create_text(card, 8, 6, to_compact(rec.meta.display_name, 26).c_str(), 0xFFFFFF, 12);
 
@@ -4955,13 +4974,22 @@ private:
         options.push_back("Edit Hex Data");
         options.push_back("Delete");
 
-        for (int i = 0; i < static_cast<int>(options.size()); ++i) {
+        const int max_visible = 4;
+        const int opt_count = static_cast<int>(options.size());
+        // Adjust scroll so selected item is always visible
+        int scroll_off = 0;
+        if (modal_idx_ >= max_visible) scroll_off = modal_idx_ - max_visible + 1;
+        if (scroll_off > opt_count - max_visible) scroll_off = std::max(0, opt_count - max_visible);
+        const int vis_count = std::min(opt_count, max_visible);
+        for (int vi = 0; vi < vis_count; ++vi) {
+            const int i = scroll_off + vi;
+            if (i >= opt_count) break;
             const bool sel = (modal_idx_ == i);
             const bool is_delete = (i == static_cast<int>(options.size()) - 1);
             lv_obj_t *row = lv_obj_create(card);
             lv_obj_remove_style_all(row);  // must be before set_size (size is a style in LVGL9)
             lv_obj_set_size(row, 204, 18);
-            lv_obj_set_pos(row, 8, 24 + i * 20);
+            lv_obj_set_pos(row, 8, 24 + vi * 20);
             lv_obj_set_style_bg_color(row, lv_color_hex(sel ? (is_delete ? 0xFF4444 : 0xF7A600) : (is_delete ? 0x3A1A1A : 0x2A2A2A)), LV_PART_MAIN | LV_STATE_DEFAULT);
             lv_obj_set_style_bg_opa(row, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
             lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);

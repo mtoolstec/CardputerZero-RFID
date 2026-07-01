@@ -1449,6 +1449,20 @@ public:
         return true;
     }
 
+    // NTAG21x write page (0xA2) via InDataExchange.
+    // Writes 4 bytes to an NTAG page. No authentication needed.
+    bool ntag_write_page(uint8_t page, const std::vector<uint8_t> &page_data, std::string *error = nullptr)
+    {
+        if (page_data.size() != 4) {
+            if (error) *error = "page data must be 4 bytes";
+            return false;
+        }
+        std::vector<uint8_t> resp;
+        if (!in_data_exchange(0x01, {0xA2, page, page_data[0], page_data[1], page_data[2], page_data[3]}, &resp, error))
+            return false;
+        return true;
+    }
+
     bool in_communicate_thru_checked(const std::vector<uint8_t> &command,
                                      bool append_crc,
                                      std::vector<uint8_t> *resp_data,

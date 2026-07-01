@@ -543,7 +543,7 @@ public:
                         }
                     }
                     NfcHexLog::get().log_tx("UART", b, n);
-                    log("NFC => " + hex);
+                    if (!hex.empty()) log("NFC => " + hex);
                     return inner->write_bytes(b, n, err);
                 }
                 ssize_t read_bytes(uint8_t *b, size_t n, int timeout_ms, std::string *err) override {
@@ -579,7 +579,7 @@ public:
                     }
                     if (got > 64) hex += "...";
                     NfcHexLog::get().log_rx("UART", b, got);
-                    log("NFC <= " + hex);
+                    if (!hex.empty()) log("NFC <= " + hex);
                     return got;
                 }
                 bool is_open() const override { return inner->is_open(); }
@@ -2653,6 +2653,74 @@ public:
 
         scan_thread_ = std::thread([this]() { perform_dump_from_last_scan(); });
         return true;
+    }
+
+    // ── Async write card ───────────────────────────────────────────────────────
+    bool can_write_card(std::string *error = nullptr) const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (connection_.device_kind == DeviceKind::UHFReader) {
+            if (error) *error = "UHF reader does not support card write";
+            return false;
+        }
+        if (!scan_.has_result) {
+            if (error) *error = "Scan card first";
+            return false;
+        }
+        const auto p = scan_.last_record.tag.protocol;
+        if (p != ProtocolKind::MifareClassic && p != ProtocolKind::Iso14443A) {
+            if (error) *error = "Write supports MFC/NTAG only";
+            return false;
+        }
+        return true;
+    }
+
+    bool start_write_card()
+    {
+        stop_pn532_ndef_emulation();
+        if (scan_thread_.joinable()) scan_thread_.join();
+        cancel_emu_probe_.store(true);
+        if (emu_probe_thread_.joinable()) emu_probe_thread_.join();
+        cancel_emu_probe_.store(false);
+        cancel_emu_dump_.store(true);
+        if (emu_dump_thread_.joinable()) emu_dump_thread_.join();
+        cancel_emu_dump_.store(false);
+
+        std::string precheck_error;
+        if (!can_write_card(&precheck_error)) {
+            if (scan_thread_.joinable()) scan_thread_.join();
+            return false;
+        }
+        cancel_hw_write_.store(true);
+        if (hw_write_thread_.joinable()) hw_write_thread_.join();
+        cancel_hw_write_.store(false);
+        {
+            std::lock_guard<std::mutex> lk(pending_log_mutex_);
+            hw_write_running_ = true;
+            hw_write_progress_ = 0;
+            hw_write_ok_ = false;
+            hw_write_error_.clear();
+        }
+        hw_write_thread_ = std::thread([this]() { perform_write_card(); });
+        return true;
+    }
+
+    bool write_card_running() const
+    {
+        std::lock_guard<std::mutex> lk(pending_log_mutex_);
+        return hw_write_running_;
+    }
+
+    bool write_card_ok() const
+    {
+        std::lock_guard<std::mutex> lk(pending_log_mutex_);
+        return hw_write_ok_;
+    }
+
+    std::string write_card_error() const
+    {
+        std::lock_guard<std::mutex> lk(pending_log_mutex_);
+        return hw_write_error_;
     }
 
     bool can_save_last_dump(std::string *error = nullptr) const
@@ -7201,6 +7269,13 @@ private:
     bool uart_test_running_ = false;          // guarded by pending_log_mutex_
     std::string uart_test_result_;            // guarded by pending_log_mutex_
     std::vector<std::string> uart_test_log_lines_; // guarded by pending_log_mutex_
+    // Async write card
+    std::thread hw_write_thread_;
+    std::atomic<bool> cancel_hw_write_{false};
+    bool hw_write_running_ = false;          // guarded by pending_log_mutex_
+    int  hw_write_progress_ = 0;             // 0-100
+    bool hw_write_ok_       = false;          // guarded by pending_log_mutex_
+    std::string hw_write_error_;              // guarded by pending_log_mutex_
     Pn532NdefState pn532_ndef_;
 
     void finish_uart_test(const std::string &result)
@@ -7208,6 +7283,72 @@ private:
         std::lock_guard<std::mutex> lk(pending_log_mutex_);
         uart_test_result_ = result;
         uart_test_running_ = false;
+    }
+
+    void perform_write_card()
+    {
+        TransportEndpoint endpoint;
+        INfcTransport *transport_raw = nullptr;
+        SavedRecord record;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            endpoint = connection_.endpoint;
+            transport_raw = transport_.get();
+            record = scan_.last_record;
+        }
+
+        bool ok = false;
+        std::string write_error;
+
+        if (!transport_raw || !transport_raw->is_open()) {
+            write_error = "transport not open"; goto done;
+        }
+
+        {
+            std::lock_guard<std::mutex> op_lock(transport_op_mutex_);
+            Pn532KillerClient client(transport_raw);
+            const auto p = record.tag.protocol;
+
+            TagInfo tag;
+            if (!client.in_list_passive_target_iso14443a(&tag, &write_error))
+                { write_error = "re-select failed: " + write_error; goto done; }
+
+            // Parse hex UID to bytes
+            std::vector<uint8_t> uid_bytes;
+            for (size_t ui = 0; ui + 1 < tag.uid.size(); ui += 2) {
+                char hb[3] = {tag.uid[ui], tag.uid[ui+1], 0};
+                uid_bytes.push_back(static_cast<uint8_t>(strtoul(hb, nullptr, 16)));
+            }
+            if (uid_bytes.size() < 4) { write_error = "invalid UID"; goto done; }
+            uint8_t uid4[4] = {uid_bytes[uid_bytes.size()-4], uid_bytes[uid_bytes.size()-3],
+                               uid_bytes[uid_bytes.size()-2], uid_bytes[uid_bytes.size()-1]};
+
+            if (p == ProtocolKind::MifareClassic) {
+                const uint8_t key[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+                if (!client.mf_authenticate(4, false, key, uid4, &write_error))
+                    { write_error = "auth failed: " + write_error; goto done; }
+                std::vector<uint8_t> td(16, 0xAA);
+                if (!client.mf_write_block_auth(4, td, &write_error))
+                    { write_error = "write block 4 failed: " + write_error; goto done; }
+                hw_write_progress_ = 50;
+            } else if (p == ProtocolKind::Iso14443A) {
+                std::vector<uint8_t> pd = {0xAA,0xBB,0xCC,0xDD};
+                if (!client.ntag_write_page(8, pd, &write_error))
+                    { write_error = "write page 8 failed: " + write_error; goto done; }
+                hw_write_progress_ = 50;
+            } else {
+                write_error = "unsupported protocol"; goto done;
+            }
+        }
+        ok = true; write_error.clear();
+    done:
+        {
+            std::lock_guard<std::mutex> lk(pending_log_mutex_);
+            hw_write_running_ = false;
+            hw_write_ok_ = ok;
+            hw_write_error_ = write_error;
+            if (ok) hw_write_progress_ = 100;
+        }
     }
 
     void perform_emu_slot_probe(ProtocolKind protocol, int slot)
