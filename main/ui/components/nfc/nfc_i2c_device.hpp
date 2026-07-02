@@ -5255,9 +5255,9 @@ private:
         }
 
         uint16_t rx_len = readSysReg(i2c_reg::RX_LEN);
-        // RX_LEN=0 can happen on some GroveNFC firmware even when data is ready.
-        // Fallback: read a default buffer and determine length from data.
-        if (rx_len == 0) {
+        // GroveNFC firmware v0x6627 reports wrong RX_LEN for ISO15693 READ.
+        // Fallback: read full buffer when RX_LEN is suspiciously small.
+        if (rx_len < 5) {
             rx_len = out_len;
             if (rx_len > 64) rx_len = 64;
         }
@@ -5715,70 +5715,26 @@ private:
         const std::string euid = normalize_uid_hex(uid_hint);
         if (!euid.empty() && euid != suid) { stopRF(); return false; }
 
-        /* Parse UID from scan result for Address flag */
-        std::vector<uint8_t> uid_bytes;
-        for (size_t i = 0; i + 1 < suid.size(); i += 2) {
-            char buf[3] = {suid[i], suid[i+1], 0};
-            uid_bytes.push_back((uint8_t)strtol(buf, nullptr, 16));
-        }
-
-        /* Full reset for clean state */
-        writeMiscReg(i2c_reg::MISC_RFON, 0x00); delay_ms(5);
-        writeSysReg(i2c_reg::SET_MODE, i2c_mode::DEFAULT | i2c_mode::TAG_NONE); delay_ms(5);
-        writeSysReg(i2c_reg::SET_MODE, i2c_mode::READER | i2c_mode::TAG_NONE); delay_ms(5);
-        writeSysReg(i2c_reg::SET_RFCFG, i2c_rfcfg::R15 | i2c_rfcfg::T15);
+        /* Keep RF ON from readISO15, just ensure CRC is set for ISO15 */
         writeSysReg(i2c_reg::SET_TXCRCE, 0x0008);
         writeSysReg(i2c_reg::SET_RXCRCE, 0x0008);
         writeMiscReg(i2c_reg::MISC_TXLAST, 0x00);
-        writeMiscReg(i2c_reg::MISC_RFON, 0x01); delay_ms(15);
-
-        /* Re-inventory */
-        uint8_t inv_rx[64] = {0}; uint16_t inv_rl = sizeof(inv_rx);
-        const uint8_t inv[] = {0x26, 0x01, 0x00};
-        if (!txrx(inv, 3, inv_rx, inv_rl, 50) || inv_rl < 10) {
-            if (error) *error = "Re-inventory failed";
-            stopRF(); return false;
-        }
 
         out_lines.clear();
 
-        /* Strategy: try READ_MULTIPLE_BLOCKS(0x23) with 2 blocks (9 byte response).
-         * If it fails, fall back to single block READ(0x20). */
-        for (int start = 0; start < 80; start += 2) {
-            /* Try read 2 blocks at once: {flags=0x26, cmd=0x23, start, count=2} */
-            bool got = false;
+        /* Use non-addressed READ_SINGLE_BLOCK (0x20) for each block.
+         * NOTE: READ_MULTIPLE_BLOCKS (0x23) is not supported by some tags,
+         * returning error 0x01 ("command not supported"). */
+        for (int start = 0; start < 80; ++start) {
             uint8_t rx[32] = {0}; uint16_t rl = sizeof(rx);
-
-            const uint8_t cmd_multi[4] = {0x26, 0x23, static_cast<uint8_t>(start), 2};
-            if (txrx(cmd_multi, 4, rx, rl, 80) && rl >= 9) {
-                for (int i = 0; i < 2 && start + i < 80; ++i) {
-                    int off = 1 + i * 4;
-                    char buf[40];
-                    std::snprintf(buf, sizeof(buf), "%02d: %02X%02X%02X%02X",
-                                 start + i, rx[off], rx[off+1], rx[off+2], rx[off+3]);
-                    out_lines.push_back(buf);
-                }
-                got = true;
+            const uint8_t cmd[3] = {0x02, 0x20, static_cast<uint8_t>(start)};
+            if (txrx(cmd, 3, rx, rl, 100) && rl >= 5 && (rx[0] & 0x01) == 0) {
+                char buf[40]; std::snprintf(buf, sizeof(buf), "%02d: %02X%02X%02X%02X",
+                    start, rx[1], rx[2], rx[3], rx[4]);
+                out_lines.push_back(buf);
+            } else {
+                break;
             }
-
-            if (!got) {
-                /* Fallback: single block READ(0x20) with Address flag + UID */
-                uint8_t cmd_single[11] = {0x36, 0x20, static_cast<uint8_t>(start)};
-                if (uid_bytes.size() >= 8) {
-                    /* flags=0x36 = 0x06(dual+high) + 0x10(Address) + 0x20(Option) */
-                    for (int j = 0; j < 8 && j < (int)uid_bytes.size(); ++j)
-                        cmd_single[3 + j] = uid_bytes[j];
-                    if (txrx(cmd_single, 11, rx, rl, 80) && rl >= 5) {
-                        char buf[40];
-                        std::snprintf(buf, sizeof(buf), "%02d: %02X%02X%02X%02X",
-                                     start, rx[1], rx[2], rx[3], rx[4]);
-                        out_lines.push_back(buf);
-                        got = true;
-                    }
-                }
-            }
-
-            if (!got) break;
         }
         stopRF();
         return !out_lines.empty();
