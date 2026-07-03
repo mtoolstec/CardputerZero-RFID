@@ -527,18 +527,19 @@ public:
                     log(hex);
                     return inner->write_bytes(b, n, err);
                 }
-                ssize_t read_bytes(uint8_t *b, size_t n, int timeout_ms, std::string *err) override {
-                    ssize_t got = inner->read_bytes(b, n, timeout_ms, err);
-                    if (got <= 0) return got;
-                    // After the first bytes arrive, drain any immediately available
-                    // continuation bytes (0 ms timeout) so the whole response frame
-                    // lands in a single log line instead of one-byte-per-line.
-                    while ((size_t)got < n) {
-                        ssize_t more = inner->read_bytes(b + got, n - (size_t)got, 0, nullptr);
-                        if (more <= 0) break;
-                        got += more;
-                    }
-                    std::string hex = "RX[" + std::to_string(got) + "] ";
+               ssize_t read_bytes(uint8_t *b, size_t n, int timeout_ms, std::string *err) override {
+                   ssize_t got = inner->read_bytes(b, n, timeout_ms, err);
+                   if (got <= 0) return got;
+                   // Drain immediately available continuation bytes (complete response frame)
+                   {
+                       const size_t max_drain = std::min(n, (size_t)40);
+                       while ((size_t)got < max_drain) {
+                           ssize_t more = inner->read_bytes(b + got, max_drain - (size_t)got, 10, nullptr);
+                           if (more <= 0) break;
+                           got += more;
+                       }
+                   }
+                   std::string hex = "RX[" + std::to_string(got) + "] ";
                     constexpr ssize_t MAX_LOG = 64;
                     for (ssize_t i = 0; i < got && i < MAX_LOG; ++i) {
                         char buf[3]; std::snprintf(buf, sizeof(buf), "%02X", b[i]);
@@ -559,16 +560,52 @@ public:
 
             Pn532KillerClient client(&logging_transport);
             std::string probe_error, firmware;
-            log_line("=== Probing device... ===");
-            const DeviceKind kind = client.detect_device(&firmware, &probe_error);
-            raw_transport.close();
+           log_line("Check PN532/PN532Killer@115200");
+           const DeviceKind kind = client.detect_device(&firmware, &probe_error);
+           raw_transport.close();
 
             std::string result;
             if (kind == DeviceKind::PN532Killer || kind == DeviceKind::PN532) {
                 result = std::string("OK: ");
                 result += firmware.empty() ? to_string(kind) : firmware;
+                log_line("Check PN532/PN532Killer@115200 [OK]");
             } else {
-                result = "No device: " + probe_error;
+                log_line("Check PN532/PN532Killer@115200 [FAIL]");
+                log_line("Check UHF@115200");
+                std::string io_err;
+                TransportEndpoint uhf_ep;
+                uhf_ep.baud_rate = ep.baud_rate;
+                uhf_ep.path = ep.path;
+                if (raw_transport.open(uhf_ep, &io_err)) {
+                    std::vector<uint8_t> uhf_cmd = build_uhf_a0_frame(0x72, {});
+                    if (raw_transport.write_bytes(uhf_cmd.data(), uhf_cmd.size(), &io_err)) {
+                        uint8_t buf[256];
+                        std::vector<uint8_t> rx_buf;
+                        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+                        while (std::chrono::steady_clock::now() < deadline) {
+                            std::string read_err;
+                            ssize_t got = raw_transport.read_bytes(buf, sizeof(buf), 50, &read_err);
+                            if (got > 0) { rx_buf.insert(rx_buf.end(), buf, buf + got); continue; }
+                            break;
+                        }
+                        if (!rx_buf.empty()) {
+                            if (rx_buf.size() >= 6 && rx_buf[0] == 0xA0 && rx_buf[3] == 0x72) {
+                                std::string ver;
+                                if (rx_buf.size() >= 8)
+                                    ver = std::to_string((int)rx_buf[4]) + "." +
+                                          std::to_string((int)rx_buf[5]) + "." +
+                                          std::to_string((int)rx_buf[6]);
+                                result = ver.empty() ? "UHF Reader" : ("UHF Reader v" + ver);
+                                log_line("Check UHF@115200 [OK]");
+                            }
+                        }
+                    }
+                    raw_transport.close();
+                }
+                if (result.empty()) {
+                    log_line("Check UHF@115200 [FAIL]");
+                    result = "No Device Found";
+                }
             }
             log_line("=== Result: " + result + " ===");
             if (fp) fclose(fp);

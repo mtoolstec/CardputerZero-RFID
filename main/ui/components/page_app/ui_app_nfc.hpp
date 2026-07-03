@@ -113,10 +113,11 @@ private:
     nfc_app::MifareKeyRecord mifare_key_edit_;
     // UART config edit state
     int   uart_field_idx_ = 0;  // 0=device 1=baud 2=Test
-    nfc_app::UartConfig uart_edit_buf_;
-    std::string uart_test_result_;  // result from last Test Connection
-    bool last_uart_test_running_ = false;  // for detecting async completion
-    int active_tool_idx_ = 0;
+   nfc_app::UartConfig uart_edit_buf_;
+   std::string uart_test_result_;  // result from last Test Connection
+   bool last_uart_test_running_ = false;  // for detecting async completion
+   uint32_t uart_test_last_check_tick_ = 0;  // lv_tick_get() when current "Check" line was first seen
+   int active_tool_idx_ = 0;
     // Read tab scan log
     std::vector<std::string> scan_log_lines_;
     int log_scroll_offset_ = 0;
@@ -520,8 +521,7 @@ private:
                 std::string result;
                 std::vector<std::string> new_lines;
                 const bool done = self->service_.drain_uart_test_logs(new_lines, result);
-                // NFC => / NFC <= log lines go to file only, not the on-screen log
-                // Only show the final test result when done.
+
                 for (auto &l : new_lines) {
                     if (l.size() >= 6 && (l.substr(0, 6) == "NFC =>" || l.substr(0, 6) == "NFC <="))
                         continue;
@@ -529,8 +529,60 @@ private:
                         continue;
                     if (l.find("=== Result:") != std::string::npos || l.find("=== UART") != std::string::npos || l.find("=== Probing") != std::string::npos)
                         continue;
+
+                    const bool is_check = (l.find("Check ") == 0);
+                    const bool has_result = (l.find("[OK]") != std::string::npos || l.find("[FAIL]") != std::string::npos);
+
+                    if (is_check && has_result) {
+                        // Result line: replace the last matching check line
+                        if (!self->scan_log_lines_.empty()) {
+                            auto &back = self->scan_log_lines_.back();
+                            if (back.find("Check ") == 0) {
+                                size_t at1 = l.find('@');
+                                size_t at2 = back.find('@');
+                                if (at1 != std::string::npos && at1 == at2 &&
+                                    l.substr(0, at1) == back.substr(0, at2)) {
+                                    back = l;
+                                    continue;
+                                }
+                            }
+                        }
+                        self->scan_log_lines_.push_back(l);
+                    } else if (is_check && !has_result) {
+                        // New check line - set the dot tick timer
+                        self->uart_test_last_check_tick_ = lv_tick_get();
+                        self->scan_log_lines_.push_back(l);
+                    } else {
+                        self->scan_log_lines_.push_back(l);
+                    }
                 }
+
+                // Dot animation: every tick, update dots on the last check line
+                if (self->uart_test_last_check_tick_ > 0 && !self->scan_log_lines_.empty()) {
+                    std::string &last = self->scan_log_lines_.back();
+                    if (last.find("Check ") == 0 &&
+                        last.find("[OK]") == std::string::npos &&
+                        last.find("[FAIL]") == std::string::npos) {
+                        uint32_t now = lv_tick_get();
+                        int elapsed_s = (now - self->uart_test_last_check_tick_) / 1000;
+                        if (elapsed_s > 3) elapsed_s = 3;
+                        size_t at_pos = last.find('@');
+                        if (at_pos != std::string::npos) {
+                            size_t end = at_pos;
+                            while (end < last.size() && (last[end] == '@' || std::isdigit(static_cast<unsigned char>(last[end]))))
+                                ++end;
+                            std::string base = last.substr(0, end);
+                            size_t current_dots = last.size() - end;
+                            size_t target_dots = static_cast<size_t>(elapsed_s);
+                            if (target_dots > current_dots) {
+                                last = base + std::string(target_dots, '.');
+                            }
+                        }
+                    }
+                }
+
                 if (done) {
+                    self->uart_test_last_check_tick_ = 0;
                     self->uart_test_result_ = result;
                     self->ui_message_ = result;
                     self->scan_log_lines_.push_back("> " + result);
@@ -807,8 +859,12 @@ private:
             activate();
             break;
         case KEY_DELETE:
-            // DEL key on READ tab: clear the scan log area
+            // DEL key on READ tab: clear log and UHF table
             if (current_tab_ == Tab::Read) {
+                if (read_uses_uhf_table()) {
+                    uhf_table_rows_.clear();
+                    uhf_table_scroll_offset_ = 0;
+                }
                 scan_log_lines_.clear();
                 log_scroll_offset_ = 0;
                 ui_message_ = "Log cleared";
@@ -822,6 +878,23 @@ private:
             }
             break;
         case KEY_S:
+            // UHF: start inventory in READ tab
+            if (current_tab_ == Tab::Read) {
+                const auto _conn = service_.connection_state();
+                if (_conn.connected && _conn.device_kind == nfc_app::DeviceKind::UHFReader) {
+                    std::string _err;
+                    if (!service_.uhf_continuous_scan_running()) {
+                        if (service_.start_uhf_continuous_scan(&_err)) {
+                            scan_log_lines_.push_back("> Start inventory...");
+                            ui_message_ = "Inventory running";
+                        } else {
+                            ui_message_ = _err.empty() ? "Inventory start failed" : _err;
+                        }
+                    }
+                    render_all();
+                    return;
+                }
+            }
             if (current_tab_ == Tab::Emulator) {
                 const auto conn = service_.connection_state();
                 cache_serial_device_kind(conn);
@@ -3549,6 +3622,9 @@ private:
                 }
                 scan_log_lines_.push_back("OK  " + compact_read_connection_detail(conn2));
                 scan_log_lines_.push_back(supported_protocols_text());
+                if (service_.is_current_device_uhf()) {
+                    scan_log_lines_.push_back("Shortcuts: S:start inventory  P:stop  Del:clear");
+                }
                 ui_message_ = std::string("Connected: ") + nfc_app::to_string(conn2.device_kind);
                 modal_ = Modal::None;
                 modal_idx_ = 0;
@@ -3618,9 +3694,15 @@ private:
                     }
                     scan_log_lines_.push_back("OK  " + compact_read_connection_detail(conn2));
                     scan_log_lines_.push_back(supported_protocols_text());
+                if (service_.is_current_device_uhf()) {
+                    scan_log_lines_.push_back("Shortcuts: S:start inventory  P:stop  Del:clear");
+                }
                 } else {
                     scan_log_lines_.push_back("OK  " + compact_read_connection_detail(conn));
                     scan_log_lines_.push_back(supported_protocols_text());
+                if (service_.is_current_device_uhf()) {
+                    scan_log_lines_.push_back("Shortcuts: S:start inventory  P:stop  Del:clear");
+                }
                 }
 
                 scan_log_lines_.push_back("> Scan card...");
@@ -3909,6 +3991,9 @@ private:
                 } else {
                     scan_log_lines_.push_back("OK  " + compact_read_connection_detail(conn2));
                     scan_log_lines_.push_back(supported_protocols_text());
+                if (service_.is_current_device_uhf()) {
+                    scan_log_lines_.push_back("Shortcuts: S:start inventory  P:stop  Del:clear");
+                }
                     ui_message_ = std::string("Connected: ") + nfc_app::to_string(conn2.device_kind);
                 }
             }
@@ -3986,6 +4071,9 @@ private:
                 } else {
                     scan_log_lines_.push_back("OK  " + compact_read_connection_detail(conn2));
                     scan_log_lines_.push_back(supported_protocols_text());
+                if (service_.is_current_device_uhf()) {
+                    scan_log_lines_.push_back("Shortcuts: S:start inventory  P:stop  Del:clear");
+                }
                     ui_message_ = std::string("Connected: ") + nfc_app::to_string(conn2.device_kind);
                 }
             }

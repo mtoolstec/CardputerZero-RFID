@@ -347,6 +347,17 @@ int main(void)
     ::std::signal(SIGTERM, on_signal);
 
     hal_paths_init(nullptr);
+
+    // Enable Grove 5V power for external modules (UHF reader, etc.)
+    ::nfc_app::NfcTransportFactory::grove_gpio_enable_bcm(17, true);
+    usleep(200000);
+
+    // Reset framebuffer to prevent black screen on re-entry
+    {
+        int _fb = ::open("/dev/fb0", O_RDWR);
+        if (_fb >= 0) ::close(_fb);
+    }
+
     lv_init();
 
     LV_EVENT_KEYBOARD = lv_event_register_id();
@@ -366,5 +377,9 @@ int main(void)
     }
 
     delete nfc_page;
+    lv_deinit();
+
+    // Disable Grove 5V power on exit
+    ::nfc_app::NfcTransportFactory::grove_gpio_enable_bcm(17, false);
     return 0;
 }
