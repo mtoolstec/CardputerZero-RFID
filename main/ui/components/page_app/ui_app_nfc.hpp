@@ -128,10 +128,11 @@ private:
     // Long-press scroll tracking
     uint32_t held_scroll_key_      = 0;
     uint32_t held_scroll_start_ms_ = 0;
-    uint32_t held_scroll_last_ms_  = 0;
-    // ESC hold-to-exit tracking (0 = not held)
-    uint32_t esc_hold_start_ms_    = 0;
-    // Hardware EMU slot (PN532Killer)
+   uint32_t held_scroll_last_ms_  = 0;
+   // ESC double-press to exit tracking
+   bool     esc_exit_confirm_      = false;
+   uint32_t esc_exit_confirm_tick_ = 0;
+   // Hardware EMU slot (PN532Killer)
     int hw_emu_slot_ = 0;
     // Dump panel scroll offset (line index within dump_lines)
     int emu_dump_scroll_ = 0;
@@ -293,7 +294,7 @@ private:
     int read_log_visible_lines() const
     {
         const auto scan = service_.scan_state();
-        if (!scan.has_result) return 10;
+        if (!scan.has_result) return 8;  // match visible_lines=log_h/LOG_LINE_H
         const auto endpoint = service_.current_endpoint();
         return (endpoint.kind == nfc_app::TransportKind::I2cBus) ? 7 : 8;
     }
@@ -429,15 +430,12 @@ private:
                 }
             }
         }
-        // ESC hold-to-exit: exit after 3s continuous hold
-        if (self->esc_hold_start_ms_ != 0) {
-            const uint32_t now = lv_tick_get();
-            if (now - self->esc_hold_start_ms_ >= 3000) {
-                self->esc_hold_start_ms_ = 0;
-                if (self->go_back_home) self->go_back_home();
-                return;
-            }
-        }
+       // ESC double-press confirm: auto-reset after 3s
+       if (self->esc_exit_confirm_) {
+           if (lv_tick_get() - self->esc_exit_confirm_tick_ >= 3000) {
+               self->esc_exit_confirm_ = false;
+           }
+       }
 
         // Auto-clear expired toast
         if (!self->toast_msg_.empty() && self->toast_expire_tick_ != 0) {
@@ -621,35 +619,22 @@ private:
                     held_scroll_last_ms_  = held_scroll_start_ms_;
                 }
             }
-            // Track ESC press for hold-to-exit
-            if (nk == KEY_ESC && modal_ == Modal::None) {
-                if (esc_hold_start_ms_ == 0) {
-                    esc_hold_start_ms_ = lv_tick_get();
-                } else if (lv_tick_get() - esc_hold_start_ms_ >= 3000) {
-                    if (go_back_home) go_back_home();
-                    return;
-                }
-            }
-            return;
-        }
+           return;
+       }
 
-        if (!IS_KEY_RELEASED(e)) return;
+       if (!IS_KEY_RELEASED(e)) return;
 
-        // On release, clear held scroll key.
-        // Only check ESC hold-to-exit when no modal is open.
-        {
-            const uint32_t nk = normalize_main_key(raw_key);
-            if (nk == KEY_UP || nk == KEY_DOWN || nk == KEY_ESC) {
-                held_scroll_key_ = 0;
-                if (nk == KEY_ESC && esc_hold_start_ms_ != 0) {
-                    if (modal_ == Modal::None && lv_tick_get() - esc_hold_start_ms_ >= 3000) {
-                        if (go_back_home) go_back_home();
-                        return;
-                    }
-                    esc_hold_start_ms_ = 0;
-                }
-            }
-        }
+       // On release, clear held scroll key.
+       {
+           const uint32_t nk = normalize_main_key(raw_key);
+           if (nk == KEY_UP || nk == KEY_DOWN || nk == KEY_ESC) {
+               held_scroll_key_ = 0;
+           }
+           // Cancel ESC exit confirm when another key is pressed
+           if (nk != KEY_ESC) {
+               esc_exit_confirm_ = false;
+           }
+       }
 
         // Global Ctrl+S: save EMU dump from any state when on Emulator tab.
         // Skip when URI input modal is active so symbol-key combos are not hijacked.
@@ -1018,10 +1003,16 @@ private:
                 render_all();
             }
             break;
-        case KEY_ESC:
-            if (esc_hold_start_ms_ == 0)
-                show_toast("Press ESC for 3s to exit");
-            break;
+       case KEY_ESC:
+           if (esc_exit_confirm_) {
+               // Second press — exit app
+               if (go_back_home) go_back_home();
+               return;
+           }
+           esc_exit_confirm_ = true;
+           esc_exit_confirm_tick_ = lv_tick_get();
+           show_toast("Press ESC again to exit");
+           break;
         default:
             break;
         }
@@ -2649,11 +2640,11 @@ private:
             }
             create_text(info, 4, 2, to_compact(card_line, 52).c_str(), 0x00FF88, 10);
             log_y = 34;
-            log_h = 86;
+            log_h = 100;
         }
 
         // ── Log area: always full-width ────────────────────────────────────
-        constexpr int LOG_LINE_H = 10;
+        constexpr int LOG_LINE_H = 12;
         const int visible_lines  = log_h / LOG_LINE_H;
         const int total_lines    = static_cast<int>(scan_log_lines_.size());
 
@@ -2758,7 +2749,7 @@ private:
                     else if (line.size() >= 3 && line[0] == 'E' && line[1] == 'R' && line[2] == 'R') color = 0xFF6060;
                     else if (!line.empty() && line[0] == '>') color = 0xF7A600;
                     else if (line.size() >= 6 && line.substr(0, 6) == "MAGIC:") color = 0xFFD700;
-                    create_text(detail, 4, y, to_compact(line, 52).c_str(), color, 10);
+                    create_text(detail, 4, y, to_compact(line, 42).c_str(), color, 10);
                 }
             }
         }
@@ -4226,51 +4217,55 @@ private:
 
     // ── AppInfo modal ─────────────────────────────────────────────────────────
 
-    void render_app_info_modal(lv_obj_t *parent)
-    {
-        const auto conn = service_.connection_state();
-        const auto ep   = service_.current_endpoint();
+   void render_app_info_modal(lv_obj_t *parent)
+   {
+       const auto conn = service_.connection_state();
+       const auto ep   = service_.current_endpoint();
 
-        lv_obj_t *card = make_modal_card(parent, 308, 125, 0x00D2FF);
-        create_text(card, 8, 4, "Device Info", 0x00D2FF, 12);
+       // Build info lines
+       struct InfoLine { const char *value; uint32_t color; };
+       InfoLine lines[5];
+       char lines_buf[5][64];
+       size_t total = 0;
 
-        char buf[64];
+       std::snprintf(lines_buf[total], sizeof(lines_buf[total]), "Device:  %s", nfc_app::to_string(conn.device_kind));
+       lines[total++] = {lines_buf[total-1], 0xFFD700};
 
-        // Row 0: device kind
-        std::snprintf(buf, sizeof(buf), "Device:  %s", nfc_app::to_string(conn.device_kind));
-        create_text(card, 8, 22, buf, 0xFFD700, 11);
-
-        // Row 1: firmware / detail (strip " @ /dev/..." path if appended)
-        std::string fw_display = conn.detail;
-        {
-            auto at = fw_display.find(" @ ");
-            if (at != std::string::npos) fw_display = fw_display.substr(0, at);
+       { std::string fw_display = conn.detail;
+           auto at = fw_display.find(" @ ");
+           if (at != std::string::npos) fw_display = fw_display.substr(0, at);
+       const std::string fw_str = fw_display.empty() ? "(none)" : fw_display.substr(0, 46);
+        std::snprintf(lines_buf[total], sizeof(lines_buf[total]), "FW:      %s", fw_str.c_str());
+        lines[total++] = {lines_buf[total-1], 0xD8D8D8};
         }
-        const std::string fw_str = fw_display.empty() ? "(none)" : fw_display.substr(0, 46);
-        std::snprintf(buf, sizeof(buf), "FW:      %s", fw_str.c_str());
-        create_text(card, 8, 35, buf, 0xD8D8D8, 11);
 
-        // Row 2: connection path
-        const std::string path_str = ep.path.empty() ? "(none)" : ep.path.substr(0, 46);
-        std::snprintf(buf, sizeof(buf), "Port:    %s", path_str.c_str());
-        create_text(card, 8, 48, buf, 0xD8D8D8, 11);
+       const std::string path_str = ep.path.empty() ? "(none)" : ep.path.substr(0, 46);
+       std::snprintf(lines_buf[total], sizeof(lines_buf[total]), "Port:    %s", path_str.c_str());
+       lines[total++] = {lines_buf[total-1], 0xD8D8D8};
 
-        // Row 3: status
-        const char *status_str = conn.connected ? "Connected" : "Disconnected";
-        std::snprintf(buf, sizeof(buf), "Status:  %s", status_str);
-        create_text(card, 8, 61, buf, conn.connected ? 0x44FF88 : 0xFF5555, 11);
+       const char *status_str = conn.connected ? "Connected" : "Disconnected";
+       std::snprintf(lines_buf[total], sizeof(lines_buf[total]), "Status:  %s", status_str);
+       lines[total++] = {lines_buf[total-1], conn.connected ? 0x44FF88u : 0xFF5555u};
+       const char *hash = RFID_BUILD_HASH;
+       std::snprintf(lines_buf[total], sizeof(lines_buf[total]), "Build:   %.42s", hash);
+       lines[total++] = {lines_buf[total-1], 0x777777};
 
-        // Row 4: PN532 ready flag (useful for debug)
-        std::snprintf(buf, sizeof(buf), "NFC Rdy: %s", conn.pn532_ready ? "yes" : "no");
-        create_text(card, 8, 74, buf, conn.pn532_ready ? 0x44FF88 : 0x888888, 11);
-
-        // Row 5: build version hash
-        {
-            const char *hash = RFID_BUILD_HASH;
-            std::snprintf(buf, sizeof(buf), "Build:   %.42s", hash);
-            create_text(card, 8, 87, buf, 0x777777, 9);
-        }
-    }
+       // Scroll & render
+       if (total > 5 && app_info_scroll_ > (int)total - 5)
+           app_info_scroll_ = (int)total - 5;
+       const int visible = std::min((int)total - app_info_scroll_, 5);
+       const int card_h = 22 + visible * 13 + 6;
+       lv_obj_t *card = make_modal_card(parent, 308, card_h, 0x00D2FF);
+       create_text(card, 8, 4, "Device Info", 0x00D2FF, 12);
+       for (int i = 0; i < visible; ++i) {
+           int idx = app_info_scroll_ + i;
+           create_text(card, 8, 22 + i * 13, lines[idx].value, lines[idx].color, 11);
+       }
+       if (total > 5) { char scroll_buf[16];
+           std::snprintf(scroll_buf, sizeof(scroll_buf), "%d/%d", app_info_scroll_ + 1, (int)total - 4);
+           create_text(card, 222, 4, scroll_buf, 0x666666, 9);
+       }
+   }
 
     // ── Tools-specific modal overlay ─────────────────────────────────────────
     void render_tools_modal(lv_obj_t *parent)
@@ -5340,11 +5335,16 @@ private:
         case Modal::ToolInfo:
             if (key == KEY_ESC) modal_ = Modal::None;
             break;
-        case Modal::AppInfo:
-            if (key == KEY_ESC || key == KEY_I) {
-                modal_ = Modal::None;
-            }
-            break;
+       case Modal::AppInfo:
+           if (key == KEY_ESC || key == KEY_I) {
+               modal_ = Modal::None;
+               app_info_scroll_ = 0;
+           } else if (key == KEY_UP) {
+               app_info_scroll_ = std::max(0, app_info_scroll_ - 1);
+           } else if (key == KEY_DOWN) {
+               app_info_scroll_ = std::min(5, app_info_scroll_ + 1);
+           }
+           break;
         case Modal::PostScan:
             handle_post_scan_key(key);
             break;

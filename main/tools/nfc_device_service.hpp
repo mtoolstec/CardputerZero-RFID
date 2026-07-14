@@ -5605,9 +5605,9 @@ private:
                 record = make_record_from_tag(tag, endpoint, false, "st25r");
                 success = true;
             } else {
-                // ISO14443A failed → try ISO15693 SubCarrierStream
-                push_log("ISO14443A no response, trying ISO15693...");
-                I2cCardInfo iso15_info;
+               // ISO14443A failed → try ISO15693 SubCarrierStream
+               push_log("ISO14443 no tag found");
+               I2cCardInfo iso15_info;
                 std::string iso15_err;
                 NfcSpiDevice::Iso15Info iso15;
                 if (spi_dev->scan_and_dump_iso15693(&iso15_info, nullptr, &iso15_err, &iso15)) {
@@ -5636,9 +5636,8 @@ private:
                     record = make_record_from_tag(tag, endpoint, false, "st25r-iso15");
                     success = true;
                 } else {
-                    push_log(iso15_err.empty() ? "No card detected" : iso15_err);
+                    push_log("ISO15693 no tag found");
                     emit_scan_tail();
-                    error = iso15_err.empty() ? "no card present" : iso15_err;
                 }
             }
             std::lock_guard<std::mutex> lock(mutex_);
@@ -5694,21 +5693,18 @@ private:
                         std::this_thread::sleep_for(std::chrono::milliseconds(150));
                 }
             }
-            // For PN532Killer: also try ISO15693 if 14A found nothing.
-            if (!real_ok) {
-                push_log("No ISO14443A tag found");
-                if (device_kind == DeviceKind::PN532Killer) {
-                    std::string err15;
-                    tag = TagInfo{};
-                    real_ok = client.in_list_passive_target_iso15693(&tag, &err15);
-                    if (!real_ok) {
-                        push_log("No ISO15693 tag found");
-                        error = err15.empty() ? "No tag found" : err15;
-                    }
-                } else {
-                    error = error.empty() ? "No tag found" : error;
-                }
-            }
+           // For PN532Killer: also try ISO15693 if 14A found nothing.
+           if (!real_ok) {
+               push_log("ISO14443 no tag found");
+               if (device_kind == DeviceKind::PN532Killer) {
+                   std::string err15;
+                   tag = TagInfo{};
+                   real_ok = client.in_list_passive_target_iso15693(&tag, &err15);
+                   if (!real_ok) {
+                       push_log("ISO15693 no tag found");
+                   }
+               }
+           }
             if (real_ok) {
                 if (tag.protocol == ProtocolKind::Iso15693) {
                     tag.identity_fields.erase("ATQA");

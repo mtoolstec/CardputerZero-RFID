@@ -2028,7 +2028,7 @@ public:
         uint8_t inv_len = 0;
         if (!nfcv_transceive(inv_req, 3, inv_dec, inv_len, 80) || inv_len < 10) {
             restore_iso14443a();
-            if (error) *error = "ISO15693 inventory failed";
+            if (error) *error = "no tag found";
             return false;
         }
 
