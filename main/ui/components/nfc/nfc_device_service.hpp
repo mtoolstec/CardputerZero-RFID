@@ -998,298 +998,111 @@ public:
             NfcHexLog::get().set_mode("uart");
         }
 
-        // ====================================================================
-        // UartSerial: only PN532 / PN532Killer probe @115200, no UHF.
-        // ====================================================================
-        if (connection_.endpoint.kind == TransportKind::UartSerial) {
-            push_log(std::string("[Detect] UART endpoint: ") + connection_.endpoint.path);
-            push_log("[Detect] Probe PN532/PN532Killer @115200");
+        const auto paced_log = [this](const std::string &line) {
+            push_log(line);
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        };
+        const auto open_at_baud = [this](int baud, std::string *open_error) -> bool {
+            if (connection_.endpoint.baud_rate == baud) return true;
+            TransportEndpoint ep = connection_.endpoint;
+            ep.baud_rate = baud;
+            if (!open_transport_locked(ep, open_error)) return false;
+            connection_.endpoint = ep;
+            return true;
+        };
 
-            if (connection_.endpoint.baud_rate != 115200) {
-                TransportEndpoint ep = connection_.endpoint;
-                ep.baud_rate = 115200;
-                std::string reopen_err;
-                if (!open_transport_locked(ep, &reopen_err)) {
-                    connection_.connected = false;
-                    connection_.status = "Connect failed";
-                    connection_.detail = std::string("UART open@115200 failed: ") + reopen_err;
-                    connection_.device_kind = DeviceKind::NotConnected;
-                    push_log(std::string("[Detect] UART open@115200 failed: ") + reopen_err);
-                    return false;
-                }
-                connection_.endpoint = ep;
+        // ====================================================================
+        // USB/UART unified probing order:
+        //   PN532 @115200 -> PN532Killer @115200 -> UHF @9600 -> UHF @115200
+        // Log each step immediately (paced 300ms) instead of flushing at end.
+        // ====================================================================
+        if (connection_.endpoint.kind == TransportKind::UartSerial ||
+            connection_.endpoint.kind == TransportKind::UsbSerial) {
+            const char *transport_name =
+                (connection_.endpoint.kind == TransportKind::UsbSerial) ? "USB" : "UART";
+            const std::string endpoint_path = connection_.endpoint.path;
+
+            std::string open_error;
+            if (!open_at_baud(115200, &open_error)) {
+                connection_.connected = false;
+                connection_.status = "Connect failed";
+                connection_.detail = std::string(transport_name) + " open@115200 failed: " + open_error;
+                connection_.device_kind = DeviceKind::NotConnected;
+                paced_log(std::string(transport_name) + " open@115200 failed: " + open_error);
+                return false;
             }
 
-            Pn532KillerClient client(transport_.get());
+            paced_log(std::string("Probe PN532 @115200") + " (" + transport_name + ")");
             std::string probe_error;
             std::string firmware;
+            Pn532KillerClient client(transport_.get());
             const auto kind = client.detect_device(&firmware, &probe_error);
-            connection_.device_kind = kind;
-            if (kind == DeviceKind::PN532Killer || kind == DeviceKind::PN532) {
+
+            if (kind == DeviceKind::PN532) {
+                const std::string fw_label = firmware.empty() ? "PN532" : firmware;
+                connection_.device_kind = DeviceKind::PN532;
                 connection_.pn532_ready = true;
-                connection_.status = std::string("Connected ") + to_string(kind);
-                const std::string fw_label = firmware.empty() ? to_string(kind) : firmware;
-                connection_.detail = fw_label + " @ " + connection_.endpoint.path + " @115200";
-                push_log(std::string("[Detect] UART PN532 detected: ") + fw_label);
+                connection_.status = "Connected PN532";
+                connection_.detail = fw_label + " @ " + endpoint_path + " @115200";
+                paced_log("Probe PN532 @115200 -> OK");
+                return true;
+            }
+
+            paced_log("Probe PN532 @115200 -> FAIL");
+            paced_log(std::string("Probe PN532Killer @115200") + " (" + transport_name + ")");
+            if (kind == DeviceKind::PN532Killer) {
+                const std::string fw_label = firmware.empty() ? "PN532Killer" : firmware;
+                connection_.device_kind = DeviceKind::PN532Killer;
+                connection_.pn532_ready = true;
+                connection_.status = "Connected PN532Killer";
+                connection_.detail = fw_label + " @ " + endpoint_path + " @115200";
+                paced_log("Probe PN532Killer @115200 -> OK");
+                return true;
+            }
+
+            if (!probe_error.empty()) {
+                paced_log(std::string("Probe PN532Killer @115200 -> FAIL (") + probe_error + ")");
             } else {
-                connection_.pn532_ready = false;
-                connection_.device_kind = DeviceKind::OtherSerial;
-                connection_.status = "Connected Serial";
-                connection_.detail = "UART: " +
-                    (probe_error.empty() ? "PN532 not detected" : probe_error);
-                if (!probe_error.empty()) {
-                    push_log(std::string("[Detect] UART PN532 not found: ") + probe_error);
-                } else {
-                    push_log("[Detect] UART PN532 not found (no response)");
+                paced_log("Probe PN532Killer @115200 -> FAIL");
+            }
+
+            auto try_uhf = [&](int baud) -> bool {
+                std::string baud_open_error;
+                paced_log(std::string("Probe UHF Reader @") + std::to_string(baud) +
+                          " (" + transport_name + ")");
+                if (!open_at_baud(baud, &baud_open_error)) {
+                    paced_log(std::string("Probe UHF Reader @") + std::to_string(baud) +
+                              " -> open failed: " + baud_open_error);
+                    return false;
                 }
-            }
-            return true;
-        }
-
-        // ====================================================================
-        // UsbSerial: full logic with UHF detection + PN532 fallback.
-        // ====================================================================
-        if (connection_.endpoint.kind == TransportKind::UsbSerial) {
-            const int primary_baud = 115200;
-            const int uhf_preferred_baud = 9600;
-            auto is_known_uhf_vid_pid = [](int vid, int pid) -> bool {
-                return vid == 0x1A86 && pid == 0xFE1C;
-            };
-            auto endpoint_has_usb20_hint = [](const TransportEndpoint &ep) -> bool {
-                const std::string up = to_upper_ascii(ep.label + " " + ep.path);
-                return up.find("USB2.0") != std::string::npos ||
-                       up.find("USB 2.0") != std::string::npos;
-            };
-            auto endpoint_has_usb_serial_hint = [](const TransportEndpoint &ep) -> bool {
-                const std::string up = to_upper_ascii(ep.label + " " + ep.path);
-                return up.find("USB SERIAL") != std::string::npos;
-            };
-            push_log(std::string("[Detect] USB endpoint: ") + connection_.endpoint.path);
-            if (connection_.endpoint.usb_vid >= 0 && connection_.endpoint.usb_pid >= 0) {
-                char vp[48];
-                std::snprintf(vp, sizeof(vp), "[Detect] USB VID:PID = %04X:%04X",
-                              connection_.endpoint.usb_vid, connection_.endpoint.usb_pid);
-                push_log(vp);
-            }
-
-            const bool force_uhf_by_name = endpoint_has_usb20_hint(connection_.endpoint);
-            const bool force_pn_by_name  = endpoint_has_usb_serial_hint(connection_.endpoint);
-
-            if (force_pn_by_name) {
-                push_log("[Detect] Name hint USB Serial -> PN532 route only");
-            }
-
-            if (force_uhf_by_name) {
-                push_log("[Detect] USB2.0 hint found -> direct UHF probe @9600");
                 std::string uhf_detail;
-                bool uhf_found = false;
-                int used_baud = uhf_preferred_baud;
-
-                if (connection_.endpoint.baud_rate != uhf_preferred_baud) {
-                    TransportEndpoint ep = connection_.endpoint;
-                    ep.baud_rate = uhf_preferred_baud;
-                    std::string reopen_err;
-                    if (!open_transport_locked(ep, &reopen_err)) {
-                        push_log(std::string("[Detect] open@9600 failed: ") + reopen_err);
-                    } else {
-                        connection_.endpoint = ep;
-                    }
-                }
-
-                if (uhf_detect_on_open_transport_locked(transport_.get(), &uhf_detail)) {
-                    uhf_found = true;
-                    used_baud = uhf_preferred_baud;
-                } else {
-                    push_log("[Detect] UHF not found @9600, retry @115200");
-                    TransportEndpoint ep = connection_.endpoint;
-                    ep.baud_rate = primary_baud;
-                    std::string reopen_err;
-                    if (open_transport_locked(ep, &reopen_err)) {
-                        connection_.endpoint = ep;
-                        if (uhf_detect_on_open_transport_locked(transport_.get(), &uhf_detail)) {
-                            uhf_found = true;
-                            used_baud = primary_baud;
-                        }
-                    } else {
-                        push_log(std::string("[Detect] open@115200 failed: ") + reopen_err);
-                    }
-                }
-
-                if (uhf_found) {
-                    connection_.device_kind = DeviceKind::UHFReader;
-                    connection_.pn532_ready = false;
-                    connection_.status = "Connected UHF Reader";
-                    connection_.detail = (uhf_detail.empty()
-                        ? (std::string("UHFReader @ ") + connection_.endpoint.path)
-                        : uhf_detail) + " @" + std::to_string(used_baud);
-                    push_log(std::string("[Detect] UHF confirmed @") + std::to_string(used_baud));
-                    return true;
-                }
-
-                push_log("[Detect] USB2.0 direct UHF probe failed, fallback to PN532 probe");
-            }
-
-            if (!force_pn_by_name &&
-                is_known_uhf_vid_pid(connection_.endpoint.usb_vid, connection_.endpoint.usb_pid)) {
-                push_log("[Detect] VID/PID matched known UHF reader (1A86:FE1C)");
-
-                std::string uhf_detail;
-                bool uhf_found = false;
-                int uhf_baud = primary_baud;
-
-                push_log("[Detect] Probe UHF reader @115200");
-                if (uhf_detect_on_open_transport_locked(transport_.get(), &uhf_detail)) {
-                    uhf_found = true;
-                    uhf_baud = 115200;
-                } else {
-                    push_log("[Detect] UHF not found @115200, retry @9600");
-                    TransportEndpoint ep9600 = connection_.endpoint;
-                    ep9600.baud_rate = 9600;
-                    std::string reopen_err;
-                    if (open_transport_locked(ep9600, &reopen_err)) {
-                        connection_.endpoint = ep9600;
-                        if (uhf_detect_on_open_transport_locked(transport_.get(), &uhf_detail)) {
-                            uhf_found = true;
-                            uhf_baud = 9600;
-                        } else {
-                            push_log("[Detect] UHF not found @9600");
-                        }
-                    } else {
-                        push_log(std::string("[Detect] open@9600 failed: ") + reopen_err);
-                    }
+                if (!uhf_detect_on_open_transport_locked(transport_.get(), &uhf_detail)) {
+                    paced_log(std::string("Probe UHF Reader @") + std::to_string(baud) + " -> FAIL");
+                    return false;
                 }
 
                 connection_.device_kind = DeviceKind::UHFReader;
                 connection_.pn532_ready = false;
                 connection_.status = "Connected UHF Reader";
-                if (uhf_found) {
-                    connection_.detail = (uhf_detail.empty()
-                        ? (std::string("UHFReader @ ") + connection_.endpoint.path)
-                        : uhf_detail) + " @" + std::to_string(uhf_baud);
-                    push_log(std::string("[Detect] UHF confirmed @") + std::to_string(uhf_baud));
-                } else {
-                    connection_.detail = std::string("UHFReader VID/PID 1A86:FE1C @ ") +
-                                         connection_.endpoint.path +
-                                         " (version query timeout)";
-                    push_log("[Detect] UHF VID/PID matched, but version query timeout");
-                }
+                connection_.detail = (uhf_detail.empty()
+                    ? (std::string("UHFReader @ ") + endpoint_path)
+                    : uhf_detail) + " @" + std::to_string(baud);
+                paced_log(std::string("Probe UHF Reader @") + std::to_string(baud) + " -> OK");
                 return true;
-            }
+            };
 
-            push_log("[Detect] Probe PN532/PN532Killer @115200");
+            if (try_uhf(9600)) return true;
+            if (try_uhf(115200)) return true;
 
-            if (connection_.endpoint.baud_rate != primary_baud) {
-                TransportEndpoint ep = connection_.endpoint;
-                ep.baud_rate = primary_baud;
-                std::string reopen_err;
-                if (!open_transport_locked(ep, &reopen_err)) {
-                    connection_.connected = false;
-                    connection_.status = "Connect failed";
-                    connection_.detail = std::string("open@115200 failed: ") + reopen_err;
-                    connection_.device_kind = DeviceKind::NotConnected;
-                    push_log(std::string("[Detect] open@115200 failed: ") + reopen_err);
-                    return false;
-                }
-                connection_.endpoint = ep;
-            }
-
-            Pn532KillerClient client(transport_.get());
-            std::string probe_error;
-            std::string firmware;
-            const auto kind = client.detect_device(&firmware, &probe_error);
-            connection_.device_kind = kind;
-            if (kind == DeviceKind::PN532Killer || kind == DeviceKind::PN532) {
-                connection_.pn532_ready = true;
-                connection_.status = std::string("Connected ") + to_string(kind);
-                const std::string fw_label = firmware.empty() ? to_string(kind) : firmware;
-                connection_.detail = fw_label + std::string(" @ ") + connection_.endpoint.path + " @115200";
-                push_log(std::string("[Detect] PN532 detected: ") + fw_label);
-
-                // Some USB ACM UHF adapters may occasionally look like a PN532 response.
-                // Cross-check once with UHF version query and prefer UHF when signature is clear.
-                if (!force_pn_by_name &&
-                    connection_.endpoint.path.find("ttyACM") != std::string::npos) {
-                    std::string cross_detail;
-                    push_log("[Detect] Cross-check UHF signature @115200");
-                    if (uhf_detect_on_open_transport_locked(transport_.get(), &cross_detail)) {
-                        connection_.device_kind = DeviceKind::UHFReader;
-                        connection_.pn532_ready = false;
-                        connection_.status = "Connected UHF Reader";
-                        connection_.detail = (cross_detail.empty()
-                            ? (std::string("UHFReader @ ") + connection_.endpoint.path)
-                            : cross_detail) + " @115200";
-                        push_log("[Detect] UHF signature confirmed, override PN532 result");
-                    }
-                }
-            } else {
-                if (!probe_error.empty()) {
-                    push_log(std::string("[Detect] PN532 not found: ") + probe_error);
-                } else {
-                    push_log("[Detect] PN532 not found");
-                }
-
-                if (force_pn_by_name) {
-                    connection_.device_kind = DeviceKind::OtherSerial;
-                    connection_.pn532_ready = false;
-                    connection_.status = "Connected Serial";
-                    connection_.detail = std::string("USB Serial route: ") +
-                                         (probe_error.empty() ? "PN532 not detected" : probe_error);
-                    push_log("[Detect] Skip UHF probe due to USB Serial name route");
-                    return true;
-                }
-
-                std::string uhf_detail;
-                push_log("[Detect] Probe UHF reader @115200");
-                if (uhf_detect_on_open_transport_locked(transport_.get(), &uhf_detail)) {
-                    connection_.device_kind = DeviceKind::UHFReader;
-                    connection_.pn532_ready = false;
-                    connection_.status = "Connected UHF Reader";
-                    connection_.detail = (uhf_detail.empty()
-                        ? (std::string("UHFReader @ ") + connection_.endpoint.path)
-                        : uhf_detail) + " @115200";
-                    push_log(std::string("[Detect] UHF detected @115200: ") +
-                             (uhf_detail.empty() ? "OK" : uhf_detail));
-                } else {
-                    push_log("[Detect] UHF not found @115200, retry @9600");
-
-                    bool uhf_found_9600 = false;
-                    std::string open9600_error;
-                    TransportEndpoint ep9600 = connection_.endpoint;
-                    ep9600.baud_rate = 9600;
-                    if (open_transport_locked(ep9600, &open9600_error)) {
-                        connection_.endpoint = ep9600;
-                        if (uhf_detect_on_open_transport_locked(transport_.get(), &uhf_detail)) {
-                            connection_.device_kind = DeviceKind::UHFReader;
-                            connection_.pn532_ready = false;
-                            connection_.status = "Connected UHF Reader";
-                            connection_.detail = (uhf_detail.empty()
-                                ? (std::string("UHFReader @ ") + connection_.endpoint.path)
-                                : uhf_detail) + " @9600";
-                            push_log(std::string("[Detect] UHF detected @9600: ") +
-                                     (uhf_detail.empty() ? "OK" : uhf_detail));
-                            uhf_found_9600 = true;
-                        } else {
-                            push_log("[Detect] UHF not found @9600");
-                        }
-                    } else {
-                        push_log(std::string("[Detect] open@9600 failed: ") + open9600_error);
-                    }
-
-                    if (!uhf_found_9600) {
-                        TransportEndpoint ep115200 = connection_.endpoint;
-                        ep115200.baud_rate = primary_baud;
-                        std::string restore_err;
-                        if (open_transport_locked(ep115200, &restore_err)) {
-                            connection_.endpoint = ep115200;
-                        }
-                        connection_.device_kind = DeviceKind::OtherSerial;
-                        connection_.pn532_ready = false;
-                        connection_.status = "Connected Serial";
-                        connection_.detail = std::string("Raw serial only: ") +
-                                             (probe_error.empty() ? "unknown device" : probe_error);
-                    }
-                }
-            }
+            // Keep serial connected, but mark as unknown device after full probe order.
+            std::string restore_error;
+            (void)open_at_baud(115200, &restore_error);
+            connection_.device_kind = DeviceKind::OtherSerial;
+            connection_.pn532_ready = false;
+            connection_.status = "Connected Serial";
+            connection_.detail = std::string("No known device on ") + transport_name +
+                                 " (tested PN532/PN532Killer/UHF @9600/@115200)";
+            return true;
         } else if (connection_.endpoint.kind == TransportKind::I2cBus) {
             // Parse "/dev/i2c-1:0x48" → bus + addr
             const std::string &path = connection_.endpoint.path;
@@ -7211,6 +7024,7 @@ private:
     // Push a log line from ANY thread without holding mutex_.
     void push_log(const std::string &line)
     {
+        if (line.find("[Detect]") == 0) return;
         std::lock_guard<std::mutex> lk(pending_log_mutex_);
         pending_log_lines_.push_back(line);
     }
@@ -7523,10 +7337,18 @@ private:
             auto parse_mfc_block_hex = [](const std::string &raw, std::vector<uint8_t> *out) -> bool {
                 if (!out) return false;
                 std::string line = raw;
-                // Accept optional "NN:" prefix used by dump views.
-                if (line.size() >= 3 && std::isxdigit(static_cast<unsigned char>(line[0])) &&
-                    std::isxdigit(static_cast<unsigned char>(line[1])) && line[2] == ':') {
-                    line = line.substr(3);
+                // Accept optional "N:" or "NN:" prefix used by dump views.
+                // Must handle both: "0:HEXDATA" (single digit) and "00:HEXDATA" (two digits).
+                size_t colon_pos = line.find(':');
+                if (colon_pos != std::string::npos && colon_pos >= 1 && colon_pos <= 2) {
+                    bool all_hex = true;
+                    for (size_t i = 0; i < colon_pos; ++i) {
+                        if (!std::isxdigit(static_cast<unsigned char>(line[i]))) {
+                            all_hex = false;
+                            break;
+                        }
+                    }
+                    if (all_hex) line = line.substr(colon_pos + 1);
                 }
 
                 std::string compact;

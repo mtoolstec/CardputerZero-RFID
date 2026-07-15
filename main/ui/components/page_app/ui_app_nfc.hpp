@@ -1,8 +1,8 @@
 #pragma once
 
-// Build version: override via -DRFID_BUILD_HASH='"abc1234"' at compile time
+// Build version: hard-coded build timestamp (updated by SConstruct / build script)
 #ifndef RFID_BUILD_HASH
-#define RFID_BUILD_HASH "dev-" __DATE__ " " __TIME__
+#define RFID_BUILD_HASH "c5bf9a1_0715T" __TIME__
 #endif
 
 #include "nfc/nfc_device_service.hpp"
@@ -402,11 +402,13 @@ private:
         // Works for Read tab scan log AND for HexLog modal
         if (self->held_scroll_key_ != 0) {
             const bool is_read_scroll = self->modal_ == Modal::None && self->current_tab_ == Tab::Read;
+            const bool is_emu_scroll = self->modal_ == Modal::None && self->current_tab_ == Tab::Emulator;
             const bool is_hexlog_scroll = self->modal_ == Modal::HexLog;
-            if (is_read_scroll || is_hexlog_scroll) {
+            if (is_read_scroll || is_emu_scroll || is_hexlog_scroll) {
                 const uint32_t now = lv_tick_get();
                 const uint32_t held_ms = now - self->held_scroll_start_ms_;
-                const int page_size = is_read_scroll ? self->read_log_visible_lines() : LOG_VISIBLE_HEX_LINES;
+                int page_size = is_read_scroll ? self->read_log_visible_lines() :
+                                (is_emu_scroll ? 7 : LOG_VISIBLE_HEX_LINES); // DUMP_ROWS=7
                 if (page_size < 1) { self->held_scroll_key_ = 0; return; }
                 const uint32_t interval = (held_ms > 800) ? 40 : 150;
                 if (held_ms > 400 && now - self->held_scroll_last_ms_ > interval) {
@@ -419,6 +421,18 @@ private:
                             self->uhf_table_scroll_offset_ = std::max(0, std::min(max_scroll, self->uhf_table_scroll_offset_ + delta));
                         } else {
                             self->log_scroll_offset_ = std::max(0, std::min(max_scroll, self->log_scroll_offset_ + delta));
+                        }
+                    } else if (is_emu_scroll) {
+                        const auto conn2 = self->service_.connection_state();
+                        self->cache_serial_device_kind(conn2);
+                        if (self->effective_emu_device_kind(conn2) == nfc_app::DeviceKind::PN532Killer) {
+                            const auto info = self->service_.emu_slot_info(
+                                self->service_.current_emulator_protocol(), self->hw_emu_slot_);
+                            if (info.dump_loaded && !info.dump_lines.empty()) {
+                                const int total = static_cast<int>(info.dump_lines.size());
+                                const int max_scroll2 = std::max(0, total - 7);
+                                self->emu_dump_scroll_ = std::max(0, std::min(max_scroll2, self->emu_dump_scroll_ + delta));
+                            }
                         }
                     } else {
                         const int total = nfc_app::NfcHexLog::get().total_lines();
@@ -610,9 +624,12 @@ private:
             const bool want_scroll_read = (nk == KEY_UP || nk == KEY_DOWN)
                                           && modal_ == Modal::None
                                           && current_tab_ == Tab::Read;
+            const bool want_scroll_emu = (nk == KEY_UP || nk == KEY_DOWN)
+                                          && modal_ == Modal::None
+                                          && current_tab_ == Tab::Emulator;
             const bool want_scroll_hexlog = (nk == KEY_UP || nk == KEY_DOWN)
                                              && modal_ == Modal::HexLog;
-            if (want_scroll_read || want_scroll_hexlog) {
+            if (want_scroll_read || want_scroll_emu || want_scroll_hexlog) {
                 if (held_scroll_key_ != nk) {
                     held_scroll_key_      = nk;
                     held_scroll_start_ms_ = lv_tick_get();
@@ -714,29 +731,47 @@ private:
             return;
         }
 
-        // In EMU tab: F/X scroll dump for GroveNFC, cycle slot for PN532Killer
+        // In EMU tab: 1-8 keys switch PN532Killer slot; F/X scroll dump
+        if (current_tab_ == Tab::Emulator && modal_ == Modal::None &&
+            (raw_key >= KEY_1 && raw_key <= KEY_8)) {
+            const auto conn = service_.connection_state();
+            cache_serial_device_kind(conn);
+            const auto kind = effective_emu_device_kind(conn);
+            if (kind == nfc_app::DeviceKind::PN532Killer) {
+                hw_emu_slot_ = raw_key - KEY_1;  // KEY_1→slot0, KEY_8→slot7
+                emu_dump_scroll_ = 0;
+                const auto proto = service_.current_emulator_protocol();
+                service_.hw_switch_emu_slot_and_probe(proto, hw_emu_slot_);
+                // Auto-download after slot switch
+                service_.hw_start_emu_dump_async(proto, hw_emu_slot_);
+                ui_message_ = "HW Slot " + std::to_string(hw_emu_slot_ + 1);
+                render_all();
+            }
+            return;
+        }
         if (current_tab_ == Tab::Emulator && modal_ == Modal::None &&
             (raw_key == KEY_F || raw_key == KEY_X)) {
             const auto conn = service_.connection_state();
             cache_serial_device_kind(conn);
             const auto kind = effective_emu_device_kind(conn);
+            const int delta = (raw_key == KEY_X) ? 1 : -1;
             if (kind == nfc_app::DeviceKind::PN532Killer) {
-                const int delta = (raw_key == KEY_F) ? -1 : 1;
-                hw_emu_slot_ = (hw_emu_slot_ + delta + 8) % 8;
-                emu_dump_scroll_ = 0;
-                const auto proto = service_.current_emulator_protocol();
-                service_.hw_switch_emu_slot_and_probe(proto, hw_emu_slot_);
-                ui_message_ = "HW Slot " + std::to_string(hw_emu_slot_ + 1);
-                render_all();
+                // F/X scrolls PN532Killer dump
+                const auto info = service_.emu_slot_info(
+                    service_.current_emulator_protocol(), hw_emu_slot_);
+                if (info.dump_loaded && !info.dump_lines.empty()) {
+                    const int total = static_cast<int>(info.dump_lines.size());
+                    const int max_scroll = std::max(0, total - 7); // DUMP_ROWS=7
+                    emu_dump_scroll_ = std::max(0, std::min(max_scroll, emu_dump_scroll_ + delta));
+                    render_all();
+                }
             } else if (kind == nfc_app::DeviceKind::GroveNFC ||
                        kind == nfc_app::DeviceKind::NFCUnit ||
                        kind == nfc_app::DeviceKind::ST25RNFC) {
-                // Scroll entire right panel content (header + dump) as one block
-                const int delta = (raw_key == KEY_X) ? 1 : -1;
                 auto dump_lines = service_.i2c_emulator_dump_lines(service_.current_emulator_protocol());
                 const auto proto = service_.current_emulator_protocol();
                 const bool is_mfc = (proto == nfc_app::ProtocolKind::MifareClassic);
-                int header_lines = is_mfc ? 5 : 3;
+                int header_lines = is_mfc ? 4 : 3;
                 int data_rows = (int)dump_lines.size();
                 int total = header_lines + std::max(1, data_rows);
                 const int MAX_VISIBLE = 11;
@@ -794,7 +829,8 @@ private:
                     service_.cycle_hw_emu_protocol();
                     emu_dump_scroll_ = 0;
                     const auto proto = service_.current_emulator_protocol();
-                    service_.hw_switch_emu_slot_and_probe(proto, hw_emu_slot_);
+                    // Direct full dump — no separate probe needed, avoids race
+                    service_.hw_start_emu_dump_async(proto, hw_emu_slot_);
                 } else if (emu_device_kind == nfc_app::DeviceKind::NFCUnit ||
                            emu_device_kind == nfc_app::DeviceKind::ST25RNFC ||
                            emu_device_kind == nfc_app::DeviceKind::GroveNFC) {
@@ -1082,6 +1118,7 @@ private:
                 service_.select_spi_endpoint(spi_select_list_[0]);
             }
 
+            scan_log_lines_.clear();
             const auto connect_ep = service_.current_endpoint();
             scan_log_lines_.push_back("> Connect " + connect_ep.label.substr(0, 22) + "...");
             const bool ok = service_.connect_current();
@@ -1145,14 +1182,21 @@ private:
         if (current_tab_ == Tab::Emulator) {
             const auto proto = service_.current_emulator_protocol();
             const std::string src_filename = emulator_source_filename(proto);
-            ui_message_ = "Load from " + src_filename;
             const auto conn = service_.connection_state();
             cache_serial_device_kind(conn);
             const auto kind = effective_emu_device_kind(conn);
             if (conn.connected && kind == nfc_app::DeviceKind::PN532Killer) {
+                ui_message_ = "PN532Killer HW Slot " + std::to_string(hw_emu_slot_ + 1);
+            } else {
+                ui_message_ = "Load from " + src_filename;
+            }
+            if (conn.connected && kind == nfc_app::DeviceKind::PN532Killer) {
                 emu_dump_scroll_ = 0;
                 const auto proto = service_.current_emulator_protocol();
+                // Direct full dump on tab entry; probe gets block0 first,
+                // then the dump fills in all sectors without overwriting.
                 service_.hw_switch_emu_slot_and_probe(proto, hw_emu_slot_);
+                service_.hw_start_emu_dump_async(proto, hw_emu_slot_);
             } else if (conn.connected && kind == nfc_app::DeviceKind::GroveNFC) {
                 std::string emu_err;
                 if (service_.grovenfc_activate(service_.current_emulator_protocol(), 0, &emu_err)) {
@@ -1839,13 +1883,15 @@ private:
                     service_.current_emulator_protocol(), hw_emu_slot_);
                 if (info.dump_loaded && !info.dump_lines.empty()) {
                     const int total = static_cast<int>(info.dump_lines.size());
-                    const int max_scroll = std::max(0, total - 7);
+                    const int max_scroll = std::max(0, total - 7); // DUMP_ROWS=7
                     emu_dump_scroll_ = std::max(0, std::min(max_scroll, emu_dump_scroll_ + delta));
                 } else {
+                    // No dump loaded: cycle slot + auto-download
                     hw_emu_slot_ = (hw_emu_slot_ + delta + 8) % 8;
                     emu_dump_scroll_ = 0;
                     const auto proto = service_.current_emulator_protocol();
                     service_.hw_switch_emu_slot_and_probe(proto, hw_emu_slot_);
+                    service_.hw_start_emu_dump_async(proto, hw_emu_slot_);
                     ui_message_ = "HW Slot " + std::to_string(hw_emu_slot_ + 1);
                 }
             } else {
@@ -1857,7 +1903,7 @@ private:
                     auto dump_lines = service_.i2c_emulator_dump_lines(service_.current_emulator_protocol());
                     const auto proto2 = service_.current_emulator_protocol();
                     const bool is_mfc2 = (proto2 == nfc_app::ProtocolKind::MifareClassic);
-                    int header_lines = is_mfc2 ? 5 : 3;
+                    int header_lines = is_mfc2 ? 4 : 3;
                     int data_rows = (int)dump_lines.size();
                     int total = header_lines + std::max(1, data_rows);
                     const int MAX_VISIBLE = 11;
@@ -2204,8 +2250,16 @@ private:
                 if (l.size() >= 4 && l[0] == 'E' && l[1] == 'P' && l[2] == 'C' && l[3] == ' ') {
                     continue;
                 }
-                if (suppress_detect_trace && l.rfind("[Detect]", 0) == 0) {
-                    continue;
+                // Suppress probe/detect/debug lines when device is connected and identified.
+                if (suppress_detect_trace) {
+                    if (l.rfind("[Detect]", 0) == 0) continue;
+                    if (l.rfind("[Probe]",  0) == 0) continue;
+                    if (l.rfind("[Debug]",  0) == 0) continue;
+                    if (l.find("[SCAN]") != std::string::npos) continue;
+                    if (l.find("[I2C]")  != std::string::npos) continue;
+                    if (l.rfind("Probe ", 0) == 0) continue;
+                    if (l.find("-> Failed") != std::string::npos ||
+                        l.find("-> OK")     != std::string::npos) continue;
                 }
                 scan_log_lines_.push_back(std::move(l));
                 log_scroll_offset_ = std::max(0, static_cast<int>(scan_log_lines_.size()) - read_log_visible_lines());
@@ -2411,29 +2465,34 @@ private:
     // Render one dump line with fixed-width font.
     // For MFC payloads ("BB:HHHH...32hex"), apply trailer key coloring and
     // block0 field coloring based on UID length (4-byte / 7-byte UID).
-    void render_dump_line_colored(lv_obj_t *parent, int x_base, int y, const std::string &line, int uid_len)
+    void render_dump_line_colored(lv_obj_t *parent, int x_base, int y, const std::string &line, int uid_len, bool skip_mfc_ascii = false)
     {
         constexpr int CW = 8;  // unscii_8 char width in px
         constexpr int DUMP_FONT = 7;
 
         const size_t colon = line.find(':');
         if (colon == std::string::npos || colon == 0 || colon > 3) {
-            create_text(parent, x_base, y, to_compact(line, 37).c_str(), 0xD8D8D8, 10);
+            create_text_mono(parent, x_base, y, to_compact(line, 37).c_str(), 0xD8D8D8, 10);
             return;
         }
+        bool has_hex_alpha = false;
         for (size_t i = 0; i < colon; ++i) {
-            if (!std::isdigit(static_cast<unsigned char>(line[i]))) {
-                create_text(parent, x_base, y, to_compact(line, 37).c_str(), 0xD8D8D8, 10);
+            const unsigned char ch = static_cast<unsigned char>(line[i]);
+            if (!std::isxdigit(ch)) {
+                create_text_mono(parent, x_base, y, to_compact(line, 37).c_str(), 0xD8D8D8, 10);
                 return;
             }
+            if (std::isalpha(ch)) has_hex_alpha = true;
         }
 
-        const int block_num = std::stoi(line.substr(0, colon), nullptr, 10);
+        // PN532Killer dump commonly uses hex block prefix (e.g. "0A:"),
+        // while other paths may use decimal (e.g. "10:").
+        const int block_num = std::stoi(line.substr(0, colon), nullptr, has_hex_alpha ? 16 : 10);
         const bool is_trailer = (block_num % 4 == 3);
 
         // "BB:" prefix in dark gray — use unscii_8 (font_size<8) for fixed 8px/char
         const std::string prefix = line.substr(0, colon + 1);
-        create_text(parent, x_base, y, prefix.c_str(), 0x606060, DUMP_FONT);
+        create_text_mono(parent, x_base, y, prefix.c_str(), 0x606060, DUMP_FONT);
 
         // hex data starts after "BB:" — strip any leading space
         size_t hex_colon_skip = colon + 1;
@@ -2463,62 +2522,76 @@ private:
         };
 
         // Non-MFC payloads (e.g. MFU/ISO15693) keep index + fixed-width body.
+        // Only NTAG pages (uid_len==4 or 7) get UID/BCC colour coding.
+        // ISO15693 (uid_len==0) shows all bytes in uniform grey.
         if (hex.size() == 8 && is_all_hex(hex)) {
-            // MFU/NTAG page highlighting:
-            //   page0 last byte  = BCC0
-            //   page2 first byte = BCC1
-            if (block_num == 0) {
-                create_text(parent, hx,          y, hex.substr(0, 6).c_str(), 0x00D2FF, DUMP_FONT); // UID[0..2]
-                create_text(parent, hx + 6 * CW, y, hex.substr(6, 2).c_str(), 0xFF66CC, DUMP_FONT); // BCC0
-            } else if (block_num == 1) {
-                create_text(parent, hx, y, hex.c_str(), 0x00D2FF, DUMP_FONT); // UID[3..6]
-            } else if (block_num == 2) {
-                create_text(parent, hx,          y, hex.substr(0, 2).c_str(), 0xFF66CC, DUMP_FONT); // BCC1
-                create_text(parent, hx + 2 * CW, y, hex.substr(2, 6).c_str(), 0xB0B0B0, DUMP_FONT);
+            if (uid_len == 4 || uid_len == 7) {
+                // NTAG page colour coding
+                if (block_num == 0) {
+                    create_text_mono(parent, hx,          y, hex.substr(0, 6).c_str(), 0x00D2FF, DUMP_FONT); // UID[0..2]
+                    create_text_mono(parent, hx + 6 * CW, y, hex.substr(6, 2).c_str(), 0xFF66CC, DUMP_FONT); // BCC0
+                } else if (block_num == 1) {
+                    create_text_mono(parent, hx, y, hex.c_str(), 0x00D2FF, DUMP_FONT); // UID[3..6]
+                } else if (block_num == 2) {
+                    create_text_mono(parent, hx,          y, hex.substr(0, 2).c_str(), 0xFF66CC, DUMP_FONT); // BCC1
+                    create_text_mono(parent, hx + 2 * CW, y, hex.substr(2, 6).c_str(), 0xB0B0B0, DUMP_FONT);
+                } else {
+                    create_text_mono(parent, hx, y, hex.c_str(), 0xC0C0C0, DUMP_FONT);
+                }
+                const std::string ascii = ascii_from_hex(hex);
+                create_text_mono(parent, hx + 10 * CW, y, "|", 0x606060, DUMP_FONT);
+                create_text_mono(parent, hx + 12 * CW, y, to_compact(ascii, 4).c_str(), 0x8FD0FF, DUMP_FONT);
             } else {
-                create_text(parent, hx, y, hex.c_str(), 0xC0C0C0, DUMP_FONT);
+                // ISO15693: uniform grey, no colour
+                create_text_mono(parent, hx, y, hex.c_str(), 0xC0C0C0, DUMP_FONT);
+                const std::string ascii = ascii_from_hex(hex);
+                create_text_mono(parent, hx + 10 * CW, y, "|", 0x606060, DUMP_FONT);
+                create_text_mono(parent, hx + 12 * CW, y, to_compact(ascii, 4).c_str(), 0x8FD0FF, DUMP_FONT);
             }
-
-            const std::string ascii = ascii_from_hex(hex);
-            create_text(parent, hx + 10 * CW, y, "|", 0x606060, DUMP_FONT);
-            create_text(parent, hx + 12 * CW, y, to_compact(ascii, 4).c_str(), 0x8FD0FF, DUMP_FONT);
             return;
         }
 
         if (hex.size() != 32) {
-            create_text(parent, hx, y, to_compact(hex, 34).c_str(), 0xC0C0C0, DUMP_FONT);
+            create_text_mono(parent, hx, y, to_compact(hex, 34).c_str(), 0xC0C0C0, DUMP_FONT);
             return;
         }
 
         if (is_trailer) {
             // Key A (bytes 0-5): hex chars [0..11]
             const std::string keyA = hex.substr(0, 12);
-            create_text(parent, hx,               y, keyA.c_str(),
+            create_text_mono(parent, hx,               y, keyA.c_str(),
                         (block_num == 3) ? 0x00CC66u : (is_default_mfc_key(keyA) ? 0x00CC66u : 0xFF8800u), DUMP_FONT);
             // Access Conditions + GPB (bytes 6-9): hex chars [12..19]
             const std::string ac = hex.substr(12, 8);
-            create_text(parent, hx + 12 * CW,    y, ac.c_str(),   0xF7A600, DUMP_FONT);
+            create_text_mono(parent, hx + 12 * CW,    y, ac.c_str(),   0xF7A600, DUMP_FONT);
             // Key B (bytes 10-15): hex chars [20..31]
             const std::string keyB = hex.substr(20, 12);
-            create_text(parent, hx + 20 * CW,    y, keyB.c_str(),
+            create_text_mono(parent, hx + 20 * CW,    y, keyB.c_str(),
                         is_default_mfc_key(keyB) ? 0x00CC66u : 0xFF8800u, DUMP_FONT);
         } else if (block_num == 0) {
             if (uid_len >= 7) {
                 // 7-byte UID block0: UID[0..6] | SAK | ATQA[2] | manufacturer data
-                create_text(parent, hx,          y, hex.substr(0, 14).c_str(), 0x00D2FF, DUMP_FONT);
-                create_text(parent, hx + 14 * CW,y, hex.substr(14, 2).c_str(), 0xFFD166, DUMP_FONT);
-                create_text(parent, hx + 16 * CW,y, hex.substr(16, 4).c_str(), 0x7CFF6B, DUMP_FONT);
-                create_text(parent, hx + 20 * CW,y, hex.substr(20, 12).c_str(), 0xB0B0B0, DUMP_FONT);
+                create_text_mono(parent, hx,          y, hex.substr(0, 14).c_str(), 0x00D2FF, DUMP_FONT);
+                create_text_mono(parent, hx + 14 * CW,y, hex.substr(14, 2).c_str(), 0xFFD166, DUMP_FONT);
+                create_text_mono(parent, hx + 16 * CW,y, hex.substr(16, 4).c_str(), 0x7CFF6B, DUMP_FONT);
+                create_text_mono(parent, hx + 20 * CW,y, hex.substr(20, 12).c_str(), 0xB0B0B0, DUMP_FONT);
             } else {
                 // 4-byte UID block0: UID[0..3] | BCC | SAK | ATQA[2] | manufacturer data
-                create_text(parent, hx,          y, hex.substr(0, 8).c_str(),  0x00D2FF, DUMP_FONT);
-                create_text(parent, hx + 8 * CW, y, hex.substr(8, 2).c_str(),  0xFF66CC, DUMP_FONT);
-                create_text(parent, hx + 10 * CW,y, hex.substr(10, 2).c_str(), 0xFFD166, DUMP_FONT);
-                create_text(parent, hx + 12 * CW,y, hex.substr(12, 4).c_str(), 0x7CFF6B, DUMP_FONT);
-                create_text(parent, hx + 16 * CW,y, hex.substr(16, 16).c_str(),0xB0B0B0, DUMP_FONT);
+                create_text_mono(parent, hx,          y, hex.substr(0, 8).c_str(),  0x00D2FF, DUMP_FONT);
+                create_text_mono(parent, hx + 8 * CW, y, hex.substr(8, 2).c_str(),  0xFF66CC, DUMP_FONT);
+                create_text_mono(parent, hx + 10 * CW,y, hex.substr(10, 2).c_str(), 0xFFD166, DUMP_FONT);
+                create_text_mono(parent, hx + 12 * CW,y, hex.substr(12, 4).c_str(), 0x7CFF6B, DUMP_FONT);
+                create_text_mono(parent, hx + 16 * CW,y, hex.substr(16, 16).c_str(),0xB0B0B0, DUMP_FONT);
             }
         } else {
-            create_text(parent, hx, y, hex.c_str(), 0xC0C0C0, DUMP_FONT);
+            create_text_mono(parent, hx, y, hex.c_str(), 0xC0C0C0, DUMP_FONT);
+            if (!skip_mfc_ascii) {
+                const std::string ascii_extra = ascii_from_hex(hex);
+                if (!ascii_extra.empty()) {
+                    create_text_mono(parent, hx + 34 * CW, y, "|", 0x606060, DUMP_FONT);
+                    create_text_mono(parent, hx + 36 * CW, y, to_compact(ascii_extra, 16).c_str(), 0x8FD0FF, DUMP_FONT);
+                }
+            }
         }
     }
 
@@ -2809,54 +2882,54 @@ private:
         const auto emu_device_kind = effective_emu_device_kind(connection);
         const auto protocol = service_.current_emulator_protocol();
 
-        lv_obj_t *left  = create_panel(parent, 0, 0, 80, 104, 0x101010);
-        lv_obj_t *right = create_panel(parent, 84, 0, 236, 104, 0x101010);
-
+        // PN532Killer: full-width dump, handled first (early return)
         if (emu_device_kind == nfc_app::DeviceKind::PN532Killer) {
-            // ── HW EMU mode: show PN532Killer hardware slot ──────────────────
+            // ── HW EMU mode: top info bar + full-width dump + bottom hint ──
             const std::string proto_name =
                 (protocol == nfc_app::ProtocolKind::MifareClassic) ? "MFC" :
                 (protocol == nfc_app::ProtocolKind::Iso15693)      ? "ISO15693" : "NTAG";
 
-            // Left: slot carousel + probe status
-            create_text(left, 6, 4, proto_name.c_str(), 0x00D2FF, 11);
-            const std::string slot_str = "HW Slot " + std::to_string(hw_emu_slot_ + 1) + "/8";
-            create_text(left, 6, 18, slot_str.c_str(), 0xFFFFFF, 12);
-
             const auto info = service_.emu_slot_info(protocol, hw_emu_slot_);
-            if (service_.emu_probe_running()) {
-                create_text(left, 6, 38, "probing...", 0xF7A600, 10);
-            } else if (info.probed) {
-                if (!info.uid.empty())
-                    create_text(left, 6, 38, to_compact(info.uid, 16).c_str(), 0x00FF88, 10);
-                else {
-                    const std::string err = service_.emu_probe_error();
-                    create_text(left, 6, 38, err.empty() ? "(no UID)" : to_compact(err, 16).c_str(), 0xFF8888, 10);
-                }
+            // ── Top info bar (12px): proto + slot + UID ──────────────────
+            {
+                char top[48];
+                const std::string uid_str = info.uid.empty() ? "-" : to_compact(info.uid, 22);
+                snprintf(top, sizeof(top), "%s %d/8 UID:%s",
+                         proto_name.c_str(), hw_emu_slot_ + 1, uid_str.c_str());
+                lv_obj_t *top_bar = create_panel(parent, 0, 0, 320, 12, 0x0D1A0D);
+                create_text(top_bar, 2, 1, top, 0x7FA5C9, 7);
             }
-            create_text(left, 6, 56, "Tab:proto", 0xD8D8D8, 10);
-            create_text(left, 6, 68, "F/X:slot", 0xD8D8D8, 10);
-            create_text(left, 6, 80, "OK:menu", 0xF7A600, 10);
+            // DUMP area: y=12 to y=92 (80px), bottom bar y=92-104
+            constexpr int DUMP_Y = 12;
+            constexpr int DUMP_H = 92;
+            lv_obj_t *right = create_panel(parent, 0, DUMP_Y, 320, DUMP_H, 0x101010);
+            lv_obj_set_style_clip_corner(right, true, 0);
 
-            // Right: dump lines if downloaded, otherwise block0 hex
             static constexpr int DUMP_ROWS = 7;
             static constexpr int ROW_H     = 13;
             const bool showing_dump = info.dump_loaded && !info.dump_lines.empty();
+            int uid_hex_digits = 0;
+            for (char ch : info.uid) {
+                if (std::isxdigit(static_cast<unsigned char>(ch))) ++uid_hex_digits;
+            }
+            const bool is_mfc = (protocol == nfc_app::ProtocolKind::MifareClassic);
+            const bool is_ntag = (protocol == nfc_app::ProtocolKind::Iso14443A);
+            const int dump_uid_len = (uid_hex_digits > 0) ? (uid_hex_digits / 2) : (is_ntag ? 4 : 0);
+
             if (service_.hw_upload_running()) {
                 const int prog = service_.hw_upload_progress();
                 char prog_buf[32];
                 snprintf(prog_buf, sizeof(prog_buf), "Uploading %d/64", prog);
-                create_text(right, 6, 6,  "Upload:", 0xF7A600, 10);
-                create_text(right, 6, 22, prog_buf, 0xFFFFFF, 11);
-                // Simple progress bar (width 0-160 proportional to 0-64)
+                create_text(right, 6, 2,  "Upload:", 0xF7A600, 10);
+                create_text(right, 6, 18, prog_buf, 0xFFFFFF, 11);
                 lv_obj_t *bar_bg = lv_obj_create(right);
-                lv_obj_set_pos(bar_bg, 6, 42);
-                lv_obj_set_size(bar_bg, 162, 10);
+                lv_obj_set_pos(bar_bg, 6, 34);
+                lv_obj_set_size(bar_bg, 300, 10);
                 lv_obj_set_style_bg_color(bar_bg, lv_color_hex(0x333333), 0);
                 lv_obj_set_style_border_width(bar_bg, 0, 0);
                 lv_obj_set_style_radius(bar_bg, 3, 0);
                 lv_obj_set_style_pad_all(bar_bg, 0, 0);
-                const int fill_w = prog * 162 / 64;
+                const int fill_w = prog * 300 / 64;
                 if (fill_w > 0) {
                     lv_obj_t *bar_fill = lv_obj_create(bar_bg);
                     lv_obj_set_pos(bar_fill, 0, 0);
@@ -2873,41 +2946,43 @@ private:
                 const int total = static_cast<int>(info.dump_lines.size());
                 const int scroll = std::max(0, std::min(emu_dump_scroll_,
                                              std::max(0, total - DUMP_ROWS)));
-                char hdr[24];
-                snprintf(hdr, sizeof(hdr), "Blk %d-%d/%d",
-                         scroll, std::min(scroll + DUMP_ROWS - 1, total - 1), total);
-                create_text(right, 6, 2, hdr, 0x00D2FF, 10);
-                for (int r = 0; r < DUMP_ROWS && (scroll + r) < total; ++r)
-                    create_text(right, 6, 14 + r * ROW_H,
-                                info.dump_lines[scroll + r].c_str(), 0xD8D8D8, 10);
-                if (total > DUMP_ROWS)
-                    create_text(right, 6, 96, "U/D scroll", 0x555555, 10);
+                for (int r = 0; r < DUMP_ROWS && (scroll + r) < total; ++r) {
+                    const auto &dline = info.dump_lines[scroll + r];
+                    render_dump_line_colored(right, 6, 2 + r * ROW_H, dline, dump_uid_len, is_mfc);
+                }
             } else if (service_.emu_probe_running()) {
                 create_text(right, 6, 6,  "Block 0:", 0x8E8E8E, 10);
                 create_text(right, 6, 22, "(probing...)", 0xF7A600, 10);
             } else if (info.probed && !info.block0_hex.empty()) {
-                // Show block 0 in "00: HEXHEX..." format
-                const auto &h = info.block0_hex;  // hex string of block0 bytes
-                const size_t byte_count = h.size() / 2;
-                // 8 bytes per display row (16 hex chars)
-                auto row_fmt = [&](int byte_off) -> std::string {
-                    std::string s;
-                    for (size_t i = 0; i < 8 && (byte_off + (int)i) < (int)byte_count; ++i)
-                        s += h.substr(static_cast<size_t>((byte_off + (int)i) * 2), 2);
-                    return s;
-                };
-                create_text(right, 6, 4,  "00: ", 0x8E8E8E, 10);
-                create_text(right, 32, 4, row_fmt(0).c_str(), 0xD8D8D8, 10);
-                if (byte_count > 8) {
-                    create_text(right, 6, 18, "   ", 0x8E8E8E, 10);
-                    create_text(right, 32, 18, row_fmt(8).c_str(), 0xD8D8D8, 10);
-                }
-                create_text(right, 6, 36, "OK>Download for full", 0x444444, 10);
+                const auto &h = info.block0_hex;
+                render_dump_line_colored(right, 6, 4, "00:" + h, dump_uid_len, is_mfc);
+                create_text(right, 6, 36, "OK>Download for full dump", 0x444444, 10);
             } else {
-                create_text(right, 6, 4,  "Block 0:", 0x8E8E8E, 10);
-                create_text(right, 6, 20, "(no data)", 0x555555, 10);
-                create_text(right, 6, 36, "F/X to probe slot", 0x444444, 10);
+                create_text(right, 6, 6,  "Block 0:", 0x8E8E8E, 10);
+                create_text(right, 6, 22, "(no data)", 0x555555, 10);
             }
+            // Bottom bar: operation messages only
+            {
+                lv_obj_t *footer = create_panel(parent, 0, 108, 320, 10, 0x0A0A0A);
+                lv_obj_set_style_clip_corner(footer, true, 0);
+                lv_obj_t *label = lv_label_create(footer);
+                lv_label_set_text(label, ui_message_.c_str());
+                lv_obj_set_style_text_font(label, &lv_font_unscii_8, LV_PART_MAIN | LV_STATE_DEFAULT);
+                lv_obj_set_style_text_color(label, lv_color_hex(0x7FA5C9), LV_PART_MAIN | LV_STATE_DEFAULT);
+                lv_obj_set_style_pad_all(label, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                lv_label_set_long_mode(label, LV_LABEL_LONG_SCROLL_CIRCULAR);
+                lv_obj_set_width(label, 318);
+                lv_obj_center(label);
+            }
+            parent = parent;
+            return; // skip generic footer below
+        }
+
+        lv_obj_t *left  = create_panel(parent, 0, 0, 80, 104, 0x101010);
+        lv_obj_t *right = create_panel(parent, 84, 0, 236, 104, 0x101010);
+        lv_obj_set_style_clip_corner(right, true, 0);
+
+        if (false) { // placeholder — PN532Killer handled above
         } else if (emu_device_kind == nfc_app::DeviceKind::PN532) {
             // ── PN532 NDEF target emulation ───────────────────────────────────
             const auto ndef = service_.pn532_ndef_state();
@@ -2952,8 +3027,7 @@ private:
                 create_text(left, 6, 50, "OK:start", 0xF7A600, 10);
                 create_text(left, 6, 62, "P:stop", 0xD8D8D8, 10);
             } else {
-                create_text(left, 6, 50, "F/X:scroll", 0xD8D8D8, 10);
-                create_text(left, 6, 62, "OK:menu", 0xF7A600, 10);
+                create_text(left, 6, 50, "OK:menu", 0xF7A600, 10);
             }
             create_text(left, 6, 80, is_st25r ? "M5 NFC CAP SPI" : (is_nfc_unit ? "NFC Unit I2C" : "GroveNFC I2C"), is_st25r ? 0x00B4FF : 0x00FF88, 10);
 
@@ -3020,120 +3094,69 @@ private:
                 for (int i = 0; i < MAX_VISIBLE && (scroll + i) < total; ++i) {
                     const auto &l = lines[scroll + i];
                     int y = 2 + i * ROW_H;
-                    create_text_mono(right, 4, y, l.text.c_str(), l.color, 7);
-                }
-            } else if (is_grove_or_nfcunit) {
-                // Show card info + dump blocks — all content scrolls as one block
-                auto dump_lines = service_.i2c_emulator_dump_lines(protocol);
-
-                struct ContentLine { std::string text; uint32_t color; bool mono; };
-                std::vector<ContentLine> lines;
-
-                // Title line
-                lines.push_back({proto_name, 0x00D2FF, true});
-
-                // Read UID from the cache (populated from JSON card.uid by i2c_emulator_dump_lines)
-                const auto slot_info = service_.emu_slot_info(protocol, 0);
-                std::string uid_str = slot_info.uid;
-                if (uid_str.empty()) uid_str = "-";
-                // Auto-detect SAK/ATQA from MFC protocol
-                std::string sak_str, atqa_str;
-                const bool is_mfc = (protocol == nfc_app::ProtocolKind::MifareClassic);
-                if (is_mfc) {
-                    sak_str = "SAK:08";
-                    atqa_str = "ATQA:0004";
-                }
-
-                lines.push_back({std::string("UID:") + uid_str, 0x00D2FF, true});
-                if (!sak_str.empty()) lines.push_back({sak_str, 0xD8D8D8, true});
-                if (!atqa_str.empty()) lines.push_back({atqa_str, 0xD8D8D8, true});
-
-                // Dump header
-                lines.push_back({"Dump:", 0x9E9E9E, true});
-
-                if (dump_lines.empty()) {
-                    lines.push_back({"(no dump loaded)", 0x666666, true});
-                } else {
-                    for (int i = 0; i < (int)dump_lines.size(); ++i) {
-                        // No word-wrap: each raw dump line = one display line.
-                        // Apply the same coloring as READ tab dump (render_dump_line_colored).
-                        const std::string &raw = dump_lines[i];
-                        std::string text_to_show = raw;
-                        uint32_t color = 0xD8D8D8;
-
-                        size_t colon = raw.find(':');
-                        bool looks_hex = (colon != std::string::npos && colon > 0);
-                        if (looks_hex) {
-                            for (size_t ci = 0; ci < colon; ++ci) {
-                                if (!std::isdigit((unsigned char)raw[ci])) { looks_hex = false; break; }
-                            }
-                        }
-                        int block_num = looks_hex ? std::stoi(raw.substr(0, colon)) : i;
-                        std::string hex = looks_hex ? raw.substr(colon + 1) : raw;
-
-                        if (is_mfc) {
-                            bool is_trailer = (block_num % 4 == 3);
-                            bool is_block0  = (block_num == 0);
-                            if (hex.size() >= 32 && looks_hex) {
-                                // Full per-byte coloring (same as render_dump_line_colored)
-                                // We'll store a simple 2-char prefix + mark for special rendering below.
-                                if (is_trailer) {
-                                    // Trailer: KeyA(0-11) green/orange, ACS(12-19) orange, KeyB(20-31) green/orange
-                                    lines.push_back({raw, 0x44CC88, true});  // placeholder, real coloring below
-                                    // We push individual segments instead for MFC trailers
-                                } else if (is_block0) {
-                                    // Block0 needs UID/BCC/SAK/ATQA coloring
-                                    lines.push_back({raw, 0x44BBFF, true});  // placeholder, real coloring below
-                                } else {
-                                    lines.push_back({raw, 0xC0C0C0, true});
-                                }
-                            } else {
-                                if (is_trailer) color = 0x44CC88;
-                                else if (is_block0) color = 0x44BBFF;
-                                else color = 0xC0C0C0;
-                                lines.push_back({raw, color, true});
-                            }
-                        } else {
-                            // NTAG / ISO15693: show blocks, append ASCII column
-                            std::string ascii_part;
-                            std::string pure;
-                            for (char c : hex) if (std::isxdigit((unsigned char)c)) pure += (char)std::toupper((unsigned char)c);
-                            if (pure.size() >= 2) {
-                                ascii_part = " |";
-                                for (size_t bi = 0; bi + 1 < pure.size(); bi += 2) {
-                                    unsigned long v = std::strtoul(pure.substr(bi, 2).c_str(), nullptr, 16);
-                                    char ch = static_cast<char>(v & 0xFF);
-                                    ascii_part += (ch >= 32 && ch <= 126) ? ch : '.';
-                                }
-                            }
-                            std::string display = raw + ascii_part;
-                            lines.push_back({display, 0xC0C0C0, true});
-                        }
-                    }
-                }
-
-                // Scroll & render — now with per-byte MFC coloring
-                static constexpr int ROW_H = 9;
-                static constexpr int PANEL_H = 104;
-                const int MAX_VISIBLE = (PANEL_H - 4) / ROW_H;
-                int total = (int)lines.size();
-                int max_scroll = std::max(0, total - MAX_VISIBLE);
-                int scroll = std::max(0, std::min(emu_dump_scroll_, max_scroll));
-
-                const int uid_hex_digits = (int)uid_str.size();
-                const int uid_len = uid_hex_digits / 2;
-
-                for (int i = 0; i < MAX_VISIBLE && (scroll + i) < total; ++i) {
-                    const auto &l = lines[scroll + i];
-                    int y = 2 + i * ROW_H;
-
-                    if (l.color == 0x44CC88 || l.color == 0x44BBFF) {
-                        // MFC trailer or block0 — render with per-byte colors
-                        render_dump_line_colored(right, 4, y, l.text, uid_len);
+                    if (l.color == 0xC0C0C0) {
+                        render_dump_line_colored(right, 4, y, l.text, 4, true);
                     } else {
                         create_text_mono(right, 4, y, l.text.c_str(), l.color, 7);
                     }
                 }
+            } else if (is_grove_or_nfcunit) {
+                // ── GroveNFC/NFCUnit: full-width panel with per-byte colored dump ──
+                auto dump_lines = service_.i2c_emulator_dump_lines(protocol);
+                lv_obj_t *emu_panel = create_panel(parent, 0, 0, 320, 104, 0x101010);
+
+                const auto slot_info = service_.emu_slot_info(protocol, 0);
+                std::string uid_str = slot_info.uid;
+                if (uid_str.empty()) uid_str = "-";
+
+                const bool is_mfc_g = (protocol == nfc_app::ProtocolKind::MifareClassic);
+                std::string sak_str_g, atqa_str_g;
+                if (is_mfc_g) { sak_str_g = "SAK:08"; atqa_str_g = "ATQA:0004"; }
+
+                const int uid_hex_digits = (int)uid_str.size();
+                const int uid_len = uid_hex_digits / 2;
+
+                struct EmuLine { bool is_dump; std::string text; int block_num; };
+                std::vector<EmuLine> content;
+
+                content.push_back({false, proto_name, 0});
+                content.push_back({false, std::string("UID:") + uid_str, 0});
+                if (is_mfc_g) content.push_back({false, sak_str_g + " " + atqa_str_g, 0});
+                content.push_back({false, "Dump:", 0});
+
+                if (dump_lines.empty()) {
+                    content.push_back({true, "", -1});
+                } else {
+                    for (const auto &raw : dump_lines) {
+                        size_t colon = raw.find(':');
+                        int bn = (colon != std::string::npos && colon > 0) ? std::stoi(raw.substr(0, colon)) : -1;
+                        content.push_back({true, raw, bn});
+                    }
+                }
+
+                constexpr int ROW_H = 9;
+                constexpr int MAX_VIS = (104 - 4) / ROW_H;
+                int total = (int)content.size();
+                int scroll = std::max(0, std::min(emu_dump_scroll_, std::max(0, total - MAX_VIS)));
+
+                for (int vi = 0; vi < MAX_VIS && (scroll + vi) < total; ++vi) {
+                    const auto &item = content[scroll + vi];
+                    int y = 2 + vi * ROW_H;
+
+                    if (!item.is_dump) {
+                        uint32_t c = 0xD8D8D8; int f = 10;
+                        if (vi == 0) { c = 0x00D2FF; f = 12; }
+                        else if (item.text.find("UID:") == 0) c = 0x00D2FF;
+                        else if (item.text.find("Dump:") == 0) c = 0x9E9E9E;
+                        create_text(emu_panel, 4, y, item.text.c_str(), c, f);
+                    } else if (item.block_num < 0 && item.text.empty()) {
+                        create_text(emu_panel, 4, y, "(no dump loaded)", 0x666666, 10);
+                    } else {
+                        render_dump_line_colored(emu_panel, 4, y, item.text, uid_len, true);
+                    }
+                }
+                if (total > MAX_VIS)
+                    create_text(emu_panel, 270, 94, "U/D scroll", 0x444444, 10);
             } else {
                 create_text(right, 6, 20, "OK menu: Dn/Up/Save", 0xD8D8D8, 10);
                 create_text(right, 6, 34, "activate selected slot", 0xD8D8D8, 10);
@@ -3156,7 +3179,9 @@ private:
         }
 
         std::string footer_text = ui_message_;
-        if (emu_device_kind == nfc_app::DeviceKind::GroveNFC ||
+        if (emu_device_kind == nfc_app::DeviceKind::PN532Killer) {
+            footer_text = "PN532Killer HW Slot " + std::to_string(hw_emu_slot_ + 1);
+        } else if (emu_device_kind == nfc_app::DeviceKind::GroveNFC ||
             emu_device_kind == nfc_app::DeviceKind::NFCUnit ||
             emu_device_kind == nfc_app::DeviceKind::ST25RNFC) {
             footer_text = "Load from " + emulator_source_filename(protocol);
