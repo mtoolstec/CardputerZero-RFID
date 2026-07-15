@@ -170,9 +170,10 @@ inline std::string protocol_to_pm3_key(ProtocolKind p)
 
 inline ProtocolKind protocol_from_pm3_key(const std::string &value)
 {
-    if (value == "iso14443a")     return ProtocolKind::Iso14443A;
-    if (value == "mifareclassic") return ProtocolKind::MifareClassic;
-    if (value == "iso15693")      return ProtocolKind::Iso15693;
+    // PM3 filetype short names (case-insensitive)
+    if (value == "mfc" || value == "mifareclassic" || value == "mifare_classic") return ProtocolKind::MifareClassic;
+    if (value == "ntag" || value == "iso14443a")     return ProtocolKind::Iso14443A;
+    if (value == "iso15" || value == "iso15693")      return ProtocolKind::Iso15693;
     return protocol_from_string(value);
 }
 
@@ -364,14 +365,20 @@ inline void to_json(nlohmann::json &j, const TagInfo &value)
 
 inline void from_json(const nlohmann::json &j, TagInfo &value)
 {
-    // Read card info
-    if (j.contains("card")) {
-        const auto &card = j["card"];
-        value.protocol = protocol_from_pm3_key(card.value("protocol", "UNKNOWN"));
-        value.uid = card.value("uid", "");
-        value.tag_type = card.value("type", card.value("tag_type", ""));
+    // Read card info — support both lowercase (pm3 v1) and uppercase (pm3 v2) keys
+    if (j.contains("card") || j.contains("Card")) {
+        const auto &card = j.contains("card") ? j["card"] : j["Card"];
+        value.protocol = protocol_from_pm3_key(
+            card.value("protocol", card.value("Protocol", "UNKNOWN")));
+        value.uid = card.value("uid", card.value("UID", ""));
+        value.tag_type = card.value("type", card.value("Type", card.value("tag_type", card.value("TagType", ""))));
+        // Collect extra identity fields (ATQA, SAK, etc.) — both cases
         for (auto it = card.begin(); it != card.end(); ++it) {
-            if (it.key() == "protocol" || it.key() == "uid" || it.key() == "type" || it.key() == "tag_type")
+            const std::string k = it.key();
+            if (k == "protocol" || k == "Protocol" ||
+                k == "uid"      || k == "UID" ||
+                k == "type"     || k == "Type" ||
+                k == "tag_type" || k == "TagType")
                 continue;
             if (it.value().is_string())
                 value.identity_fields[it.key()] = it.value().get<std::string>();
@@ -387,18 +394,30 @@ inline void from_json(const nlohmann::json &j, TagInfo &value)
     // Read blocks → convert to "NN: HEX..." lines for raw_data
     value.raw_data.clear();
     if (j.contains("blocks") && j["blocks"].is_object()) {
+        // nlohmann::json stores object keys lexicographically.  PM3 uses
+        // unpadded keys ("0".."63"), so iterating the object directly would
+        // produce 0,1,10,...,2 and break callers that index raw_data by block.
+        std::vector<std::pair<int, std::string>> ordered_blocks;
         for (auto it = j["blocks"].begin(); it != j["blocks"].end(); ++it) {
+            try {
+                ordered_blocks.emplace_back(std::stoi(it.key()), it.key());
+            } catch (...) {
+                // Ignore non-numeric PM3 block keys rather than shifting every
+                // subsequent block away from its physical block number.
+            }
+        }
+        std::sort(ordered_blocks.begin(), ordered_blocks.end(),
+                  [](const auto &lhs, const auto &rhs) { return lhs.first < rhs.first; });
+        for (const auto &entry : ordered_blocks) {
+            const auto &block = j["blocks"][entry.second];
             std::string pure;
-            if (it.value().is_string()) {
-                for (char c : it.value().get<std::string>())
+            if (block.is_string()) {
+                for (char c : block.get<std::string>())
                     if (std::isxdigit(static_cast<unsigned char>(c)))
                         pure += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
             }
             if (!pure.empty()) {
-                // Strip leading zeros from key (e.g. "00" → "0", "01" → "1")
-                std::string key = it.key();
-                while (key.size() > 1 && key[0] == '0') key.erase(0, 1);
-                value.raw_data.push_back(key + ":" + pure);
+                value.raw_data.push_back(std::to_string(entry.first) + ":" + pure);
             }
         }
     }
@@ -488,12 +507,107 @@ inline void to_json(nlohmann::json &j, const SavedRecord &value)
     j = nlohmann::json{
         {"meta", value.meta},
         {"tag", value.tag},
+        {"mifare_classic_dump", value.mifare_dump ? nlohmann::json(*value.mifare_dump) : nlohmann::json()},
         {"emulator_slot", value.emulator_slot ? nlohmann::json(*value.emulator_slot) : nlohmann::json()},
     };
 }
 
 inline void from_json(const nlohmann::json &j, SavedRecord &value)
 {
+    // ── Detect PM3 / proxmark3 export format ──────────────────────────────
+    // PM3 v1:  { "filetype": "mfc"|"ntag"|"iso15", "card": {...}, "blocks": {...} }
+    // PM3 v2:  { "FileType": "mfc v2", "Card": {...}, "blocks": {...}, "Created": "proxmark3" }
+    // PM3 raw: { "card": {...}, "blocks": {...} }  (some dumps omit FileType)
+    // Our:     { "meta": {...}, "tag": {...}, ... }
+    // Detection: any JSON with top-level "blocks" that does NOT have
+    // our internal {meta, tag} wrapper is treated as PM3-style import.
+    const bool has_blocks = j.contains("blocks") && j["blocks"].is_object();
+    const bool is_m5cz    = j.contains("meta") && j.contains("tag");
+
+    if (!is_m5cz && has_blocks) {
+        // PM3-style format — build TagInfo and minimal RecordMeta from it
+        // For uppercase PM3 keys, copy Card→card temporarily so TagInfo::from_json works
+        nlohmann::json &nc = const_cast<nlohmann::json &>(j);
+        if (j.contains("Card") && !j.contains("card")) {
+            nc["card"] = j["Card"];
+        }
+        value.tag = j.get<TagInfo>();  // TagInfo::from_json handles "card" + "blocks"
+
+        // Determine protocol from FileType / filetype (if present)
+        std::string ft = j.value("FileType", j.value("filetype", j.value("Created", "")));
+        for (char &ch : ft) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+
+        if (value.tag.protocol == ProtocolKind::Unknown) {
+            // Guess protocol from filetype or block count
+            if (ft.find("mfc") != std::string::npos || ft == "mifareclassic")
+                value.tag.protocol = ProtocolKind::MifareClassic;
+            else if (ft.find("ntag") != std::string::npos || ft == "iso14443a")
+                value.tag.protocol = ProtocolKind::Iso14443A;
+            else if (ft.find("iso15") != std::string::npos || ft == "iso15693")
+                value.tag.protocol = ProtocolKind::Iso15693;
+            else if (!value.tag.raw_data.empty()) {
+                // Guess from block count: 64 blocks → MIFARE Classic 1K
+                const size_t n = value.tag.raw_data.size();
+                if (n == 64 || n == 32 || n == 16) {
+                    value.tag.protocol = ProtocolKind::MifareClassic;
+                    value.tag.tag_type = (n == 64) ? "MIFARE Classic 1K"
+                                       : (n == 32) ? "MIFARE Classic 512B"
+                                       : "MIFARE Classic Mini";
+                } else if (n <= 255) {
+                    value.tag.protocol = ProtocolKind::Iso14443A;
+                }
+            }
+        }
+        if (value.tag.protocol == ProtocolKind::MifareClassic &&
+            (value.tag.tag_type.empty() || value.tag.tag_type == "Unknown")) {
+            const size_t block_count = value.tag.raw_data.size();
+            value.tag.tag_type = block_count == 64 ? "MIFARE Classic 1K"
+                               : block_count == 256 ? "MIFARE Classic 4K"
+                               : block_count == 20 ? "MIFARE Classic Mini"
+                               : "MIFARE Classic";
+        }
+        // Build meta: generate record_id inline
+        {
+            const std::string uid_part = value.tag.uid.empty() ? "unknown" : value.tag.uid;
+            value.meta.record_id = std::string(to_string(value.tag.protocol)) + "_" + uid_part + "_" + iso8601_now();
+
+            std::string prefix;
+            switch (value.tag.protocol) {
+            case ProtocolKind::MifareClassic: prefix = "MFC_"; break;
+            case ProtocolKind::Iso14443A:     prefix = "N213_"; break;
+            case ProtocolKind::Iso15693:      prefix = "ISO15_"; break;
+            default:                          prefix = "Tag_"; break;
+            }
+            value.meta.display_name = prefix + uid_part;
+        }
+        value.meta.created_at = iso8601_now();
+        value.meta.source = "pm3-import";
+        value.meta.notes = "Imported from Proxmark3 dump";
+        value.meta.transport = TransportKind::Mock;
+        value.meta.mock = false;
+        value.meta.schema_version = 1;
+        value.meta.schema_name = "m5cz.nfc.record";
+        if (value.tag.protocol == ProtocolKind::MifareClassic) {
+            MifareClassicDump dump;
+            dump.block_count = static_cast<int>(value.tag.raw_data.size());
+            dump.sector_count = dump.block_count == 256 ? 40 : (dump.block_count + 3) / 4;
+            dump.blocks_hex.reserve(value.tag.raw_data.size());
+            for (const std::string &line : value.tag.raw_data) {
+                const size_t colon = line.find(':');
+                dump.blocks_hex.push_back(colon == std::string::npos ? line : line.substr(colon + 1));
+            }
+            dump.attack.dump_obtained = !dump.blocks_hex.empty();
+            value.mifare_dump = std::move(dump);
+        } else {
+            value.mifare_dump.reset();
+        }
+        if (j.contains("mifare_classic_dump")) {
+            value.mifare_dump = j["mifare_classic_dump"].get<MifareClassicDump>();
+        }
+        return;
+    }
+
+    // ── Normal M5CZ record format ─────────────────────────────────────────
     value.meta = j.value("meta", RecordMeta{});
     value.tag = j.value("tag", TagInfo{});
 

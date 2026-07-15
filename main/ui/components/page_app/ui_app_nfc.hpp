@@ -2,7 +2,7 @@
 
 // Build version: hard-coded build timestamp (updated by SConstruct / build script)
 #ifndef RFID_BUILD_HASH
-#define RFID_BUILD_HASH "c5bf9a1_0715T" __TIME__
+#define RFID_BUILD_HASH "597132c_" __DATE__ " " __TIME__
 #endif
 
 #include "nfc/nfc_device_service.hpp"
@@ -15,10 +15,12 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstdio>
+#include <dirent.h>
 #include <fstream>
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <sys/stat.h>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -43,6 +45,7 @@ class UINfcPage : public app_base
         ToolPage,      // Tool detail page
         EmulatorAction,// Upload / download / default menu
         HexExitConfirm,// Save/discard/cancel prompt
+        FileImport,     // Import JSON dump from file
         ToolInfo,      // 'i' key tool detail popup (Tools tab only)
         AppInfo,       // 'i' key global RFID app introduction
         PostScan,      // After scan result: Read Again / Save Tag menu
@@ -142,6 +145,8 @@ private:
     // EMU dump completion tracking (to show toast when async dump finishes)
     bool last_emu_dump_running_   = false;
     bool last_emu_probe_running_  = false;
+    bool last_upload_running_     = false;
+    int  last_upload_progress_    = 0;
     // HW upload completion tracking
     bool last_hw_upload_running_  = false;
     int pending_hw_upload_slot_   = -1;
@@ -200,6 +205,10 @@ private:
     std::vector<nfc_app::TransportEndpoint> spi_select_list_;
     // Read-tab transport pill scroll offset (0=USB+UART, 1=UART+I2C, 2=I2C+SPI)
     int read_transport_offset_ = 0;
+    // File load modal state
+    std::vector<std::string> load_file_list_;
+    int load_file_idx_ = 0;
+    std::string load_file_dir_;      // current directory path
     // PN532 NDEF URI input buffer
     std::string pn532_ndef_uri_      = "https://m5stack.com";
     int         pn532_ndef_type_idx_ = 0; // 0=https 1=http 2=tel 3=mailto 4=custom
@@ -398,6 +407,18 @@ private:
             }
         }
         self->last_emu_probe_running_ = emu_probe_running_now;
+        // Upload progress refresh: ensure EMU tab shows progress bar updating
+        {
+            const bool uploading_now = self->service_.hw_upload_running();
+            const int  prog_now = self->service_.hw_upload_progress();
+            const bool upload_state_changed = (uploading_now != self->last_upload_running_) ||
+                                              (prog_now != self->last_upload_progress_);
+            if (upload_state_changed && self->current_tab_ == Tab::Emulator) {
+                self->render_all();
+            }
+            self->last_upload_running_ = uploading_now;
+            self->last_upload_progress_ = prog_now;
+        }
         // Long-press scroll: hold 400ms→scroll (1 line), hold 1500ms→fast page scroll
         // Works for Read tab scan log AND for HexLog modal
         if (self->held_scroll_key_ != 0) {
@@ -1177,6 +1198,13 @@ private:
             if (service_.spi_listener_active()) {
                 service_.spi_stop_listener();
                 ui_message_ = "SPI ST25R emulation stopped";
+            }
+            // PN532Killer: always switch back to reader mode on EMU exit
+            {
+                const auto leaving_conn = service_.connection_state();
+                if (leaving_conn.device_kind == nfc_app::DeviceKind::PN532Killer) {
+                    service_.hw_switch_to_reader_mode();
+                }
             }
         }
         if (current_tab_ == Tab::Emulator) {
@@ -2068,8 +2096,12 @@ private:
     void activate_saved_action()
     {
         if (saved_records_.empty()) {
-            refresh_saved_records();
-            ui_message_ = "Reloaded saved list";
+            // No records yet — open file browser so user can Import from file
+            modal_ = Modal::FileImport;
+            load_file_dir_ = "/home/pi";
+            load_file_idx_ = 0;
+            refresh_import_file_list();
+            ui_message_ = "Import a JSON dump file";
             return;
         }
         modal_     = Modal::Action;
@@ -3020,19 +3052,9 @@ private:
                   emu_device_kind == nfc_app::DeviceKind::NotConnected)));
             const bool is_grove_or_nfcunit =
                 !is_st25r && (emu_device_kind == nfc_app::DeviceKind::GroveNFC || is_nfc_unit);
-            create_text(left, 6, 4,  is_st25r ? "SPI EMU" : "SW EMU", is_st25r ? 0x00B4FF : 0x00FF88, 12);
-            create_text(left, 6, 18, proto_name.c_str(), 0xFFFFFF, 12);
-            create_text(left, 6, 38, "Tab:proto", 0xD8D8D8, 10);
-            if (is_st25r) {
-                create_text(left, 6, 50, "OK:start", 0xF7A600, 10);
-                create_text(left, 6, 62, "P:stop", 0xD8D8D8, 10);
-            } else {
-                create_text(left, 6, 50, "OK:menu", 0xF7A600, 10);
-            }
-            create_text(left, 6, 80, is_st25r ? "M5 NFC CAP SPI" : (is_nfc_unit ? "NFC Unit I2C" : "GroveNFC I2C"), is_st25r ? 0x00B4FF : 0x00FF88, 10);
-
             if (is_st25r) {
                 // SPI EMU: same dump format as I2C with ASCII + scrolling
+                lv_obj_t *emu_panel = create_panel(parent, 0, 0, 320, 104, 0x101010);
                 service_.load_spi_ntag_memory_if_empty();  // eager load from JSON
                 const auto &mem = service_.spi_ntag_memory();
                 const size_t pages = mem.size() / 4;
@@ -3057,8 +3079,8 @@ private:
                 // Same ContentLine + render as I2C below (see is_grove_or_nfcunit)
                 struct ContentLine { std::string text; uint32_t color; bool mono; };
                 std::vector<ContentLine> lines;
-                lines.push_back({service_.spi_profile_label(), 0x00D2FF, true});
-                lines.push_back({std::string("UID:") + uid_str, 0x00D2FF, true});
+                lines.push_back({proto_name + "  UID:" + uid_str, 0x00D2FF, true});
+                lines.push_back({"Loaded: " + emulator_source_filename(protocol), 0x8DB6FF, true});
                 if (!uid_str.empty() && uid_str != "-") {
                     lines.push_back({"ATQA:0044 SAK:00", 0xD8D8D8, true});
                 }
@@ -3095,9 +3117,9 @@ private:
                     const auto &l = lines[scroll + i];
                     int y = 2 + i * ROW_H;
                     if (l.color == 0xC0C0C0) {
-                        render_dump_line_colored(right, 4, y, l.text, 4, true);
+                        render_dump_line_colored(emu_panel, 4, y, l.text, 4, true);
                     } else {
-                        create_text_mono(right, 4, y, l.text.c_str(), l.color, 7);
+                        create_text_mono(emu_panel, 4, y, l.text.c_str(), l.color, 7);
                     }
                 }
             } else if (is_grove_or_nfcunit) {
@@ -3119,8 +3141,8 @@ private:
                 struct EmuLine { bool is_dump; std::string text; int block_num; };
                 std::vector<EmuLine> content;
 
-                content.push_back({false, proto_name, 0});
-                content.push_back({false, std::string("UID:") + uid_str, 0});
+                content.push_back({false, proto_name + "  UID:" + uid_str, 0});
+                content.push_back({false, "Loaded: " + emulator_source_filename(protocol), 0});
                 if (is_mfc_g) content.push_back({false, sak_str_g + " " + atqa_str_g, 0});
                 content.push_back({false, "Dump:", 0});
 
@@ -3146,7 +3168,7 @@ private:
                     if (!item.is_dump) {
                         uint32_t c = 0xD8D8D8; int f = 10;
                         if (vi == 0) { c = 0x00D2FF; f = 12; }
-                        else if (item.text.find("UID:") == 0) c = 0x00D2FF;
+                        else if (item.text.find("Loaded:") == 0) c = 0x8DB6FF;
                         else if (item.text.find("Dump:") == 0) c = 0x9E9E9E;
                         create_text(emu_panel, 4, y, item.text.c_str(), c, f);
                     } else if (item.block_num < 0 && item.text.empty()) {
@@ -3166,16 +3188,14 @@ private:
             }
         } else {
             // ── No device / unknown ───────────────────────────────────────────
-            create_text(left, 6, 4,  "EMU", 0x888888, 12);
-            create_text(left, 6, 22, "No device", 0xAAAAAA, 11);
-            create_text(left, 6, 40, "Connect a device", 0x9E9E9E, 10);
-
-            create_text(right, 6, 4,  "Hardware EMU:", 0x8E8E8E, 11);
-            create_text(right, 6, 18, "PN532Killer", 0xFFD700, 11);
-            create_text(right, 6, 30, "I2C mode for SW EMU", 0x00FF88, 11);
-            create_text(right, 6, 44, "Use Read tab Tab-key", 0x9E9E9E, 10);
-            create_text(right, 6, 66, (std::string("Mode: ") + nfc_app::to_string(endpoint.kind)).c_str(), 0x555555, 10);
-            create_text(right, 6, 80, (std::string("Status: ") + nfc_app::to_string(emu_device_kind)).c_str(), 0x555555, 10);
+            lv_obj_t *info = create_panel(parent, 0, 0, 320, 104, 0x101010);
+            create_text(info, 8, 6,  "Hardware EMU: PN532Killer", 0xFFD700, 11);
+            create_text(info, 8, 24, "Software EMU:", 0x00FF88, 11);
+            create_text(info, 8, 39, "GroveNFC, NFC Unit, M5 NFC CAP", 0xD8D8D8, 10);
+            create_text(info, 8, 60, "Connect/select a device in Read tab", 0x9E9E9E, 10);
+            const std::string state_line = std::string("Mode: ") + nfc_app::to_string(endpoint.kind) +
+                                           "  State: " + nfc_app::to_string(emu_device_kind);
+            create_text(info, 8, 78, state_line.c_str(), 0x555555, 10);
         }
 
         std::string footer_text = ui_message_;
@@ -5032,6 +5052,7 @@ private:
         switch (modal_) {
         case Modal::Action:     render_action_modal_card(overlay);     break;
         case Modal::SlotSelect: render_slot_select_modal_card(overlay); break;
+        case Modal::FileImport: render_file_import_modal_card(overlay); break;
         case Modal::EditName:   render_edit_name_modal_card(overlay);  break;
         case Modal::EditHex:    render_edit_hex_modal_card(overlay);   break;
         case Modal::HexExitConfirm: render_hex_exit_confirm_card(overlay); break;
@@ -5066,9 +5087,11 @@ private:
         const bool record_from_i2c = (rec.meta.transport == nfc_app::TransportKind::I2cBus);
         const bool show_write_to_tag = is_i2c_dev || is_pn532_dev || record_from_i2c;
         const bool has_first_action = is_i2c_dev || is_pn532killer;
-        const int n_opts = has_first_action ? (show_write_to_tag ? 5 : 4)
-                                            : (show_write_to_tag ? 4 : 3);
-        const lv_coord_t card_h = static_cast<lv_coord_t>(24 + std::min(n_opts, 4) * 20 + (n_opts > 4 ? 12 : 0));
+        const int n_opts = has_first_action ? (show_write_to_tag ? 6 : 5)
+                                            : (show_write_to_tag ? 5 : 4);
+        // Leave a visible inner gutter below the last row. With exactly four
+        // actions the previous height left only two pixels above the border.
+        const lv_coord_t card_h = static_cast<lv_coord_t>(24 + std::min(n_opts, 4) * 20 + 10);
         lv_obj_t *card = make_modal_card(parent, 220, card_h, 0xF7A600);
         create_text(card, 8, 6, to_compact(rec.meta.display_name, 26).c_str(), 0xFFFFFF, 12);
 
@@ -5080,6 +5103,7 @@ private:
             options.push_back("Upload to Slot...");
         options.push_back("Edit Name");
         options.push_back("Edit Hex Data");
+        options.push_back("Import from file");
         options.push_back("Delete");
 
         const int max_visible = 4;
@@ -5105,6 +5129,51 @@ private:
         }
     }
 
+    void render_file_import_modal_card(lv_obj_t *parent)
+    {
+        lv_obj_t *card = make_modal_card(parent, 280, 114, 0x00B4FF);
+        const std::string dir_label = load_file_dir_.empty() ? "/home/pi" : load_file_dir_;
+        create_text(card, 8, 5, to_compact(dir_label, 32).c_str(), 0x00B4FF, 10);
+        bool has_back = !load_file_dir_.empty() && load_file_dir_ != "/";
+        if (load_file_list_.empty() && !has_back) {
+            create_text(card, 8, 26, "(no files)", 0x7A7A7A, 11);
+        } else {
+            constexpr int VISIBLE = 4;
+            int offset = load_file_idx_ - 1;
+            if (offset < 0) offset = 0;
+            const int total = (has_back ? 1 : 0) + static_cast<int>(load_file_list_.size());
+            if (offset > total - VISIBLE) offset = std::max(0, total - VISIBLE);
+            for (int i = 0; i < VISIBLE; ++i) {
+                const int fi = offset + i;
+                if (fi >= total) break;
+                bool is_back = (fi == 0 && has_back);
+                const bool sel = (fi == load_file_idx_);
+                uint32_t bg = sel ? 0x00B4FF : (is_back ? 0x2A1A00 : 0x1E1E1E);
+                std::string line_label;
+                if (is_back) {
+                    line_label = ".. (back)";
+                } else {
+                    const int idx = fi - (has_back ? 1 : 0);
+                    line_label = load_file_list_[idx];
+                }
+                lv_obj_t *row = lv_obj_create(card);
+                lv_obj_remove_style_all(row);
+                lv_obj_set_size(row, 264, 15);
+                lv_obj_set_pos(row, 8, 22 + i * 18);
+                lv_obj_set_style_bg_color(row, lv_color_hex(bg), LV_PART_MAIN | LV_STATE_DEFAULT);
+                lv_obj_set_style_bg_opa(row, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
+                lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+                bool is_dir = !is_back && !line_label.empty() && line_label.back() == '/';
+                uint32_t col = sel ? 0x000000 : (is_back ? 0xFFAA55 : (is_dir ? 0x55DDFF : 0xD0D0D0));
+                if (is_back) {
+                    create_text(row, 4, 2, ".. (back)", col, 10);
+                } else {
+                    create_text(row, 4, 2, to_compact(line_label, 34).c_str(), col, 10);
+                }
+            }
+        }
+        create_text(card, 8, 98, "Enter:open/load  Bsp:back  ESC:cancel", 0x7A7A7A, 10);
+    }
     void render_slot_select_modal_card(lv_obj_t *parent)
     {
         // Width 250, Height 114 → 5 visible slots + header + hint with bottom padding
@@ -5345,6 +5414,7 @@ private:
         switch (modal_) {
         case Modal::Action:     handle_action_key(key);      break;
         case Modal::SlotSelect: handle_slot_select_key(key); break;
+        case Modal::FileImport: handle_file_import_key(key);  break;
         case Modal::EditName:   handle_edit_name_key(key);   break;
         case Modal::EditHex:    handle_edit_hex_key(key, mods);    break;
         case Modal::HexExitConfirm: handle_hex_exit_confirm_key(key); break;
@@ -5410,15 +5480,16 @@ private:
         const bool record_from_i2c = (rec.meta.transport == nfc_app::TransportKind::I2cBus);
         const bool show_write_to_tag = is_i2c_dev || is_pn532_dev || record_from_i2c;
         const bool has_first_action = is_i2c_dev || is_pn532killer;
-        const int n_opts = has_first_action ? (show_write_to_tag ? 5 : 4)
-                                            : (show_write_to_tag ? 4 : 3);
+        const int n_opts = has_first_action ? (show_write_to_tag ? 6 : 5)
+                                            : (show_write_to_tag ? 5 : 4);
         // Write to Tag is now first; Emulate/Upload is second
         const int idx_write   = show_write_to_tag ? 0 : -1;
         const int idx_emu     = has_first_action ? (show_write_to_tag ? 1 : 0) : -1;
         const int idx_name    = has_first_action ? (show_write_to_tag ? 2 : 1)
                                                   : (show_write_to_tag ? 1 : 0);
         const int idx_hex     = idx_name + 1;
-        const int idx_delete  = idx_hex + 1;
+        const int idx_load    = idx_hex + 1;
+        const int idx_delete  = idx_load + 1;
 
         switch (key) {
         case KEY_UP:
@@ -5480,6 +5551,12 @@ private:
                 edit_buf_ = lines.empty() ? "" : strip_to_hex(lines[0]);
                 edit_hex_dirty_ = false;
                 modal_ = Modal::EditHex;
+            } else if (modal_idx_ == idx_load) {
+                // Directory browser: start at /home/pi, list dirs and .json files
+                modal_ = Modal::FileImport;
+                load_file_dir_ = "/home/pi";
+                load_file_idx_ = 0;
+                refresh_import_file_list();
             } else if (modal_idx_ == idx_delete) {
                 std::string err;
                 const std::string record_id = rec.meta.record_id;
@@ -5495,6 +5572,125 @@ private:
             break;
         case KEY_ESC:
             modal_     = Modal::None;
+            modal_idx_ = 0;
+            break;
+        default: break;
+        }
+    }
+
+    // ── FileImport directory browser helpers ────────────────────────────────
+
+    void refresh_import_file_list()
+    {
+        load_file_list_.clear();
+        const std::string dir_path = load_file_dir_.empty() ? "/home/pi" : load_file_dir_;
+        DIR *dir = opendir(dir_path.c_str());
+        if (!dir) return;
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != nullptr) {
+            const char *name = entry->d_name;
+            if (name[0] == '.') continue;  // skip . and hidden
+            std::string full = dir_path + "/" + name;
+            struct stat st;
+            if (stat(full.c_str(), &st) != 0) continue;
+            if (S_ISDIR(st.st_mode)) {
+                load_file_list_.push_back(std::string(name) + "/");
+            } else if (S_ISREG(st.st_mode)) {
+                std::string sname(name);
+                if (sname.size() >= 5 && sname.substr(sname.size() - 5) == ".json") {
+                    load_file_list_.push_back(sname);
+                }
+            }
+        }
+        closedir(dir);
+        std::sort(load_file_list_.begin(), load_file_list_.end());
+        // Push directories first, then files
+        std::stable_sort(load_file_list_.begin(), load_file_list_.end(),
+            [](const std::string &a, const std::string &b) {
+                bool ad = !a.empty() && a.back() == '/';
+                bool bd = !b.empty() && b.back() == '/';
+                if (ad != bd) return ad;  // dirs first
+                return false;
+            });
+    }
+
+    void handle_file_import_key(uint32_t key)
+    {
+        const bool has_back = !load_file_dir_.empty() && load_file_dir_ != "/";
+        const int total = (has_back ? 1 : 0) + static_cast<int>(load_file_list_.size());
+        switch (key) {
+        case KEY_UP:
+        case KEY_F:
+            if (total > 0) load_file_idx_ = (load_file_idx_ - 1 + total) % total;
+            break;
+        case KEY_DOWN:
+        case KEY_X:
+            if (total > 0) load_file_idx_ = (load_file_idx_ + 1) % total;
+            break;
+        case KEY_BACKSPACE:
+            // Go to parent directory
+            {
+                const std::string cur = load_file_dir_.empty() ? "/home/pi" : load_file_dir_;
+                const size_t slash = cur.rfind('/');
+                if (slash != std::string::npos && slash > 0) {
+                    load_file_dir_ = cur.substr(0, slash);
+                } else if (slash == 0 && cur.size() > 1) {
+                    load_file_dir_ = "/";
+                }
+                load_file_idx_ = 0;
+                refresh_import_file_list();
+            }
+            break;
+        case KEY_ENTER:
+            if (total > 0 && load_file_idx_ < total) {
+                const bool is_back = (load_file_idx_ == 0 && has_back);
+                if (is_back) {
+                    // Go to parent directory
+                    const std::string cur = load_file_dir_.empty() ? "/home/pi" : load_file_dir_;
+                    const size_t slash = cur.rfind('/');
+                    if (slash != std::string::npos && slash > 0) {
+                        load_file_dir_ = cur.substr(0, slash);
+                    } else if (slash == 0 && cur.size() > 1) {
+                        load_file_dir_ = "/";
+                    }
+                    load_file_idx_ = 0;
+                    refresh_import_file_list();
+                } else {
+                    const int real_idx = load_file_idx_ - (has_back ? 1 : 0);
+                    if (real_idx < 0 || real_idx >= static_cast<int>(load_file_list_.size())) break;
+                    const std::string &entry_name = load_file_list_[real_idx];
+                    if (!entry_name.empty() && entry_name.back() == '/') {
+                        // Enter subdirectory
+                        const std::string dir_name = entry_name.substr(0, entry_name.size() - 1);
+                        load_file_dir_ = (load_file_dir_.empty() ? "/home/pi" : load_file_dir_) + "/" + dir_name;
+                        load_file_idx_ = 0;
+                        refresh_import_file_list();
+                    } else {
+                        // Import .json file: convert to M5CZ format and save to records directory
+                        const std::string full_path = (load_file_dir_.empty() ? "/home/pi" : load_file_dir_) + "/" + entry_name;
+                        nfc_app::SavedRecord imported;
+                        std::string err;
+                        if (service_.import_record_from_file(full_path, &imported, &err)) {
+                            refresh_saved_records();
+                            const auto imported_it = std::find_if(saved_records_.begin(), saved_records_.end(),
+                                [&](const nfc_app::SavedRecord &record) {
+                                    return record.meta.record_id == imported.meta.record_id;
+                                });
+                            if (imported_it != saved_records_.end())
+                                saved_idx_ = static_cast<int>(std::distance(saved_records_.begin(), imported_it));
+                            show_toast("Imported " + entry_name);
+                            ui_message_ = "Imported " + entry_name;
+                        } else {
+                            ui_message_ = err.empty() ? "Import failed" : err;
+                        }
+                        modal_ = Modal::None;
+                        modal_idx_ = 0;
+                    }
+                }
+            }
+            break;
+        case KEY_ESC:
+            modal_ = Modal::Action;
             modal_idx_ = 0;
             break;
         default: break;

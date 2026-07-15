@@ -2118,6 +2118,24 @@ public:
         return storage_.delete_record(record_id, error);
     }
 
+    bool load_record_by_id(const std::string &record_id, SavedRecord *record, std::string *error = nullptr)
+    {
+        return storage_.load_record_by_id(record_id, record);
+    }
+
+    // Load a record directly from a full file path (used by FileLoad directory browser)
+    bool load_record_by_path(const std::string &full_path, SavedRecord *record, std::string *error = nullptr)
+    {
+        return storage_.load_record_by_path(full_path, record, error);
+    }
+
+    // Import external JSON dump (PM3/proxmark3) into Saved records.
+    // Reads the source file, converts to M5CZ format, and saves to dumps/.
+    bool import_record_from_file(const std::string &full_path, SavedRecord *record, std::string *error = nullptr)
+    {
+        return storage_.import_record_from_file(full_path, record, error);
+    }
+
     std::vector<MifareKeyRecord> list_mifare_keys() const
     {
         return storage_.load_mifare_keys();

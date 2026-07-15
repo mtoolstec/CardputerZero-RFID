@@ -170,8 +170,35 @@ public:
         }
 
         nlohmann::json document = record;
+        // Reorder blocks keys numerically (nlohmann::json sorts alphabetically by default)
+        reorder_blocks_keys(document);
         output << document.dump(2);
         return true;
+    }
+
+    // Reorder the "blocks" object keys in numeric order (0,1,2,... instead of 0,1,10,11,...)
+    // Handles both PM3 format (doc["blocks"]) and M5CZ format (doc["tag"]["blocks"]).
+    static void reorder_blocks_keys(nlohmann::json &doc)
+    {
+        nlohmann::json *blocks = nullptr;
+        if (doc.contains("blocks") && doc["blocks"].is_object()) {
+            blocks = &doc["blocks"];
+        } else if (doc.contains("tag") && doc["tag"].is_object() &&
+                   doc["tag"].contains("blocks") && doc["tag"]["blocks"].is_object()) {
+            blocks = &doc["tag"]["blocks"];
+        }
+        if (!blocks) return;
+        std::vector<std::pair<int, std::string>> ordered;
+        for (auto it = blocks->begin(); it != blocks->end(); ++it) {
+            try { ordered.emplace_back(std::stoi(it.key()), it.key()); }
+            catch (...) { ordered.emplace_back(999999, it.key()); }
+        }
+        std::sort(ordered.begin(), ordered.end(),
+                  [](const auto &a, const auto &b) { return a.first < b.first; });
+        nlohmann::json reordered = nlohmann::json::object();
+        for (const auto &kv : ordered)
+            reordered[kv.second] = (*blocks)[kv.second];
+        *blocks = std::move(reordered);
     }
 
     bool delete_record(const std::string &record_id, std::string *error = nullptr) const
@@ -214,6 +241,109 @@ public:
     bool load_record_by_id(const std::string &record_id, SavedRecord *record) const
     {
         return load_record(records_dir() + "/" + sanitize_filename(record_id) + ".json", record);
+    }
+
+    // ── Import external JSON dump (PM3 / proxmark3) into Saved records ─────
+    // Reads the source file, detects PM3 format, converts to M5CZ SavedRecord,
+    // and saves to the dumps/ directory so it appears in the Saved list.
+    // Returns the parsed record in *record and saves it to disk.
+    bool import_record_from_file(const std::string &full_path, SavedRecord *record,
+                                  std::string *error = nullptr) const
+    {
+        if (!record) {
+            if (error) *error = "null record pointer";
+            return false;
+        }
+        // ── Step 1: Read the source JSON ──────────────────────────────
+        std::ifstream input(full_path.c_str());
+        if (!input.is_open()) {
+            if (error) *error = "Cannot open file: " + full_path;
+            return false;
+        }
+        nlohmann::json j;
+        try {
+            input >> j;
+        } catch (...) {
+            if (error) *error = "Invalid JSON: " + full_path;
+            return false;
+        }
+        input.close();
+
+        // ── Step 2: Detect format ────────────────────────────────────
+        const bool has_blocks = j.contains("blocks") && j["blocks"].is_object();
+        const bool is_m5cz    = j.contains("meta") && j.contains("tag");
+
+        if (!is_m5cz && !has_blocks) {
+            if (error) *error = "Unrecognized JSON format (needs PM3 blocks or M5CZ structure)";
+            return false;
+        }
+
+        // ── Step 3: Convert to SavedRecord ────────────────────────────
+        // Use the existing from_json which handles both PM3 and M5CZ
+        try {
+            *record = j.get<SavedRecord>();
+        } catch (...) {
+            if (error) *error = "Failed to parse record from JSON";
+            return false;
+        }
+
+        // ── Step 4: Ensure record_id is populated ────────────────────
+        if (record->meta.record_id.empty()) {
+            std::string stem = full_path;
+            const size_t last_slash = stem.rfind('/');
+            if (last_slash != std::string::npos) stem = stem.substr(last_slash + 1);
+            if (stem.size() > 5 && stem.substr(stem.size() - 5) == ".json")
+                stem = stem.substr(0, stem.size() - 5);
+            // Build protocol prefix from tag info
+            std::string prefix;
+            switch (record->tag.protocol) {
+            case ProtocolKind::MifareClassic: prefix = "MFC"; break;
+            case ProtocolKind::Iso14443A:     prefix = "N213"; break;
+            case ProtocolKind::Iso15693:      prefix = "ISO15"; break;
+            default:                          prefix = "Tag"; break;
+            }
+            const std::string uid_part = record->tag.uid.empty() ? "noUID" : record->tag.uid;
+            record->meta.record_id = prefix + "_" + uid_part + "_" + iso8601_now();
+            record->meta.display_name = prefix + "_" + uid_part;
+            record->meta.created_at = iso8601_now();
+            record->meta.source = "file-import";
+            record->meta.schema_version = 1;
+            record->meta.schema_name = "m5cz.nfc.record";
+        }
+
+        // ── Step 5: Save to dumps/ directory ─────────────────────────
+        if (!ensure_layout()) {
+            if (error) *error = "Cannot create RFID storage directories";
+            return false;
+        }
+        const std::string dest_path = records_dir() + "/" +
+            sanitize_filename(record->meta.record_id) + ".json";
+        std::ofstream output(dest_path.c_str(), std::ios::out | std::ios::trunc);
+        if (!output.is_open()) {
+            if (error) *error = "Cannot write to: " + dest_path;
+            return false;
+        }
+        nlohmann::json document = *record;
+        reorder_blocks_keys(document);
+        output << document.dump(2);
+        output.close();
+        if (!output.good()) {
+            if (error) *error = "Write failed: " + dest_path;
+            return false;
+        }
+        return true;
+    }
+
+    // Load a record directly from a full file path without importing to Saved.
+    // Use import_record_from_file() if you want the file saved to dumps/.
+    bool load_record_by_path(const std::string &full_path, SavedRecord *record,
+                             std::string *error = nullptr) const
+    {
+        if (!load_record(full_path, record)) {
+            if (error) *error = "Failed to parse JSON: " + full_path;
+            return false;
+        }
+        return true;
     }
 
     bool save_emulator_slots(const std::vector<EmulatorSlotRecord> &slots) const
