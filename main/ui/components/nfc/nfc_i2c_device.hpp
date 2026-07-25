@@ -894,7 +894,26 @@ public:
         // Setting OP_CONTROL=0 kills the oscillator, causing the subsequent
         // PT memory write to be silently ignored by the chip.
 
-        st25r_cmd(0xD6);  // ADJUST_REGULATORS
+        // GroveNFC re-runs UnitST25R3916::begin() whenever it switches from
+        // reader to emulation. Reproduce its cold initialization sequence;
+        // carrying reader registers into target mode prevents load modulation.
+        if (!st25r_cmd(0xC1)) return false;  // SET_DEFAULT
+        delay_ms(2);
+        {
+            const uint8_t protection[] = {0xFC, 0x04, 0x10};
+            if (::write(fd_, protection, sizeof(protection)) !=
+                static_cast<ssize_t>(sizeof(protection))) return false;
+        }
+
+        // UnitST25R3916::begin() configures the NFC Unit for its 3.3 V I2C
+        // wiring before listener mode. The lightweight Linux reader setup did
+        // not initialize these power/I/O bits, leaving the passive load
+        // modulator unable to produce a response visible to the reader.
+        if (!st25r_write_reg(0x00, 0x07)) return false;
+        if (!st25r_write_reg(0x01, 0xA4)) return false;  // sup3v | aat_en | io_drv_lvl
+        if (!st25r_change_bits(0x02, 0x80, 0x00)) return false;  // oscillator/regulator on
+        delay_ms(5);
+        if (!st25r_cmd(0xD6)) return false;  // ADJUST_REGULATORS
         delay_ms(5);
 
         // Upstream default passive-target definition for NFC-A emulation.
@@ -904,7 +923,22 @@ public:
         if (!st25r_write_reg(0x2A, 0x13)) return false;
         if (!st25r_write_reg(0x2B, 0x02)) return false;
         if (!st25r_change_bits(0x02, 0x03, 0x00)) return false;
-        if (!st25r_write_reg(0x29, 0x5F)) return false;       // passive target modulation
+        // Reader setup historically wrote 0x03 to register 0x09 while calling
+        // it the antenna driver. 0x09 is actually STREAM_MODE_DEFINITION; the
+        // real TX_DRIVER is 0x28. Restore stream mode and match the vendor
+        // listener's default 13/15 AM setting for passive load modulation.
+        if (!st25r_write_reg(0x09, 0x00)) return false;
+        if (!st25r_write_reg(0x28, 0xD0)) return false;
+        uint8_t passive_modulation = 0x5F;
+        if (const char *v = std::getenv("NFC_UNIT_PTM")) {
+            char *end = nullptr;
+            const unsigned long parsed = std::strtoul(v, &end, 0);
+            if (end && end != v && parsed <= 0xFFu) {
+                passive_modulation = static_cast<uint8_t>(parsed);
+            }
+        }
+        if (!st25r_write_reg(0x29, passive_modulation)) return false;
+        std::fprintf(stderr, "[NFCU-PT] passive_modulation=0x%02X\n", passive_modulation);
         (void)st25r_write_spaceb(0x05, 0x40);                 // EMD suppression start on first bits
 
         // Disable GPT trigger source and set MRT step to 512/fc.
@@ -914,6 +948,14 @@ public:
 
         // 14443-A parity on, NFC-F off.
         if (!st25r_change_bits(0x05, 0x00, 0xE0)) return false;
+
+        // UnitST25R3916::configure_emulation_a() runs before PICC/PT-memory
+        // loading. Keep that ordering: target mode affects how the passive
+        // target configuration is latched by the chip.
+        if (!st25r_write_reg(0x03, ST25R_MODE_BITRATE_DETECTION)) return false;
+        if (!st25r_write_reg(0x08, 0x5C)) return false;
+        if (!st25r_write_reg(0x19, 0x02)) return false;  // mask WU_AX only
+        if (!st25r_write_reg(0x12, 0x08)) return false;
 
         // Match M5Unit-NFC listener defaults.
         st25r_write_reg(0x26, 0x00);
@@ -1142,6 +1184,12 @@ public:
                 nfcunit_listener_state_ == NfcUnitListenerState::Active) {
                 continue;
             }
+            if (!nfcunit_listener_mode_f_ &&
+                nfcunit_listener_state_ == NfcUnitListenerState::Idle) {
+                // With no IRQ GPIO, every sleep here is a blind spot during
+                // the NFC-A anticollision response window.
+                continue;
+            }
             std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
         return false;
@@ -1163,6 +1211,25 @@ public:
         }
         if (!st25r_cmd(0xC4)) return false;  // TRANSMIT_WITH_CRC
         (void)st25r_wait_irq(0x08, 25);      // TXE best effort
+        return true;
+    }
+
+    bool nfcunit_send_listener_short_frame(uint8_t value, uint8_t bits)
+    {
+        if (!is_open() || !is_nfc_unit() || !nfcunit_listener_running_) return false;
+        if (nfcunit_listener_state_ != NfcUnitListenerState::Active) return false;
+        if (bits == 0 || bits > 7) return false;
+
+        uint8_t tx = static_cast<uint8_t>(value & ((1u << bits) - 1u));
+        st25r_cmd(0xDB);  // CLEAR_FIFO
+        if (!st25r_fifo_write(&tx, 1)) return false;
+        st25r_set_ntx(0, bits);
+        {
+            uint8_t dummy = 0;
+            st25r_read_reg(0x1A, dummy);
+        }
+        if (!st25r_cmd(0xC5)) return false;  // TRANSMIT_WITHOUT_CRC
+        (void)st25r_wait_irq(0x08, 25);
         return true;
     }
 
@@ -1388,14 +1455,26 @@ private:
 
     uint32_t st25r_read_irq32()
     {
-        uint8_t m = 0, t = 0, e = 0, p = 0;
-        if (!st25r_read_reg(0x1A, m)) return 0;
-        if (!st25r_read_reg(0x1B, t)) return 0;
+        uint8_t e = 0, p = 0;
+        uint8_t mt[2] = {0, 0};
+        // Reading IRQ_MAIN clears the error register, so match the vendor
+        // driver: error first, MAIN+TIMER in one auto-increment transaction,
+        // then PASSIVE_TARGET. This also saves one I2C transaction in the
+        // timing-critical anticollision loop.
         if (!st25r_read_reg(0x1C, e)) return 0;
+        {
+            uint8_t rb = 0x1A | 0x40;
+            struct i2c_msg msgs[2] = {
+                {addr_, 0,        1, (__u8*)&rb},
+                {addr_, I2C_M_RD, 2, (__u8*)mt}
+            };
+            struct i2c_rdwr_ioctl_data d = {msgs, 2};
+            if (::ioctl(fd_, I2C_RDWR, &d) < 0) return 0;
+        }
         if (!st25r_read_reg(0x1D, p)) return 0;
         uint32_t irq32 = 0;
-        irq32 |= static_cast<uint32_t>(m) << 24;
-        irq32 |= static_cast<uint32_t>(t) << 16;
+        irq32 |= static_cast<uint32_t>(mt[0]) << 24;
+        irq32 |= static_cast<uint32_t>(mt[1]) << 16;
         irq32 |= static_cast<uint32_t>(e) << 8;
         irq32 |= static_cast<uint32_t>(p);
         return irq32;
@@ -1426,6 +1505,11 @@ private:
 
     void nfcunit_listener_trace(const char *label, uint32_t detail = 0xFFFFFFFFu)
     {
+        static const bool enabled = []() {
+            const char *v = std::getenv("NFC_UNIT_EMU_TRACE");
+            return v && *v && std::strcmp(v, "0") != 0;
+        }();
+        if (!enabled) return;
         if (detail == 0xFFFFFFFFu) {
             std::fprintf(stderr, "[NFC-EMU] %s\n", label);
         } else {
@@ -1435,6 +1519,11 @@ private:
 
     void nfcunit_listener_trace_bytes(const char *label, const uint8_t *data, size_t len, size_t max_show = 24)
     {
+        static const bool enabled = []() {
+            const char *v = std::getenv("NFC_UNIT_EMU_TRACE");
+            return v && *v && std::strcmp(v, "0") != 0;
+        }();
+        if (!enabled) return;
         std::fprintf(stderr, "[NFC-EMU] %s len=%zu", label, len);
         const size_t show = std::min(len, max_show);
         for (size_t i = 0; i < show; ++i) {
@@ -1536,15 +1625,22 @@ private:
         st25r_enable_interrupts(ST25R_I_OSC32 | ST25R_LISTENER_DEFAULT_IRQ | ST25R_LISTENER_MODE_IRQ);
 
         st25r_change_bits(0x0A, 0x80, 0x00);  // set no_crc_rx
+        if (!nfcunit_listener_mode_f_) {
+            // NFC-A anticollision is fixed at 106 kbit/s. Program this while
+            // entering OFF so READY only needs one timing-critical mode write.
+            st25r_write_reg(0x04, 0x00);
+        }
         st25r_change_bits(0x03, nfcunit_listener_mode_f_ ? 0xE0 : 0xC8,
-                  nfcunit_listener_mode_f_ ? 0x18 : 0x30);
+                          nfcunit_listener_mode_f_ ? 0x18 : 0x30);
 
         if (nfcunit_listener_is_extra_field()) {
             return nfcunit_listener_enter_idle();
         }
-        // Match M5UnitNFC's proven listener adapter: with no external field,
-        // turn the oscillator/RX back off and wait for I_eon.
-        st25r_change_bits(0x02, 0x00, 0xC8);
+        // CardputerZero has no dedicated ST25R IRQ line and polls over I2C.
+        // Keep the oscillator/RX ready between short reader polling bursts;
+        // powering down here makes the first ATQA load-modulation response
+        // intermittent before Linux observes I_eon.
+        st25r_change_bits(0x02, 0xC0, 0x08);
         return true;
     }
 
@@ -1601,17 +1697,28 @@ private:
         nfcunit_listener_data_flag_ = false;
         nfcunit_listener_target_active_ = false;
 
-        if (nfcunit_listener_take_irq(ST25R_I_EOF32)) {
+        // update_idle() has just consumed the IRQ snapshot. Do not perform
+        // another four-register I2C read here: it delays MODE_DEFINITION until
+        // the automatic UID response is already on air.
+        if (nfcunit_listener_irq_latch_ & ST25R_I_EOF32) {
+            nfcunit_listener_irq_latch_ &= ~ST25R_I_EOF32;
             return nfcunit_listener_enter_off();
         }
 
-        st25r_change_bits(0x0A, 0x00, 0x80);  // clear no_crc_rx
-        if (nfcunit_listener_bitrate_ <= 2) {
-            const uint8_t br = nfcunit_listener_bitrate_ & 0x03u;
-            st25r_write_reg(0x04, static_cast<uint8_t>((br << 4) | br));
+        if (nfcunit_listener_mode_f_) {
+            if (nfcunit_listener_bitrate_ <= 2) {
+                const uint8_t br = nfcunit_listener_bitrate_ & 0x03u;
+                st25r_write_reg(0x04, static_cast<uint8_t>((br << 4) | br));
+            }
+            st25r_write_reg(0x03, 0xA0);
+        } else {
+            st25r_write_reg(0x04, 0x00);
         }
+        st25r_change_bits(0x0A, 0x00, 0x80);  // clear no_crc_rx
         st25r_change_bits(0x02, 0x00, 0x04);  // clear wakeup bit
-        st25r_write_reg(0x03, nfcunit_listener_mode_f_ ? 0xA0 : ST25R_MODE_LISTEN_NFCA);
+        if (!nfcunit_listener_mode_f_) {
+            if (!st25r_write_reg(0x03, ST25R_MODE_LISTEN_NFCA)) return false;
+        }
         return true;
     }
 
@@ -1668,7 +1775,8 @@ private:
 
     bool nfcunit_listener_update_off()
     {
-        if (nfcunit_listener_take_irq(ST25R_I_EON32) & ST25R_I_EON32) {
+        if ((nfcunit_listener_take_irq(ST25R_I_EON32) & ST25R_I_EON32) ||
+            nfcunit_listener_is_extra_field()) {
             nfcunit_listener_trace("irq EON");
             return nfcunit_listener_enter_idle();
         }
@@ -1678,6 +1786,24 @@ private:
     bool nfcunit_listener_update_idle(std::vector<uint8_t> &frame)
     {
         frame.clear();
+        if (!nfcunit_listener_mode_f_) {
+            uint8_t passive_irq = 0;
+            if (st25r_read_reg(0x1D, passive_irq) &&
+                (passive_irq & static_cast<uint8_t>(ST25R_I_RXE_PTA32))) {
+                uint8_t pta = 0;
+                if (st25r_read_reg(0x21, pta) && ((pta & 0x0Fu) > 0x01u)) {
+                    // NFC-A anticollision is always 106 kbit/s here.
+                    nfcunit_listener_bitrate_ = 0;
+                    return nfcunit_listener_enter_ready();
+                }
+            }
+            nfcunit_listener_irq_latch_ |= static_cast<uint32_t>(passive_irq);
+            // Before selection, NFC-A traffic is handled by the chip's
+            // automatic anticollision engine. Poll only its passive-target
+            // IRQ bank so an unrelated full IRQ snapshot cannot consume the
+            // event and add three I2C transactions before the mode switch.
+            return true;
+        }
         const uint32_t mode_wake = nfcunit_listener_mode_f_ ? ST25R_I_WU_F32 : ST25R_I_RXE_PTA32;
         uint32_t irq32 = nfcunit_listener_take_irq(ST25R_I_NFCT32 | ST25R_I_RXE32 | ST25R_I_EOF32 | mode_wake);
         if (!irq32) return true;
@@ -1691,11 +1817,6 @@ private:
                 nfcunit_listener_bitrate_ = br;
                 nfcunit_listener_trace("irq NFCT bitrate", static_cast<uint32_t>(br));
             }
-        }
-
-        if ((irq32 & ST25R_I_EOF32) && !nfcunit_listener_data_flag_) {
-            nfcunit_listener_trace("idle eof -> off");
-            return nfcunit_listener_enter_off();
         }
 
         if ((irq32 & ST25R_I_RXE32) && nfcunit_listener_bitrate_ != 0xFF) {
@@ -1745,6 +1866,15 @@ private:
             }
         }
 
+        // Linux polls the four IRQ registers over I2C, so a completed
+        // anti-collision step and a later field-off can be observed in the
+        // same read. Process RXE/PTA progress first; EOF is only terminal when
+        // no useful listener event was present.
+        if ((irq32 & ST25R_I_EOF32) && !nfcunit_listener_data_flag_) {
+            nfcunit_listener_trace("idle eof -> off");
+            return nfcunit_listener_enter_off();
+        }
+
         return true;
     }
 
@@ -1754,15 +1884,22 @@ private:
                       (nfcunit_listener_wakeup_ ? ST25R_I_WU_AX32 : ST25R_I_WU_A32);
         uint32_t irq32 = nfcunit_listener_take_irq(ST25R_I_EOF32 | wake_irq);
         if (!irq32) return true;
+        nfcunit_listener_trace("ready irq", irq32);
 
-        if (irq32 & ST25R_I_EOF32) {
-            nfcunit_listener_trace("ready eof -> off");
-            return nfcunit_listener_enter_off();
-        }
+        // With polled I2C, WU_A and a subsequent EOF may be coalesced. The
+        // activation event must win or the listener never reaches ACTIVE.
         if (irq32 & (ST25R_I_WU_A32 | ST25R_I_WU_AX32 | ST25R_I_WU_F32)) {
             nfcunit_listener_trace("irq WAKE", irq32);
             if (nfcunit_listener_keep_auto_collision_) return true;
             return nfcunit_listener_enter_active();
+        }
+        if (irq32 & ST25R_I_EOF32) {
+            nfcunit_listener_trace("ready eof -> off");
+            if (!nfcunit_listener_mode_f_) {
+                nfcunit_listener_trace("ready eof -> idle");
+                return nfcunit_listener_enter_idle();
+            }
+            return nfcunit_listener_enter_off();
         }
         return true;
     }

@@ -671,6 +671,11 @@ private:
 
        if (!IS_KEY_RELEASED(e)) return;
 
+       std::fprintf(stderr, "[NFC-KEY] raw=%u normalized=%u mods=0x%X tab=%d modal=%d\n",
+                    raw_key, normalize_main_key(raw_key), mods,
+                    static_cast<int>(current_tab_), static_cast<int>(modal_));
+       std::fflush(stderr);
+
        // On release, clear held scroll key.
        {
            const uint32_t nk = normalize_main_key(raw_key);
@@ -682,6 +687,42 @@ private:
                esc_exit_confirm_ = false;
            }
        }
+
+        // NFC Unit EMU transport controls are global within the Emulator tab.
+        // The action popup used to consume P/S before the normal shortcut
+        // switch, leaving the listener running with no visible feedback.
+        if (current_tab_ == Tab::Emulator &&
+            (modal_ == Modal::None || modal_ == Modal::EmulatorAction) &&
+            (raw_key == KEY_P || raw_key == KEY_S)) {
+            const auto conn = service_.connection_state();
+            cache_serial_device_kind(conn);
+            const auto endpoint = active_endpoint_for_ui(conn);
+            const auto kind = effective_emu_device_kind(conn);
+            if (kind == nfc_app::DeviceKind::NFCUnit ||
+                endpoint.kind == nfc_app::TransportKind::I2cBus) {
+                modal_ = Modal::None;
+                modal_idx_ = 0;
+                if (raw_key == KEY_P) {
+                    const bool ok = service_.grovenfc_deactivate();
+                    {
+                        std::lock_guard<std::mutex> lock(nfcunit_emu_autostart_mutex_);
+                        nfcunit_emu_autostart_running_ = false;
+                        nfcunit_emu_autostart_result_consumed_ = true;
+                    }
+                    ui_message_ = ok ? "Emulation Stopped"
+                                     : "NFC Unit stop failed";
+                    std::fprintf(stderr, "[NFC-KEY] P pause ok=%d\n", ok ? 1 : 0);
+                } else {
+                    (void)service_.grovenfc_deactivate();
+                    start_nfcunit_emu_autostart_async();
+                    ui_message_ = "Start Emulating NTAG";
+                    std::fprintf(stderr, "[NFC-KEY] S restart queued\n");
+                }
+                std::fflush(stderr);
+                render_all();
+                return;
+            }
+        }
 
         // Global Ctrl+S: save EMU dump from any state when on Emulator tab.
         // Skip when URI input modal is active so symbol-key combos are not hijacked.
@@ -982,14 +1023,16 @@ private:
                     }
                     render_all();
                 } else if (endpoint.kind == nfc_app::TransportKind::I2cBus || emu_device_kind == nfc_app::DeviceKind::NFCUnit) {
-                    if (service_.nfcunit_emulation_running()) {
-                        ui_message_ = "NFC Unit already running";
-                    } else if (nfcunit_emu_autostart_running_) {
-                        ui_message_ = "NFC Unit starting...";
-                    } else {
-                        start_nfcunit_emu_autostart_async();
-                        ui_message_ = "NFC Unit starting...";
+                    // S is explicit restart: stop the listener first, then
+                    // start the selected profile again.
+                    (void)service_.grovenfc_deactivate();
+                    {
+                        std::lock_guard<std::mutex> lock(nfcunit_emu_autostart_mutex_);
+                        nfcunit_emu_autostart_running_ = false;
+                        nfcunit_emu_autostart_result_consumed_ = true;
                     }
+                    start_nfcunit_emu_autostart_async();
+                    ui_message_ = "Start Emulating NTAG";
                     render_all();
                 } else if (st25r_mode) {
                     if (service_.spi_listener_active()) {
@@ -1045,8 +1088,13 @@ private:
                     ui_message_ = "PN532 NDEF emulation stopped";
                     render_all();
                 } else if (endpoint.kind == nfc_app::TransportKind::I2cBus || emu_device_kind == nfc_app::DeviceKind::NFCUnit) {
-                    service_.grovenfc_deactivate();
-                    ui_message_ = "NFC Unit emulation stopped";
+                    (void)service_.grovenfc_deactivate();
+                    {
+                        std::lock_guard<std::mutex> lock(nfcunit_emu_autostart_mutex_);
+                        nfcunit_emu_autostart_running_ = false;
+                        nfcunit_emu_autostart_result_consumed_ = true;
+                    }
+                    ui_message_ = "Emulation Stopped";
                     render_all();
                 } else if (st25r_mode) {
                     service_.spi_stop_listener();
@@ -3183,7 +3231,18 @@ private:
                     }
                 }
 
-                create_footer(parent, "Load from " + emulator_source_filename(protocol));
+                std::string footer_text = ui_message_.empty()
+                    ? ("Load from " + emulator_source_filename(protocol))
+                    : ui_message_;
+                if (is_nfc_unit) {
+                    const auto start_state = service_.nfcunit_emu_start_state();
+                    if (start_state.running) {
+                        footer_text = "Start Emulating " + proto_name;
+                    } else if (service_.nfcunit_emulation_running()) {
+                        footer_text = "Emulating " + proto_name;
+                    }
+                }
+                create_footer(parent, footer_text);
                 return;
             } else {
                 create_text(right, 6, 20, "OK menu: Dn/Up/Save", 0xD8D8D8, 10);

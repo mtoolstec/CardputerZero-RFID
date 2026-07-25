@@ -4520,7 +4520,6 @@ private:
                 got = dev->nfcunit_poll_listener_frame(frame, 20);
             }
             if (!got || frame.empty()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(2));
                 continue;
             }
 
@@ -4577,7 +4576,7 @@ private:
                 continue;
             }
 
-            if (response.empty()) response = {kNak};
+            const bool short_response = response.empty();
 
             {
                 bool tx_ok = false;
@@ -4587,7 +4586,15 @@ private:
                     tx_dev = i2c_device_.get();
                 }
                 if (tx_dev && tx_dev->is_open() && tx_dev->is_nfc_unit()) {
-                    tx_ok = tx_dev->nfcunit_send_listener_frame(response.data(), static_cast<uint8_t>(response.size()));
+                    if (short_response) {
+                        tx_ok = tx_dev->nfcunit_send_listener_short_frame(kNak, 4);
+                    } else if (response.size() == 1 && response[0] == kAck) {
+                        tx_ok = tx_dev->nfcunit_send_listener_short_frame(kAck, 4);
+                    } else if (response.size() == 1 && response[0] == kNak) {
+                        tx_ok = tx_dev->nfcunit_send_listener_short_frame(kNak, 4);
+                    } else {
+                        tx_ok = tx_dev->nfcunit_send_listener_frame(response.data(), static_cast<uint8_t>(response.size()));
+                    }
                     if (!tx_ok && !nfc_unit_emu_cancel_.load()) {
                         NfcHexLog::get().log_event("NFC-I2C", "NTAG tx failed, auto-restart listener");
                         tx_dev->nfcunit_stop_listener();
