@@ -94,6 +94,14 @@ if not dependency_ready and "CardputerZero" in os.environ:
         f.write(version)
 
 if dependency_dir.exists():
+    # Homebrew's cross-compiler reports aarch64-unknown-linux-gnu, while the
+    # Raspberry Pi sysroot uses Debian's aarch64-linux-gnu multiarch name.
+    for base in ("usr/include", "usr/lib"):
+        multiarch_root = dependency_dir / base
+        compatible_name = multiarch_root / "aarch64-unknown-linux-gnu"
+        if multiarch_root.exists() and not compatible_name.exists():
+            compatible_name.symlink_to("aarch64-linux-gnu", target_is_directory=True)
+
     static_lib_path = Path(static_lib)
     if static_lib_path.is_symlink() or static_lib_path.exists():
         if static_lib_path.is_dir() and not static_lib_path.is_symlink():
