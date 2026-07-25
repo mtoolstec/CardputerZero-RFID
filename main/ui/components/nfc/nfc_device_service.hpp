@@ -4282,40 +4282,11 @@ private:
 
     bool start_nfcunit_iso15693_emulation_unlocked(std::string *error)
     {
-        I2cGroveNfcDevice *dev = nullptr;
-        std::vector<uint8_t> iso15_dump;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (!i2c_device_ || !i2c_device_->is_open() || !i2c_device_->is_nfc_unit()) {
-                if (error) *error = "NFC Unit not connected";
-                return false;
-            }
-            dev = i2c_device_.get();
-            iso15_dump = storage_.load_emulator_default_dump(ProtocolKind::Iso15693);
-        }
-
-        dev->nfcunit_stop_listener();
-        (void)dev->stopEmulation();
-        if (!iso15_dump.empty()) {
-            log_i2c_load_payload("ISO15693", iso15_dump);
-        }
-        const bool ok = dev->startEmulationISO15();
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            nfc_unit_emu_cancel_.store(false);
-            nfc_unit_emu_running_.store(ok);
-            nfc_unit_emu_protocol_ = ProtocolKind::Iso15693;
-            if (ok) {
-                nfc_unit_emu_thread_ = std::thread([this]() { nfcunit_iso15693_keepalive_worker(); });
-            }
-        }
-        if (ok) {
-            push_log("[NFCUnit] ISO15693 emulation started");
-            if (error) error->clear();
-            return true;
-        }
-        push_log("[NFCUnit] ISO15693 emulation start failed");
-        if (error) *error = "NFC Unit ISO15693 emulation start failed";
+        // M5UnitNFC exposes listener/emulation layers for NFC-A and NFC-F only.
+        // startEmulationISO15() belongs to the GroveNFC 0x48 register bridge and
+        // cannot configure the raw ST25R3916 NFC Unit at 0x50.
+        push_log("[NFCUnit] ISO15693 tag emulation unsupported (use GroveNFC)");
+        if (error) *error = "NFC Unit cannot emulate ISO15693; use GroveNFC";
         return false;
     }
 
@@ -4402,23 +4373,9 @@ private:
             return false;
         }
         i2c_device_->nfcunit_stop_listener();
-        (void)i2c_device_->stopEmulation();
-        const std::vector<uint8_t> iso15_dump = storage_.load_emulator_default_dump(ProtocolKind::Iso15693);
-        if (!iso15_dump.empty()) {
-            log_i2c_load_payload("ISO15693", iso15_dump);
-        }
-        const bool ok = i2c_device_->startEmulationISO15();
-        nfc_unit_emu_cancel_.store(false);
-        nfc_unit_emu_running_.store(ok);
-        nfc_unit_emu_protocol_ = ProtocolKind::Iso15693;
-        if (ok) {
-            nfc_unit_emu_thread_ = std::thread([this]() { nfcunit_iso15693_keepalive_worker(); });
-            push_log("[NFCUnit] ISO15693 emulation started");
-            if (error) error->clear();
-            return true;
-        }
-        push_log("[NFCUnit] ISO15693 emulation start failed");
-        if (error) *error = "NFC Unit ISO15693 emulation start failed";
+        nfc_unit_emu_running_.store(false);
+        push_log("[NFCUnit] ISO15693 tag emulation unsupported (use GroveNFC)");
+        if (error) *error = "NFC Unit cannot emulate ISO15693; use GroveNFC";
         return false;
     }
 

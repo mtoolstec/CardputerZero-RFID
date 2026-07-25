@@ -1542,8 +1542,9 @@ private:
         if (nfcunit_listener_is_extra_field()) {
             return nfcunit_listener_enter_idle();
         }
-        // Keep oscillator/RX on to avoid missing short reader polling bursts.
-        st25r_change_bits(0x02, 0xC0, 0x00);
+        // Match M5UnitNFC's proven listener adapter: with no external field,
+        // turn the oscillator/RX back off and wait for I_eon.
+        st25r_change_bits(0x02, 0x00, 0xC8);
         return true;
     }
 
@@ -1553,6 +1554,7 @@ private:
 
         nfcunit_listener_trace("state -> IDLE");
 
+        const NfcUnitListenerState previous_state = nfcunit_listener_state_;
         uint8_t op = 0;
         uint8_t aux = 0;
         nfcunit_listener_state_ = NfcUnitListenerState::Idle;
@@ -1573,12 +1575,14 @@ private:
 
         st25r_change_bits(0x0A, 0x80, 0x00);  // set no_crc_rx
 
-        if (nfcunit_listener_mode_f_) {
-            st25r_change_bits(0x08, 0x09, 0x04);  // Enable auto response for NFC-F only
-        } else {
-            st25r_change_bits(0x08, 0x00, 0x01);  // Enable auto response for NFC-A
+        if (previous_state == NfcUnitListenerState::Active && !nfcunit_listener_wakeup_) {
+            if (nfcunit_listener_mode_f_) {
+                st25r_change_bits(0x08, 0x09, 0x04);
+            } else {
+                st25r_change_bits(0x08, 0x00, 0x01);
+            }
+            st25r_cmd(0xCD);  // GO_TO_SENSE
         }
-        st25r_cmd(0xCD);                      // GO_TO_SENSE
 
         st25r_cmd(0xDB);  // CLEAR_FIFO
         st25r_cmd(0xD1);  // UNMASK_RECEIVE_DATA
@@ -1690,42 +1694,8 @@ private:
         }
 
         if ((irq32 & ST25R_I_EOF32) && !nfcunit_listener_data_flag_) {
-            uint16_t fifo_cnt = 0;
-            if (st25r_read_fifo_count(fifo_cnt) && fifo_cnt > 0) {
-                uint8_t raw[16] = {0};
-                const uint16_t to_read = std::min<uint16_t>(fifo_cnt, sizeof(raw));
-                if (st25r_fifo_read(raw, static_cast<uint8_t>(to_read))) {
-                    nfcunit_listener_trace_bytes("idle eof raw", raw, to_read);
-                    if ((to_read > 0) && (raw[0] == 0x26u || raw[0] == 0x52u)) {
-                        nfcunit_listener_bitrate_ = 0;
-                        nfcunit_listener_trace("idle short poll", raw[0]);
-                        st25r_cmd(0xDB);  // CLEAR_FIFO
-                        st25r_cmd(0xD1);  // UNMASK_RECEIVE_DATA
-                        return nfcunit_listener_enter_ready();
-                    }
-
-                    // Some readers send anti-collision/select frames directly after short poll.
-                    // Keep those frames and hand them to the upper emulation worker immediately.
-                    if (to_read > 0) {
-                        const uint16_t use_len = (to_read > 2) ? static_cast<uint16_t>(to_read - 2) : to_read;
-                        if (use_len > 0) {
-                            frame.assign(raw, raw + use_len);
-                            nfcunit_listener_data_flag_ = true;
-                            nfcunit_listener_trace("idle eof frame", use_len);
-                            st25r_cmd(0xDB);  // CLEAR_FIFO
-                            st25r_cmd(0xD1);  // UNMASK_RECEIVE_DATA
-                            (void)nfcunit_listener_enter_active();
-                            return true;
-                        }
-                    }
-                }
-            }
-            // Keep listener alive for follow-up frames (e.g. anti-collision/select)
-            // instead of resetting to OFF on every EOF.
-            st25r_cmd(0xDB);  // CLEAR_FIFO
-            st25r_cmd(0xD1);  // UNMASK_RECEIVE_DATA
-            nfcunit_listener_trace("idle eof -> keep");
-            return true;
+            nfcunit_listener_trace("idle eof -> off");
+            return nfcunit_listener_enter_off();
         }
 
         if ((irq32 & ST25R_I_RXE32) && nfcunit_listener_bitrate_ != 0xFF) {
@@ -1786,10 +1756,8 @@ private:
         if (!irq32) return true;
 
         if (irq32 & ST25R_I_EOF32) {
-            st25r_cmd(0xDB);  // CLEAR_FIFO
-            st25r_cmd(0xD1);  // UNMASK_RECEIVE_DATA
-            nfcunit_listener_trace("ready eof -> idle");
-            return nfcunit_listener_enter_idle();
+            nfcunit_listener_trace("ready eof -> off");
+            return nfcunit_listener_enter_off();
         }
         if (irq32 & (ST25R_I_WU_A32 | ST25R_I_WU_AX32 | ST25R_I_WU_F32)) {
             nfcunit_listener_trace("irq WAKE", irq32);

@@ -48,7 +48,7 @@ NFC tags across multiple hardware devices.
 ### Emulator Tab
 - **PN532Killer HW Emulation** — up to 8 slots, ISO14443A / ISO15693 / MIFARE Classic
 - **Grove NFC Tag Emulation** — NTAG213/215/216, MFC1K, China2, ISO15693 via I²C register protocol
-- **NFC Unit (ST25R3916B) Emulation** — ISO14443A / ISO14443B / ISO15693 / MIFARE Classic with slot profile
+- **NFC Unit (ST25R3916B) Emulation** — NFC-A / NTAG listener emulation (ISO15693 tag emulation requires Grove NFC)
 - **M5 NFC CAP (ST25R3916) Emulation** — ISO14443A listener (REQA → anticollision → UID response)
 - **NDEF URL Emulation** — PN532-only: broadcast a custom NDEF URI/URL
 - **UID Changer** — rewrite block 0 of Gen1A / Gen2 (CUID) / Gen3 / Gen4 magic cards
