@@ -11,7 +11,10 @@ has_homebrew_aarch64 = os.path.exists(os.path.join(homebrew_toolchain, "aarch64-
 
 version = "v0.0.3"
 static_lib = "build/static_lib"
-update = False
+local_path = Path(os.getcwd())
+sdk_path = local_path.parent.parent / "SDK"
+dependency_dir = sdk_path / "github_source" / f"static_lib_{version}"
+dependency_archive = sdk_path / "github_source" / f"static_lib_{version}.tar.gz"
 
 if "CardputerZero" in os.environ:
     if not os.path.exists("build/config/config_tmp.mk"):
@@ -42,8 +45,6 @@ else:
             f.write("CONFIG_V9_5_LV_USE_DRAW_SW_ASM=1\n")
             f.write("CONFIG_V9_5_LV_USE_EVDEV=y\n")
 
-local_path = Path(os.getcwd())
-sdk_path = local_path.parent.parent / "SDK"
 os.environ["SDK_PATH"] = str(sdk_path)
 os.environ["EXT_COMPONENTS_PATH"] = str(sdk_path.parent / "ext_components")
 
@@ -68,36 +69,36 @@ try:
 except Exception:
     pass  # fallback: code uses __DATE__ __TIME__
 
-if not os.path.exists(static_lib):
-    update = True
-else:
+dependency_ready = False
+if dependency_dir.exists():
     try:
-        with open(str(Path(static_lib) / "version"), "r") as f:
-            if version != f.read().strip():
-                update = True
+        with open(dependency_dir / "version", "r") as f:
+            dependency_ready = f.read().strip() == version
     except Exception:
-        update = True
+        dependency_ready = False
 
-if update and "CardputerZero" in os.environ:
+if not dependency_ready and "CardputerZero" in os.environ:
     with open(env["PROJECT_TOOL_S"]) as f:
         exec(f.read())
     down_url = "https://github.com/dianjixz/M5CardputerZero-UserDemo/releases/download/{}/sdk_bsp.tar.gz".format(
         version
     )
-    archive_name = "static_lib_{}.tar.gz".format(version)
-    try:
-        down_path = check_wget_down(down_url, archive_name)
-        if os.path.exists(static_lib):
-            shutil.rmtree(static_lib)
-        shutil.move(down_path, static_lib)
-    except Exception as ex:
-        print("[RFID] check_wget_down failed, fallback to tar extraction:", ex)
-        archive_path = Path(archive_name)
-        if not archive_path.exists():
-            subprocess.check_call(["curl", "-L", down_url, "-o", str(archive_path)])
-        if os.path.exists(static_lib):
-            shutil.rmtree(static_lib)
-        os.makedirs(static_lib, exist_ok=True)
-        subprocess.check_call(["tar", "-xzf", str(archive_path), "-C", static_lib])
-        with open(str(Path(static_lib) / "version"), "w") as f:
-            f.write(version)
+    if not dependency_archive.exists():
+        dependency_archive.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.check_call(["curl", "-L", down_url, "-o", str(dependency_archive)])
+    if dependency_dir.exists():
+        shutil.rmtree(dependency_dir)
+    dependency_dir.mkdir(parents=True, exist_ok=True)
+    subprocess.check_call(["tar", "-xzf", str(dependency_archive), "-C", str(dependency_dir)])
+    with open(dependency_dir / "version", "w") as f:
+        f.write(version)
+
+if dependency_dir.exists():
+    static_lib_path = Path(static_lib)
+    if static_lib_path.is_symlink() or static_lib_path.exists():
+        if static_lib_path.is_dir() and not static_lib_path.is_symlink():
+            shutil.rmtree(static_lib_path)
+        else:
+            static_lib_path.unlink()
+    static_lib_path.parent.mkdir(parents=True, exist_ok=True)
+    static_lib_path.symlink_to(dependency_dir, target_is_directory=True)
