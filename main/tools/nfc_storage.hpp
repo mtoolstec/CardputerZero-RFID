@@ -821,6 +821,35 @@ public:
         }
     }
 
+    static bool normalize_emulator_block_hex(const std::string &raw,
+                                             size_t expected_hex_chars,
+                                             std::string *normalized)
+    {
+        if (!normalized) return false;
+        std::string payload = raw;
+        const size_t colon = payload.find(':');
+        if (colon != std::string::npos) {
+            if (colon == 0 || colon > 2) return false;
+            for (size_t i = 0; i < colon; ++i) {
+                if (!std::isxdigit(static_cast<unsigned char>(payload[i]))) return false;
+            }
+            payload = payload.substr(colon + 1);
+        }
+
+        std::string pure;
+        pure.reserve(expected_hex_chars);
+        for (const unsigned char ch : payload) {
+            if (std::isxdigit(ch)) {
+                pure.push_back(static_cast<char>(std::toupper(ch)));
+            } else if (!std::isspace(ch) && ch != '-' && ch != '_') {
+                return false;
+            }
+        }
+        if (pure.size() != expected_hex_chars) return false;
+        *normalized = std::move(pure);
+        return true;
+    }
+
     // Write record hex data as structured JSON to emulator file.
     // Used by the "Emulate" flow: Saved record → write to {p}_0.json.
     void save_emulator_json_from_record(ProtocolKind protocol, const SavedRecord &record) const
@@ -857,15 +886,23 @@ public:
             j["card"]["protocol"] = "iso15693";
         }
 
-        for (size_t i = 0; i < record.tag.raw_data.size(); ++i) {
-            std::string pure;
-            const std::string &line = record.tag.raw_data[i];
-            size_t colon = line.find(':');
-            std::string hex = (colon != std::string::npos && colon + 1 < line.size())
-                ? line.substr(colon + 1) : line;
-            for (char c : hex) if (std::isxdigit((unsigned char)c)) pure += (char)std::toupper((unsigned char)c);
-            if (!pure.empty()) j["blocks"][std::to_string(i)] = pure;
+        const size_t expected_hex_chars =
+            (protocol == ProtocolKind::MifareClassic) ? 32u : 8u;
+        const std::vector<std::string> *source = &record.tag.raw_data;
+        if (protocol == ProtocolKind::MifareClassic && record.mifare_dump.has_value() &&
+            !record.mifare_dump->blocks_hex.empty()) {
+            source = &record.mifare_dump->blocks_hex;
         }
+
+        size_t valid_blocks = 0;
+        for (size_t i = 0; i < source->size(); ++i) {
+            std::string pure;
+            if (!normalize_emulator_block_hex((*source)[i], expected_hex_chars, &pure)) continue;
+            j["blocks"][std::to_string(i)] = pure;
+            ++valid_blocks;
+        }
+
+        if (valid_blocks == 0) return;
 
         std::ofstream out(path.c_str(), std::ios::out | std::ios::trunc);
         if (out.is_open()) out << j.dump(2);
@@ -896,7 +933,7 @@ public:
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Emulator JSON directory — structured per-protocol dump files used by the UI.
-    // Runtime path: $HOME/rfid/emulator/{protocol_key}_0.json
+    // Runtime path: $HOME/rfid/emulator/{MFC|NTAG|ISO15693}/{protocol_key}_0.json
     // Defaults path: $HOME/rfid/emulator/default/{protocol_key}_0.json
     //                  (populated by deploy script from config/defaults/)
     // ═══════════════════════════════════════════════════════════════════════════
@@ -913,10 +950,26 @@ public:
         return emulator_json_dir() + "/default";
     }
 
+    static std::string emulator_protocol_dir_name(ProtocolKind protocol)
+    {
+        switch (protocol) {
+        case ProtocolKind::MifareClassic: return "MFC";
+        case ProtocolKind::Iso14443A:     return "NTAG";
+        case ProtocolKind::Iso15693:      return "ISO15693";
+        default:                          return "UNKNOWN";
+        }
+    }
+
+    std::string legacy_emulator_json_path(ProtocolKind protocol) const
+    {
+        return emulator_json_dir() + "/" + emulator_file_stem(protocol) + "_0.json";
+    }
+
     std::string emulator_json_path(ProtocolKind protocol) const
     {
-        ensure_dir_recursive(emulator_json_dir());
-        return emulator_json_dir() + "/" + emulator_file_stem(protocol) + "_0.json";
+        const std::string dir = emulator_json_dir() + "/" + emulator_protocol_dir_name(protocol);
+        ensure_dir_recursive(dir);
+        return dir + "/" + emulator_file_stem(protocol) + "_0.json";
     }
 
     std::string emulator_json_default_path(ProtocolKind protocol) const
@@ -937,6 +990,12 @@ public:
         for (auto protocol : {ProtocolKind::Iso14443A, ProtocolKind::MifareClassic, ProtocolKind::Iso15693}) {
             const std::string user_path = emulator_json_path(protocol);
             if (::access(user_path.c_str(), F_OK) == 0) continue;  // already exists
+
+            const std::string legacy_path = legacy_emulator_json_path(protocol);
+            if (::access(legacy_path.c_str(), F_OK) == 0) {
+                copy_file(legacy_path, user_path);
+                continue;
+            }
 
             // Prefer app-bundled config/defaults/ (correct PM3 format, never data_hex)
             std::string app_default_dir = std::string(hal_path_data_dir()) + "/config/defaults";

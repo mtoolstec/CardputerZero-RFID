@@ -3050,18 +3050,22 @@ public:
     // No slot concept — data is loaded dynamically per protocol.
     bool i2c_emulate(ProtocolKind protocol, const SavedRecord &record, std::string *error = nullptr)
     {
-        // Save the record as default dump for this protocol (no lock needed)
-        if (!record.tag.raw_data.empty()) {
+        const std::vector<std::string> *source = &record.tag.raw_data;
+        if (protocol == ProtocolKind::MifareClassic && record.mifare_dump.has_value() &&
+            !record.mifare_dump->blocks_hex.empty()) {
+            source = &record.mifare_dump->blocks_hex;
+        }
+        if (!source->empty()) {
             std::vector<uint8_t> bytes;
-            for (const auto &line : record.tag.raw_data) {
-                std::string hex = line;
+            for (const auto &line : *source) {
+                std::string hex;
+                if (!normalize_emu_hex(line, emulator_block_hex_chars(protocol), &hex)) continue;
                 for (size_t i = 0; i + 1 < hex.size(); i += 2) {
-                    char *end = nullptr;
-                    unsigned long val = std::strtoul(hex.substr(i, 2).c_str(), &end, 16);
-                    if (end && *end == '\0') bytes.push_back(static_cast<uint8_t>(val));
+                    bytes.push_back(static_cast<uint8_t>(
+                        std::strtoul(hex.substr(i, 2).c_str(), nullptr, 16)));
                 }
             }
-            storage_.save_emulator_default_dump(protocol, bytes);
+            if (!bytes.empty()) storage_.save_emulator_default_dump(protocol, bytes);
         }
 
         // Also write to rfid/emulator/{protocol}_0.json so EMU tab sees updated data
@@ -3250,14 +3254,12 @@ public:
         dump_lines.reserve(slot_data.size());
 
         for (size_t i = 0; i < slot_data.size(); ++i) {
-            const std::string &line = slot_data[i];
-            if (line.size() >= 3 && line[2] == ':') {
-                dump_lines.push_back(line);
-                continue;
-            }
-            char prefix[8];
-            std::snprintf(prefix, sizeof(prefix), "%02d:", static_cast<int>(i));
-            dump_lines.push_back(std::string(prefix) + line);
+            const std::string line = normalized_emu_dump_line(protocol, i, slot_data[i]);
+            if (!line.empty()) dump_lines.push_back(line);
+        }
+        if (dump_lines.empty()) {
+            if (err) *err = "Selected slot has no normalized dump blocks";
+            return false;
         }
 
         auto &cache = emu_slot_cache_[{protocol, slot}];
@@ -3265,10 +3267,7 @@ public:
         cache.dump_lines = std::move(dump_lines);
         cache.dump_loaded = true;
 
-        if (cache.uid.empty() && !cache.dump_lines.empty()) {
-            const std::string first = cache.dump_lines.front();
-            if (first.size() > 3) cache.uid = first.substr(3, std::min<size_t>(14, first.size() - 3));
-        }
+        if (cache.uid.empty()) cache.uid = uid_from_normalized_dump(protocol, cache.dump_lines);
         if (err) err->clear();
         return true;
     }
@@ -3282,7 +3281,7 @@ public:
         if (it != emu_slot_cache_.end() && it->second.dump_loaded)
             return it->second.dump_lines;
 
-        // Try loading structured JSON from rfid/emulator/{protocol}_0.json
+        // Try loading structured JSON from the protocol-specific emulator directory.
         std::string json_path = storage_.emulator_json_path(protocol);
         std::string uid_from_json;
         std::vector<std::string> lines;
@@ -3307,17 +3306,15 @@ public:
                         }
                         std::sort(keys.begin(), keys.end());
                         for (int k : keys) {
-                            std::string key_str = std::to_string(k);
-                            if (blocks.contains(key_str) && blocks[key_str].is_string()) {
-                                std::string hex = blocks[key_str].get<std::string>();
-                                // Convert to uppercase pure hex
-                                std::string pure;
-                                for (char c : hex) if (std::isxdigit((unsigned char)c)) pure += (char)std::toupper((unsigned char)c);
-                                if (pure.empty()) continue;
-                                char prefix[16];
-                                std::snprintf(prefix, sizeof(prefix), "%02d:", k);
-                                lines.push_back(std::string(prefix) + pure);
-                            }
+                            const std::string key_plain = std::to_string(k);
+                            char key_pad[4];
+                            std::snprintf(key_pad, sizeof(key_pad), "%02d", k);
+                            const std::string key_str = blocks.contains(key_pad) ? std::string(key_pad) :
+                                                         blocks.contains(key_plain) ? key_plain : "";
+                            if (key_str.empty() || !blocks[key_str].is_string()) continue;
+                            const std::string line = normalized_emu_dump_line(
+                                protocol, static_cast<size_t>(k), blocks[key_str].get<std::string>());
+                            if (!line.empty()) lines.push_back(line);
                         }
                     }
                     // Fallback: if no blocks field but data_hex present, chunk it
@@ -3326,17 +3323,16 @@ public:
                         std::string pure;
                         for (char c : raw) if (std::isxdigit((unsigned char)c)) pure += (char)std::toupper((unsigned char)c);
                         int bytes_per_line = (protocol == ProtocolKind::MifareClassic) ? 16 : 4;
-                        for (size_t pos = 0; pos < pure.size(); ) {
-                            int n = (int)(pos / 2);
-                            char prefix[16];
-                            std::snprintf(prefix, sizeof(prefix), "%02d:", n);
+                        size_t block_index = 0;
+                        for (size_t pos = 0; pos < pure.size(); ++block_index) {
                             std::string chunk = pure.substr(pos, bytes_per_line * 2);
                             pos += chunk.size();
-                            lines.push_back(std::string(prefix) + chunk);
+                            const std::string line = normalized_emu_dump_line(protocol, block_index, chunk);
+                            if (!line.empty()) lines.push_back(line);
                         }
                     }
                 } catch (...) {
-                    push_log("[EMU] Failed to parse emulator JSON, using slot defaults");
+                    NfcHexLog::get().log_event("emu", "invalid emulator JSON");
                 }
             }
         }
@@ -3347,14 +3343,8 @@ public:
             if (!slots.empty() && !slots[0].raw_data.empty()) {
                 lines.reserve(slots[0].raw_data.size());
                 for (size_t i = 0; i < slots[0].raw_data.size(); ++i) {
-                    const std::string &line = slots[0].raw_data[i];
-                    if (line.size() >= 3 && line[2] == ':') {
-                        lines.push_back(line);
-                        continue;
-                    }
-                    char prefix[8];
-                    std::snprintf(prefix, sizeof(prefix), "%02d:", static_cast<int>(i));
-                    lines.push_back(std::string(prefix) + line);
+                    const std::string line = normalized_emu_dump_line(protocol, i, slots[0].raw_data[i]);
+                    if (!line.empty()) lines.push_back(line);
                 }
             }
         }
@@ -3365,15 +3355,74 @@ public:
         cache.dump_loaded = true;
         // Use JSON UID if available, otherwise extract from first dump line
         if (!uid_from_json.empty()) {
-            cache.uid = uid_from_json;
-        } else if (!cache.dump_lines.empty()) {
-            const std::string first = cache.dump_lines.front();
-            if (first.size() > 3) cache.uid = first.substr(3, std::min<size_t>(14, first.size() - 3));
+            cache.uid.clear();
+            for (const unsigned char ch : uid_from_json) {
+                if (std::isxdigit(ch)) cache.uid.push_back(static_cast<char>(std::toupper(ch)));
+            }
+        } else {
+            cache.uid = uid_from_normalized_dump(protocol, cache.dump_lines);
         }
         return cache.dump_lines;
     }
 
 private:
+    static size_t emulator_block_hex_chars(ProtocolKind protocol)
+    {
+        return protocol == ProtocolKind::MifareClassic ? 32u : 8u;
+    }
+
+    static bool normalize_emu_hex(const std::string &raw, size_t expected, std::string *pure)
+    {
+        if (!pure) return false;
+        std::string payload = raw;
+        const size_t colon = payload.find(':');
+        if (colon != std::string::npos) {
+            if (colon == 0 || colon > 2) return false;
+            for (size_t i = 0; i < colon; ++i) {
+                if (!std::isxdigit(static_cast<unsigned char>(payload[i]))) return false;
+            }
+            payload = payload.substr(colon + 1);
+        }
+
+        std::string normalized;
+        normalized.reserve(expected);
+        for (const unsigned char ch : payload) {
+            if (std::isxdigit(ch)) {
+                normalized.push_back(static_cast<char>(std::toupper(ch)));
+            } else if (!std::isspace(ch) && ch != '-' && ch != '_') {
+                return false;
+            }
+        }
+        if (normalized.size() != expected) return false;
+        *pure = std::move(normalized);
+        return true;
+    }
+
+    static std::string normalized_emu_dump_line(ProtocolKind protocol,
+                                                size_t block_index,
+                                                const std::string &raw)
+    {
+        std::string pure;
+        if (!normalize_emu_hex(raw, emulator_block_hex_chars(protocol), &pure)) return {};
+        char prefix[8];
+        std::snprintf(prefix, sizeof(prefix), "%02X: ", static_cast<unsigned>(block_index));
+        return std::string(prefix) + pure;
+    }
+
+    static std::string uid_from_normalized_dump(ProtocolKind protocol,
+                                                const std::vector<std::string> &lines)
+    {
+        if (lines.empty()) return {};
+        std::string first;
+        if (!normalize_emu_hex(lines[0], emulator_block_hex_chars(protocol), &first)) return {};
+        if (protocol == ProtocolKind::MifareClassic) return first.substr(0, 8);
+        if (protocol == ProtocolKind::Iso14443A && lines.size() > 1) {
+            std::string second;
+            if (normalize_emu_hex(lines[1], 8, &second)) return first.substr(0, 6) + second;
+        }
+        return {};
+    }
+
     static constexpr size_t kNfcUnitNtag213Pages = 45;
 
     static bool parse_i2c_endpoint_path(const std::string &path, std::string *bus, uint8_t *addr)
