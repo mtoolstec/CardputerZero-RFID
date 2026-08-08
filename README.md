@@ -15,7 +15,7 @@ NFC tags across multiple hardware devices.
 | **M5 NFC Unit** | I²C (0x50) | ✅ | ✅ MFC/NTAG/15693 | ✅ Gen1A/3 | ✅ ISO14443A/B/15693/MFC | ❌ | ❌ | ❌ | ✅ |
 | **Grove NFC** | I²C (0x48) | ✅ | ✅ MFC/NTAG/15693/FeliCa | ❌ | ✅ NTAG/MFC1K/15693 | ❌ | ❌ | ❌ | ✅ |
 | **M5 NFC CAP** | SPI (spidev) | ✅ | ✅ MFC/NTAG | ✅ Gen1A | ✅ ISO14443A | ❌ | ❌ | ❌ | ✅ |
-| **UHF Reader** | USB (1A86:FE1C) | ✅ | ✅ Continuous scan | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ |
+| **UHF Reader** | USB (1A86:FE1C / 1A86:55D3 FZUHF) | ✅ | ✅ Continuous scan | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ |
 
 ## Supported Protocols & Operations
 

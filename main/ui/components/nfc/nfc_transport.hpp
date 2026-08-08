@@ -211,10 +211,13 @@ public:
         // Detect by port name:
         //   macOS CDC-ACM: cu.usbmodem*
         //   Linux CDC-ACM: ttyACM*
-        // Both need the DTR pulse; plain PN532 / CH340 (ttyUSB*, cu.usbserial*, etc.) keep DTR HIGH.
+        // PN532Killer needs the DTR pulse. Known UHF CDC-ACM devices and plain
+        // PN532 / CH340 ports keep DTR HIGH.
         const bool is_cdc_acm = endpoint.path.find("usbmodem") != std::string::npos
                              || endpoint.path.find("ttyACM")   != std::string::npos;
-        if (is_cdc_acm) {
+        const bool is_known_uhf = endpoint.usb_vid == 0x1A86 &&
+                                  (endpoint.usb_pid == 0x55D3 || endpoint.usb_pid == 0xFE1C);
+        if (is_cdc_acm && !is_known_uhf) {
             // PN532Killer: pulse HIGH → LOW, then stay LOW
             int bits = TIOCM_DTR | TIOCM_RTS;
             ioctl(fd_, TIOCMBIS, &bits);  // HIGH
@@ -420,15 +423,14 @@ public:
                 read_usb_vid_pid(name, &endpoint.usb_vid, &endpoint.usb_pid);
             // Try to read USB product name for a friendlier label
             std::string product = read_usb_product_name(name);
+            std::string manufacturer = read_usb_manufacturer_name(name);
             if (!product.empty()) {
-                endpoint.label = std::string(to_string(kind)) + " " + product + " (" + name + ")";
+                endpoint.label = product;
+                if (!manufacturer.empty() && manufacturer != product)
+                    endpoint.label += " - " + manufacturer;
+                endpoint.label += " (" + name + ")";
             } else {
                 endpoint.label = std::string(to_string(kind)) + " " + name;
-            }
-
-            if (kind == TransportKind::UsbSerial &&
-                is_known_uhf_vid_pid(endpoint.usb_vid, endpoint.usb_pid)) {
-                endpoint.label = std::string("USB UHF Reader ") + "(" + name + ")";
             }
             endpoint.baud_rate = 115200;
             endpoints.push_back(endpoint);
@@ -720,9 +722,9 @@ private:
     static std::string read_usb_product_name(const std::string &devname)
     {
 #if defined(__linux__)
-        // sysfs path: /sys/class/tty/<dev>/device/../../product
-        // The tty device node -> device (usb interface) -> device (usb device) -> product
-        static const char *SUFFIXES[] = {"/device/../../product", "/device/../product", nullptr};
+        // The tty symlink points at the USB interface. Its parent is the actual
+        // USB device; the grandparent may be a hub and must only be a fallback.
+        static const char *SUFFIXES[] = {"/device/../product", "/device/../../product", nullptr};
         for (const char **s = SUFFIXES; *s; ++s) {
             const std::string path = std::string("/sys/class/tty/") + devname + *s;
             FILE *f = fopen(path.c_str(), "r");
@@ -791,9 +793,24 @@ private:
         return {};
     }
 
+    static std::string read_usb_manufacturer_name(const std::string &devname)
+    {
+#if defined(__linux__)
+        static const char *SUFFIXES[] = {"/device/../manufacturer", "/device/../../manufacturer", nullptr};
+        for (const char **s = SUFFIXES; *s; ++s) {
+            std::string value;
+            if (read_first_line_trimmed(std::string("/sys/class/tty/") + devname + *s, &value))
+                return value;
+        }
+#else
+        (void)devname;
+#endif
+        return {};
+    }
+
     static bool is_known_uhf_vid_pid(int vid, int pid)
     {
-        return (vid == 0x1A86 && pid == 0xFE1C);
+        return vid == 0x1A86 && (pid == 0xFE1C || pid == 0x55D3);
     }
 
     static bool parse_hex_u16(const std::string &text, int *value)
@@ -838,10 +855,10 @@ private:
 
 #if defined(__linux__)
         static const char *SUFFIXES[] = {
-            "/device/../../idVendor", "/device/../idVendor", "/device/idVendor", nullptr
+            "/device/../idVendor", "/device/../../idVendor", "/device/idVendor", nullptr
         };
         static const char *PSUFFIXES[] = {
-            "/device/../../idProduct", "/device/../idProduct", "/device/idProduct", nullptr
+            "/device/../idProduct", "/device/../../idProduct", "/device/idProduct", nullptr
         };
 
         int found_vid = -1;

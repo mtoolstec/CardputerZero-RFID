@@ -24,6 +24,12 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#if defined(__linux__)
+#include <fcntl.h>
+#include <linux/gpio.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+#endif
 
 class UINfcPage : public app_base
 {
@@ -81,6 +87,7 @@ public:
         creat_UI();
         event_handler_init();
         ui_timer_ = lv_timer_create(UINfcPage::ui_timer_cb, 200, this);
+        sync_ext_usb_power();
         render_all();
     }
 
@@ -89,6 +96,12 @@ public:
         (void)service_.grovenfc_deactivate();
         (void)service_.stop_pn532_ndef_emulation();
         (void)service_.spi_stop_listener();
+        if (service_.uhf_continuous_scan_running()) {
+            std::string ignored;
+            (void)service_.stop_uhf_continuous_scan(&ignored);
+        }
+        service_.disconnect();
+        set_ext_usb_power(false);
         if (ui_timer_) lv_timer_delete(ui_timer_);
     }
 
@@ -179,6 +192,11 @@ private:
     std::vector<nfc_app::TransportEndpoint> usb_select_list_;
     bool pending_usb_connect_ = false;
     std::string pending_usb_connect_path_;
+    bool usb_connect_in_progress_ = false;
+    std::string usb_connect_label_;
+    std::vector<std::string> usb_probe_lines_;
+    bool uhf_inventory_started_ = false;
+    int ext_usb_gpio_fd_ = -1;
     uint32_t nfc_automation_last_tick_ = 0;
     static constexpr const char *kNfcAutomationCmdPath = "/tmp/applaunch_nfc_automation.cmd";
     static constexpr const char *kNfcAutomationStatusPath = "/tmp/applaunch_nfc_automation.status";
@@ -315,9 +333,7 @@ private:
 
     bool read_uses_uhf_table() const
     {
-        const auto conn = service_.connection_state();
-        return (conn.connected && conn.device_kind == nfc_app::DeviceKind::UHFReader) ||
-               !uhf_table_rows_.empty();
+        return uhf_inventory_started_;
     }
 
     nfc_app::TransportEndpoint active_endpoint_for_ui(const nfc_app::ConnectionState &conn) const
@@ -869,6 +885,7 @@ private:
         case KEY_TAB:
             if (current_tab_ == Tab::Read) {
                 service_.cycle_device_mode(&ui_message_);
+                sync_ext_usb_power();
                 // Auto-scroll pill bar so the newly active transport is visible
                 {
                     const nfc_app::TransportKind new_kind = service_.current_endpoint().kind;
@@ -954,6 +971,7 @@ private:
             // DEL key on READ tab: clear log and UHF table
             if (current_tab_ == Tab::Read) {
                 if (read_uses_uhf_table()) {
+                    service_.clear_uhf_table();
                     uhf_table_rows_.clear();
                     uhf_table_scroll_offset_ = 0;
                 }
@@ -977,6 +995,7 @@ private:
                     std::string _err;
                     if (!service_.uhf_continuous_scan_running()) {
                         if (service_.start_uhf_continuous_scan(&_err)) {
+                            uhf_inventory_started_ = true;
                             scan_log_lines_.push_back("> Start inventory...");
                             ui_message_ = "Inventory running";
                         } else {
@@ -1235,6 +1254,16 @@ private:
         int tab_index = static_cast<int>(current_tab_);
         tab_index = (tab_index + delta + 4) % 4;
         current_tab_ = static_cast<Tab>(tab_index);
+        if (prev_tab == Tab::Read && current_tab_ != Tab::Read && ext_usb_gpio_fd_ >= 0) {
+            if (service_.uhf_continuous_scan_running()) {
+                std::string ignored;
+                (void)service_.stop_uhf_continuous_scan(&ignored);
+            }
+            service_.disconnect();
+            set_ext_usb_power(false);
+        } else if (current_tab_ == Tab::Read) {
+            sync_ext_usb_power();
+        }
         // When leaving Emulator tab, stop NDEF emulation only.
         if (prev_tab == Tab::Emulator && current_tab_ != Tab::Emulator) {
             if (service_.pn532_ndef_state().running) {
@@ -1306,6 +1335,73 @@ private:
             }
         }
         render_all();
+    }
+
+    bool set_ext_usb_power(bool enabled)
+    {
+#if defined(__linux__)
+        if (enabled) {
+            if (ext_usb_gpio_fd_ >= 0) return true;
+
+            int chip_fd = -1;
+            for (int i = 0; i < 16; ++i) {
+                const std::string path = "/dev/gpiochip" + std::to_string(i);
+                const int candidate = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+                if (candidate < 0) continue;
+                struct gpiochip_info info {};
+                if (::ioctl(candidate, GPIO_GET_CHIPINFO_IOCTL, &info) == 0 &&
+                    std::string(info.label) == "m5ioe1") {
+                    chip_fd = candidate;
+                    break;
+                }
+                ::close(candidate);
+            }
+            if (chip_fd < 0) {
+                ui_message_ = "EXT USB: M5IOE1 not found";
+                return false;
+            }
+
+            struct gpiohandle_request request {};
+            request.lines = 2;
+            request.lineoffsets[0] = 0;   // PYG1_HAT_SW: GPIO -> USB Hub USB4
+            request.lineoffsets[1] = 12;  // PYG13_HAT_EN: HAT 5VOUT enable
+            request.flags = GPIOHANDLE_REQUEST_OUTPUT;
+            request.default_values[0] = 1;
+            request.default_values[1] = 1;
+            std::snprintf(request.consumer_label, sizeof(request.consumer_label), "RFID EXT USB");
+            if (::ioctl(chip_fd, GPIO_GET_LINEHANDLE_IOCTL, &request) != 0) {
+                const std::string why = std::strerror(errno);
+                ::close(chip_fd);
+                ui_message_ = "EXT USB enable failed: " + why;
+                return false;
+            }
+            ::close(chip_fd);
+            ext_usb_gpio_fd_ = request.fd;
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            service_.refresh_endpoints();
+            return true;
+        }
+
+        if (ext_usb_gpio_fd_ >= 0) {
+            struct gpiohandle_data values {};
+            values.values[0] = 0;
+            values.values[1] = 0;
+            (void)::ioctl(ext_usb_gpio_fd_, GPIOHANDLE_SET_LINE_VALUES_IOCTL, &values);
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            ::close(ext_usb_gpio_fd_);
+            ext_usb_gpio_fd_ = -1;
+        }
+#else
+        (void)enabled;
+#endif
+        return true;
+    }
+
+    void sync_ext_usb_power()
+    {
+        const bool want_usb = current_tab_ == Tab::Read &&
+            service_.current_endpoint().kind == nfc_app::TransportKind::UsbSerial;
+        (void)set_ext_usb_power(want_usb);
     }
 
     void start_nfcunit_emu_autostart_async()
@@ -2245,6 +2341,12 @@ private:
 
     void render_all()
     {
+        if (usb_connect_in_progress_) {
+            set_page_title("RFID");
+            render_tabs();
+            render_content();
+            return;
+        }
         update_scan_log();
         cache_serial_device_kind(service_.connection_state());
         if (current_tab_ == Tab::Tools) {
@@ -2693,6 +2795,20 @@ private:
 
     void render_read_tab(lv_obj_t *parent)
     {
+        if (usb_connect_in_progress_) {
+            lv_obj_t *panel = create_panel(parent, 0, 0, 320, CONTENT_H, 0x0A0A0A);
+            create_text(panel, 6, 5, "Detecting USB reader", 0x00D2FF, 12);
+            create_text(panel, 6, 21, to_compact(usb_connect_label_, 50).c_str(), 0x8E8E8E, 10);
+            int y = 39;
+            for (const auto &line : usb_probe_lines_) {
+                const bool ok = line.size() >= 2 && line.substr(line.size() - 2) == " v";
+                create_text_mono(panel, 6, y, to_compact(line, 50).c_str(),
+                                 ok ? 0x00FF88 : 0xD8D8D8, 10);
+                y += 14;
+                if (y > CONTENT_H - 10) break;
+            }
+            return;
+        }
         const auto scan = service_.scan_state();
         const auto endpoint = service_.current_endpoint();
         const auto conn = service_.connection_state();
@@ -3823,6 +3939,7 @@ private:
                 scan_log_lines_.push_back("> UHF scan once...");
                 std::string error;
                 if (service_.start_uhf_scan_once(&error)) {
+                    uhf_inventory_started_ = true;
                     ui_message_ = "UHF scanning...";
                 } else {
                     ui_message_ = error.empty() ? "UHF scan failed" : error;
@@ -3837,6 +3954,7 @@ private:
                 scan_log_lines_.push_back("> UHF inventory start...");
                 std::string error;
                 if (service_.start_uhf_continuous_scan(&error)) {
+                    uhf_inventory_started_ = true;
                     ui_message_ = "Inventory running";
                 } else {
                     ui_message_ = error.empty() ? "Inventory start failed" : error;
@@ -3946,7 +4064,7 @@ private:
 
         const int n = static_cast<int>(usb_select_list_.size());
         const int card_h = 28 + std::max(1, n) * 20;
-        lv_obj_t *card = make_modal_card(overlay, 200, card_h, 0x00D2FF);
+        lv_obj_t *card = make_modal_card(overlay, 304, card_h, 0x00D2FF);
         create_text(card, 8, 5, "Select USB Port", 0x00D2FF, 12);
 
         for (int i = 0; i < n; ++i) {
@@ -3958,7 +4076,7 @@ private:
                 lbl = lbl.substr(pfx.size());
             lv_obj_t *row = lv_obj_create(card);
             lv_obj_remove_style_all(row);
-            lv_obj_set_size(row, 184, 18);
+            lv_obj_set_size(row, 288, 18);
             lv_obj_set_pos(row, 8, 22 + i * 20);
             lv_obj_set_style_bg_color(row, lv_color_hex(sel ? 0x00D2FF : 0x242424), LV_PART_MAIN | LV_STATE_DEFAULT);
             lv_obj_set_style_bg_opa(row, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -3989,7 +4107,8 @@ private:
                 const auto &selected_ep = usb_select_list_[usb_select_idx_];
                 scan_log_lines_.clear();
                 log_scroll_offset_ = 0;
-                scan_log_lines_.push_back("> Connect " + selected_ep.label.substr(0, 22) + "...");
+                usb_connect_label_ = selected_ep.label;
+                usb_probe_lines_.clear();
                 pending_usb_connect_ = true;
                 pending_usb_connect_path_ = selected_ep.path;
                 ui_message_ = "Detecting device...";
@@ -4014,16 +4133,41 @@ private:
             return;
         }
 
-        const bool ok = service_.connect_current();
+        usb_connect_in_progress_ = true;
+        render_all();
+        lv_refr_now(NULL);
+        const bool ok = service_.connect_current([this](const std::string &line) {
+            const size_t marker = line.find(" ...");
+            const std::string prefix = marker == std::string::npos ? line : line.substr(0, marker);
+            if (!usb_probe_lines_.empty() &&
+                usb_probe_lines_.back().rfind(prefix, 0) == 0) {
+                usb_probe_lines_.back() = line;
+            } else {
+                usb_probe_lines_.push_back(line);
+            }
+            render_all();
+            lv_refr_now(NULL);
+        });
+        usb_connect_in_progress_ = false;
         const auto conn2 = service_.connection_state();
         if (!ok) {
+            scan_log_lines_ = usb_probe_lines_;
             scan_log_lines_.push_back("ERR " + compact_read_connection_detail(conn2));
             ui_message_ = "Connect failed";
             return;
         }
 
-        scan_log_lines_.push_back("OK  " + compact_read_connection_detail(conn2));
+        scan_log_lines_.clear();
+        uhf_inventory_started_ = false;
+        service_.clear_uhf_table();
+        uhf_table_rows_.clear();
+        scan_log_lines_.push_back(std::string("Device: ") + nfc_app::to_string(conn2.device_kind));
         scan_log_lines_.push_back(supported_protocols_text());
+        if (conn2.device_kind == nfc_app::DeviceKind::UHFReader) {
+            scan_log_lines_.push_back("S: Start inventory");
+            scan_log_lines_.push_back("P: Stop inventory");
+            scan_log_lines_.push_back("Del: Clear list");
+        }
         ui_message_ = std::string("Connected: ") + nfc_app::to_string(conn2.device_kind);
     }
 

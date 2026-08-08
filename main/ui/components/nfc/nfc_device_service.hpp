@@ -963,7 +963,7 @@ public:
         return true;
     }
 
-    bool connect_current()
+    bool connect_current(const std::function<void(const std::string &)> &probe_progress = {})
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (endpoints_.empty()) return false;
@@ -1002,6 +1002,12 @@ public:
             push_log(line);
             std::this_thread::sleep_for(std::chrono::milliseconds(300));
         };
+        const auto report_probe = [&](const std::string &name, int baud, bool done, bool ok) {
+            if (!probe_progress) return;
+            std::string line = "Checking " + name + " @" + std::to_string(baud) + " ...";
+            if (done) line += ok ? " v" : " x";
+            probe_progress(line);
+        };
         const auto open_at_baud = [this](int baud, std::string *open_error) -> bool {
             if (connection_.endpoint.baud_rate == baud) return true;
             TransportEndpoint ep = connection_.endpoint;
@@ -1013,7 +1019,7 @@ public:
 
         // ====================================================================
         // USB/UART unified probing order:
-        //   PN532 @115200 -> PN532Killer @115200 -> UHF @9600 -> UHF @115200
+        //   UHF @115200 -> PN532/PN532Killer @115200 -> UHF @9600
         // Log each step immediately (paced 300ms) instead of flushing at end.
         // ====================================================================
         if (connection_.endpoint.kind == TransportKind::UartSerial ||
@@ -1032,6 +1038,45 @@ public:
                 return false;
             }
 
+            auto try_uhf = [&](int baud) -> bool {
+                std::string baud_open_error;
+                report_probe("UHF Reader", baud, false, false);
+                paced_log(std::string("Probe UHF Reader @") + std::to_string(baud) +
+                          " (" + transport_name + ")");
+                if (!open_at_baud(baud, &baud_open_error)) {
+                    paced_log(std::string("Probe UHF Reader @") + std::to_string(baud) +
+                              " -> open failed: " + baud_open_error);
+                    report_probe("UHF Reader", baud, true, false);
+                    return false;
+                }
+                std::string uhf_detail;
+                const bool descriptor_is_uhf =
+                    connection_.endpoint.kind == TransportKind::UsbSerial &&
+                    connection_.endpoint.usb_vid == 0x1A86 &&
+                    (connection_.endpoint.usb_pid == 0x55D3 ||
+                     connection_.endpoint.usb_pid == 0xFE1C);
+                if (!uhf_detect_on_open_transport_locked(transport_.get(), &uhf_detail) &&
+                    !descriptor_is_uhf) {
+                    paced_log(std::string("Probe UHF Reader @") + std::to_string(baud) + " -> FAIL");
+                    report_probe("UHF Reader", baud, true, false);
+                    return false;
+                }
+                connection_.device_kind = DeviceKind::UHFReader;
+                connection_.pn532_ready = false;
+                connection_.status = "Connected UHF Reader";
+                if (uhf_detail.empty() && descriptor_is_uhf)
+                    uhf_detail = connection_.endpoint.label;
+                connection_.detail = (uhf_detail.empty()
+                    ? (std::string("UHFReader @ ") + endpoint_path)
+                    : uhf_detail) + " @" + std::to_string(baud);
+                paced_log(std::string("Probe UHF Reader @") + std::to_string(baud) + " -> OK");
+                report_probe("UHF Reader", baud, true, true);
+                return true;
+            };
+
+            if (try_uhf(115200)) return true;
+
+            report_probe("PN532", 115200, false, false);
             paced_log(std::string("Probe PN532 @115200") + " (" + transport_name + ")");
             std::string probe_error;
             std::string firmware;
@@ -1045,10 +1090,13 @@ public:
                 connection_.status = "Connected PN532";
                 connection_.detail = fw_label + " @ " + endpoint_path + " @115200";
                 paced_log("Probe PN532 @115200 -> OK");
+                report_probe("PN532", 115200, true, true);
                 return true;
             }
 
             paced_log("Probe PN532 @115200 -> FAIL");
+            report_probe("PN532", 115200, true, false);
+            report_probe("PN532Killer", 115200, false, false);
             paced_log(std::string("Probe PN532Killer @115200") + " (" + transport_name + ")");
             if (kind == DeviceKind::PN532Killer) {
                 const std::string fw_label = firmware.empty() ? "PN532Killer" : firmware;
@@ -1057,6 +1105,7 @@ public:
                 connection_.status = "Connected PN532Killer";
                 connection_.detail = fw_label + " @ " + endpoint_path + " @115200";
                 paced_log("Probe PN532Killer @115200 -> OK");
+                report_probe("PN532Killer", 115200, true, true);
                 return true;
             }
 
@@ -1066,33 +1115,8 @@ public:
                 paced_log("Probe PN532Killer @115200 -> FAIL");
             }
 
-            auto try_uhf = [&](int baud) -> bool {
-                std::string baud_open_error;
-                paced_log(std::string("Probe UHF Reader @") + std::to_string(baud) +
-                          " (" + transport_name + ")");
-                if (!open_at_baud(baud, &baud_open_error)) {
-                    paced_log(std::string("Probe UHF Reader @") + std::to_string(baud) +
-                              " -> open failed: " + baud_open_error);
-                    return false;
-                }
-                std::string uhf_detail;
-                if (!uhf_detect_on_open_transport_locked(transport_.get(), &uhf_detail)) {
-                    paced_log(std::string("Probe UHF Reader @") + std::to_string(baud) + " -> FAIL");
-                    return false;
-                }
-
-                connection_.device_kind = DeviceKind::UHFReader;
-                connection_.pn532_ready = false;
-                connection_.status = "Connected UHF Reader";
-                connection_.detail = (uhf_detail.empty()
-                    ? (std::string("UHFReader @ ") + endpoint_path)
-                    : uhf_detail) + " @" + std::to_string(baud);
-                paced_log(std::string("Probe UHF Reader @") + std::to_string(baud) + " -> OK");
-                return true;
-            };
-
+            report_probe("PN532Killer", 115200, true, false);
             if (try_uhf(9600)) return true;
-            if (try_uhf(115200)) return true;
 
             // Keep serial connected, but mark as unknown device after full probe order.
             std::string restore_error;
@@ -1519,6 +1543,13 @@ public:
         }
         if (error) error->clear();
         return true;
+    }
+
+    void clear_uhf_table()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        uhf_tags_.clear();
+        uhf_last_csv_path_.clear();
     }
 
     std::vector<ProtocolKind> supported_protocols_for_current_device() const
