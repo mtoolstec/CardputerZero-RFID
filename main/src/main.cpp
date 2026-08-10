@@ -345,6 +345,9 @@ int main(void)
 {
     ::std::signal(SIGINT,  on_signal);
     ::std::signal(SIGTERM, on_signal);
+    // Scan feedback streams PCM to PipeWire.  If the player exits early, a
+    // closed audio pipe must not terminate the RFID app.
+    ::std::signal(SIGPIPE, SIG_IGN);
 
     hal_paths_init(nullptr);
 

@@ -13,6 +13,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstdio>
 #include <dirent.h>
@@ -21,6 +23,7 @@
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -30,6 +33,111 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 #endif
+
+namespace rfid_scan_audio {
+
+static std::atomic<int> pending_beep{0};
+static std::once_flag worker_once;
+
+static void audio_worker()
+{
+#if defined(__linux__)
+    constexpr int sample_rate = 16000;
+    constexpr int block_ms = 10;
+    constexpr int frames_per_block = sample_rate * block_ms / 1000;
+    constexpr int tone_blocks = 3;
+    constexpr int gap_blocks = 2;
+    constexpr int tone_frames = frames_per_block * tone_blocks;
+    constexpr double frequency_hz = 1850.0;
+    constexpr double pi = 3.14159265358979323846;
+
+    for (;;) {
+        int fds[2];
+        if (::pipe(fds) != 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+#ifdef F_SETPIPE_SZ
+        // Keep queued audio short so new tag beeps are heard promptly.
+        (void)::fcntl(fds[1], F_SETPIPE_SZ, 4096);
+#endif
+        const pid_t pid = ::fork();
+        if (pid == 0) {
+            ::dup2(fds[0], STDIN_FILENO);
+            ::close(fds[0]);
+            ::close(fds[1]);
+            ::execlp("pw-play", "pw-play", "--raw", "--format", "s16",
+                     "--rate", "16000", "--channels", "2", "--channel-map", "stereo",
+                     "--latency", "16ms", "--volume", "1.0", "-",
+                     static_cast<char *>(nullptr));
+            _exit(127);
+        }
+        ::close(fds[0]);
+        if (pid < 0) {
+            ::close(fds[1]);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+
+        int tone_left = 0;
+        int gap_left = 0;
+        int tone_pos = 0;
+        bool stream_ok = true;
+        while (stream_ok) {
+            if (tone_left == 0 && gap_left == 0 && pending_beep.exchange(0) > 0) {
+                tone_left = tone_blocks;
+                tone_pos = 0;
+            }
+
+            int16_t samples[frames_per_block * 2] = {};
+            if (tone_left > 0) {
+                for (int i = 0; i < frames_per_block; ++i, ++tone_pos) {
+                    const double edge = std::min(1.0,
+                        std::min(tone_pos / 80.0, (tone_frames - tone_pos - 1) / 80.0));
+                    const int16_t value = static_cast<int16_t>(14000.0 * edge *
+                        std::sin(2.0 * pi * frequency_hz * tone_pos / sample_rate));
+                    samples[i * 2] = value;
+                    samples[i * 2 + 1] = value;
+                }
+                if (--tone_left == 0) gap_left = gap_blocks;
+            } else if (gap_left > 0) {
+                --gap_left;
+            }
+
+            const char *data = reinterpret_cast<const char *>(samples);
+            size_t remaining = sizeof(samples);
+            while (remaining > 0) {
+                const ssize_t written = ::write(fds[1], data, remaining);
+                if (written > 0) {
+                    data += written;
+                    remaining -= static_cast<size_t>(written);
+                } else if (written < 0 && errno == EINTR) {
+                    continue;
+                } else {
+                    stream_ok = false;
+                    break;
+                }
+            }
+        }
+        ::close(fds[1]);
+        (void)::waitpid(pid, nullptr, 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+#endif
+}
+
+static void play_beeps(int count)
+{
+#if defined(__linux__)
+    if (count <= 0) return;
+    pending_beep.store(1); // Coalesce bursts; never build an audio backlog.
+    std::call_once(worker_once, []() { std::thread(audio_worker).detach(); });
+#else
+    (void)count;
+#endif
+}
+
+} // namespace rfid_scan_audio
 
 class UINfcPage : public app_base
 {
@@ -87,6 +195,7 @@ public:
         creat_UI();
         event_handler_init();
         ui_timer_ = lv_timer_create(UINfcPage::ui_timer_cb, 200, this);
+        uhf_beep_timer_ = lv_timer_create(UINfcPage::uhf_beep_timer_cb, 50, this);
         sync_ext_usb_power();
         render_all();
     }
@@ -102,6 +211,7 @@ public:
         }
         service_.disconnect();
         set_ext_usb_power(false);
+        if (uhf_beep_timer_) lv_timer_delete(uhf_beep_timer_);
         if (ui_timer_) lv_timer_delete(ui_timer_);
     }
 
@@ -114,6 +224,7 @@ private:
     int saved_idx_ = 0;
     int tools_idx_ = 0;
     lv_timer_t *ui_timer_ = nullptr;
+    lv_timer_t *uhf_beep_timer_ = nullptr;
     std::string ui_message_ = "Ready";
     Modal modal_          = Modal::None;
     int   modal_idx_      = 0;
@@ -140,6 +251,10 @@ private:
     std::vector<nfc_app::NfcDeviceService::UhfTableRow> uhf_table_rows_;
     int uhf_table_scroll_offset_ = 0;
     bool last_scan_running_ = false;
+    uint64_t last_uhf_read_total_ = 0;
+    uint64_t uhf_rate_window_total_ = 0;
+    uint32_t uhf_rate_window_tick_ = 0;
+    uint32_t uhf_last_activity_tick_ = 0;
     int  app_info_scroll_ = 0;  // AppInfo modal scroll offset (line index)
     // Long-press scroll tracking
     uint32_t held_scroll_key_      = 0;
@@ -328,7 +443,7 @@ private:
 
     int read_uhf_visible_rows() const
     {
-        return 8;
+        return 7;
     }
 
     bool read_uses_uhf_table() const
@@ -650,6 +765,53 @@ private:
             self->last_uart_test_running_ = test_running_now;
         }
         self->render_all();
+    }
+
+    static void uhf_beep_timer_cb(lv_timer_t *timer)
+    {
+        UINfcPage *self = static_cast<UINfcPage *>(lv_timer_get_user_data(timer));
+        if (!self) return;
+
+        const auto rows = self->service_.uhf_table_rows();
+        uint64_t read_total = 0;
+        for (const auto &row : rows) {
+            if (row.read_count > 0) read_total += static_cast<uint64_t>(row.read_count);
+        }
+        const uint32_t now = lv_tick_get();
+        const bool continuous = self->service_.uhf_continuous_scan_running();
+        const bool has_new_reads = read_total > self->last_uhf_read_total_;
+        if (has_new_reads) self->uhf_last_activity_tick_ = now;
+
+        // One UHF inventory round can take about 220 ms plus a 120 ms pacing
+        // delay.  Keep the cadence alive across rounds, then stop promptly once
+        // no new tag reads have arrived for 450 ms.
+        const bool tag_active = continuous && self->uhf_last_activity_tick_ != 0 &&
+            (now - self->uhf_last_activity_tick_ <= 450);
+        if (tag_active || (!continuous && has_new_reads)) {
+            rfid_scan_audio::play_beeps(1);
+        }
+        self->last_uhf_read_total_ = read_total;
+
+        if (!continuous) {
+            self->uhf_last_activity_tick_ = 0;
+            self->uhf_rate_window_tick_ = now;
+            self->uhf_rate_window_total_ = read_total;
+            return;
+        }
+        if (self->uhf_rate_window_tick_ == 0) {
+            self->uhf_rate_window_tick_ = now;
+            self->uhf_rate_window_total_ = read_total;
+            return;
+        }
+        const uint32_t elapsed = now - self->uhf_rate_window_tick_;
+        if (elapsed >= 1000) {
+            const uint64_t delta = read_total >= self->uhf_rate_window_total_
+                ? read_total - self->uhf_rate_window_total_ : read_total;
+            const uint64_t rate = delta * 1000u / elapsed;
+            self->ui_message_ = "UHF inventory: " + std::to_string(rate) + " tags/s";
+            self->uhf_rate_window_tick_ = now;
+            self->uhf_rate_window_total_ = read_total;
+        }
     }
 
     void event_handler(lv_event_t *e)
@@ -2456,7 +2618,9 @@ private:
         const auto scan = service_.scan_state();
         const bool now_running = scan.running;
         if (!now_running && last_scan_running_) {
-            if (!scan.has_result) {
+            if (scan.has_result && !read_uses_uhf_table()) {
+                rfid_scan_audio::play_beeps(1);
+            } else if (!scan.has_result) {
                 scan_log_lines_.push_back(std::string("ERR ") + (scan.error.empty() ? "no tag" : to_compact(scan.error, 52)));
             }
             log_scroll_offset_ = std::max(0, static_cast<int>(scan_log_lines_.size()) - read_log_visible_lines());
@@ -2894,7 +3058,8 @@ private:
 
         // ── Card info header (shown when a result exists) ─────────────────
         int log_y = 20;
-        int log_h = 100;
+        // UHF reserves the bottom 14 px for the live inventory-rate footer.
+        int log_h = use_uhf_table ? 86 : 100;
         if (scan.has_result && !use_uhf_table) {
             const auto &tag = record.tag;
             auto find_identity_ci = [&](const char *key) -> std::string {
@@ -3038,7 +3203,9 @@ private:
                 }
             }
         }
-        // No footer — log lines already show status
+        if (use_uhf_table) {
+            create_footer(parent, ui_message_);
+        }
     }
 
     void render_saved_tab(lv_obj_t *parent)
@@ -6236,6 +6403,7 @@ private:
             if (key == KEY_S) {
                 std::string scanned_uid, scan_err, scanned_type;
                 if (service_.scan_uid_once(&scanned_uid, &scan_err, &scanned_type)) {
+                    rfid_scan_audio::play_beeps(1);
                     uid_changer_uid_input_ = uid_changer_normalize_hex(scanned_uid, 14);
                     if (uid_changer_uid_input_.size() == 8)  uid_changer_uid_len_idx_ = 0;
                     else if (uid_changer_uid_input_.size() == 14) uid_changer_uid_len_idx_ = 1;
