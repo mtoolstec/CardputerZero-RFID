@@ -1147,10 +1147,10 @@ public:
 
                 // First I2C connect: force a short Grove power-cycle to recover
                 // from stale peripheral state after previous EMU/reader mode.
-                NfcTransportFactory::grove_gpio_enable_bcm(17, false);
+                NfcTransportFactory::set_grove_5v(false);
                 std::this_thread::sleep_for(std::chrono::milliseconds(150));
                 NfcTransportFactory::grove_gpio_enable_bcm(4, true);
-                NfcTransportFactory::grove_gpio_enable_bcm(17, true);
+                NfcTransportFactory::set_grove_5v(true);
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
                 i2c_device_ = std::make_unique<I2cGroveNfcDevice>();
@@ -4020,10 +4020,10 @@ private:
             return false;
         }
 
-        NfcTransportFactory::grove_gpio_enable_bcm(17, false);
+        NfcTransportFactory::set_grove_5v(false);
         std::this_thread::sleep_for(std::chrono::milliseconds(80));
         NfcTransportFactory::grove_gpio_enable_bcm(4, true);
-        NfcTransportFactory::grove_gpio_enable_bcm(17, true);
+        NfcTransportFactory::set_grove_5v(true);
         std::this_thread::sleep_for(std::chrono::milliseconds(260));
 
         auto new_device = std::make_unique<I2cGroveNfcDevice>();
@@ -4075,10 +4075,10 @@ private:
         }
 
         // Equivalent to unplug/replug: power-cycle Grove 5V and keep mux in I2C mode.
-        NfcTransportFactory::grove_gpio_enable_bcm(17, false);
+        NfcTransportFactory::set_grove_5v(false);
         std::this_thread::sleep_for(std::chrono::milliseconds(150));
         NfcTransportFactory::grove_gpio_enable_bcm(4, true);
-        NfcTransportFactory::grove_gpio_enable_bcm(17, true);
+        NfcTransportFactory::set_grove_5v(true);
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
         i2c_device_ = std::make_unique<I2cGroveNfcDevice>();
@@ -5138,10 +5138,10 @@ private:
 
     static bool is_accepted_uhf_inventory_epc(const std::string &epc)
     {
+        if (epc.size() > 96) return false;
         if (!looks_like_epc(epc)) return false;
         const std::string up = to_upper_ascii(epc);
-        // Keep mtools baseline acceptance (E2*) while dropping known ghost EPC prefix.
-        if (up.rfind("E2", 0) != 0) return false;
+        // Some readers emit this placeholder when no real tag was inventoried.
         if (up.rfind("E280690000", 0) == 0) return false;
         return true;
     }
@@ -5529,8 +5529,45 @@ private:
             if (i + frame_len > raw.size()) break;
             if (raw[i + frame_len - 1] == 0x7E && len > 0) {
                 const size_t payload_start = i + 5;
-                parse_one(std::vector<uint8_t>(raw.begin() + payload_start,
-                                               raw.begin() + payload_start + len));
+                const std::vector<uint8_t> payload(raw.begin() + payload_start,
+                                                   raw.begin() + payload_start + len);
+
+                // Binary inventory reports commonly contain [RSSI][PC][EPC][CRC]
+                // or [PC][EPC][CRC]. PC bits 15..11 carry the EPC word count.
+                auto try_bb_layout = [&](size_t pc_offset) -> bool {
+                    if (pc_offset + 2 > payload.size()) return false;
+                    const uint16_t pc = static_cast<uint16_t>(
+                        (static_cast<uint16_t>(payload[pc_offset]) << 8) |
+                        payload[pc_offset + 1]);
+                    const size_t epc_len = static_cast<size_t>((pc >> 11) & 0x1F) * 2;
+                    const size_t epc_offset = pc_offset + 2;
+                    if (epc_len == 0 || epc_offset + epc_len > payload.size()) return false;
+
+                    UhfTagSnapshot row;
+                    row.epc = keep_hex_chars_upper(
+                        bytes_to_hex_string(payload.data() + epc_offset, epc_len));
+                    if (!is_accepted_uhf_inventory_epc(row.epc)) return false;
+
+                    char pc_buf[8];
+                    std::snprintf(pc_buf, sizeof(pc_buf), "%04X", pc);
+                    row.pc = pc_buf;
+                    if (pc_offset > 0) {
+                        row.rssi = std::to_string(static_cast<int>(
+                            static_cast<int8_t>(payload[0])));
+                    }
+                    if (epc_offset + epc_len + 2 <= payload.size()) {
+                        row.crc = keep_hex_chars_upper(bytes_to_hex_string(
+                            payload.data() + epc_offset + epc_len, 2));
+                    }
+                    row.raw_hex = bytes_to_hex_string(payload.data(), payload.size(), 64);
+                    row.read_count = 1;
+                    out.push_back(row);
+                    return true;
+                };
+
+                if (!try_bb_layout(1) && !try_bb_layout(0)) {
+                    parse_one(payload);
+                }
             }
             i += frame_len;
         }

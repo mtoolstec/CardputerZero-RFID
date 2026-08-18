@@ -157,6 +157,11 @@ public:
         if (error) *error = "serial transport unsupported on Windows in v1";
         return false;
 #else
+        if ((endpoint.path == "/dev/ttyS0" || endpoint.path == "/dev/serial0") &&
+            !configure_cardputer_top_uart(error)) {
+            return false;
+        }
+
         // Open with O_NONBLOCK so open() doesn't hang waiting for DCD/carrier
         // (CH340 and similar USB-serial chips never assert DCD).
         // After open we clear O_NONBLOCK via fcntl so that write() blocks until
@@ -364,6 +369,27 @@ public:
 
 private:
 #ifndef _WIN32
+    static bool configure_cardputer_top_uart(std::string *error)
+    {
+#if defined(__linux__)
+        if (::access("/usr/bin/pinctrl", X_OK) != 0) {
+            if (error) *error = "pinctrl not found; cannot configure top UART pins";
+            return false;
+        }
+        const int rc = std::system(
+            "/usr/bin/pinctrl set 14 a5 >/dev/null 2>&1 && "
+            "/usr/bin/pinctrl set 15 a5 >/dev/null 2>&1");
+        if (rc != 0) {
+            if (error) *error = "failed to configure GPIO14/GPIO15 for top UART";
+            return false;
+        }
+        ::usleep(20000);
+#else
+        (void)error;
+#endif
+        return true;
+    }
+
     static speed_t baud_to_constant(int baud)
     {
         switch (baud) {
@@ -518,9 +544,8 @@ public:
     {
         std::vector<TransportEndpoint> result;
 #if defined(__linux__)
-        // ── Enable Grove 5V power via GROVE_EN (BCM17 = AW35112FDR load switch) ──
-        // G17 (BCM17) HIGH = GROVE power on.
-        grove_gpio_enable_bcm(17, true);
+        // Enable the dedicated Grove 5V rail exposed by the device-tree LED.
+        set_grove_5v(true);
 
         // ── Switch GROVE mux to I2C1 mode (BCM4 = G4 = FSW7227 SEL pin) ──
         // From schematic: SEL=L → UART, SEL=H → I2C1.
@@ -606,6 +631,21 @@ public:
         return result;
     }
 
+    static bool set_ext_5v(bool enabled)
+    {
+        return set_power_rail("/sys/class/leds/ext_5v_out/brightness", enabled);
+    }
+
+    static bool set_ext_usb_route(bool enabled)
+    {
+        return set_power_rail("/sys/class/leds/ext_usb_gpio_fun/brightness", enabled);
+    }
+
+    static bool set_grove_5v(bool enabled)
+    {
+        return set_power_rail("/sys/class/leds/grove_5v_out/brightness", enabled);
+    }
+
     // ── Grove GPIO helpers ────────────────────────────────────────────────────
     // Find the sysfs base of the gpiochip whose label matches `chip_label`.
     // Returns -1 if not found.
@@ -643,8 +683,7 @@ public:
     }
 
     // Drive a BCM GPIO pin via sysfs, auto-detecting the gpiochip base.
-    // CardputerZero: GROVE_EN=BCM17, active-HIGH (FSW7227 load switch).
-    // Silently ignores errors so probe_i2c_devices() never throws.
+    // BCM4 selects the Grove UART/I2C mux; power is controlled separately above.
     static void grove_gpio_enable_bcm(int bcm_pin, bool high)
     {
 #if defined(__linux__)
@@ -695,6 +734,20 @@ public:
     }
 
 private:
+    static bool set_power_rail(const char *path, bool enabled)
+    {
+#if defined(__linux__)
+        FILE *f = fopen(path, "w");
+        if (!f) return false;
+        const bool wrote = std::fputc(enabled ? '1' : '0', f) != EOF;
+        return fclose(f) == 0 && wrote;
+#else
+        (void)path;
+        (void)enabled;
+        return true;
+#endif
+    }
+
     static bool starts_with(const std::string &value, const std::string &prefix)
     {
         return value.size() >= prefix.size() && value.compare(0, prefix.size(), prefix) == 0;

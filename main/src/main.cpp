@@ -351,9 +351,15 @@ int main(void)
 
     hal_paths_init(nullptr);
 
-    // Enable Grove 5V power for external modules (UHF reader, etc.)
-    ::nfc_app::NfcTransportFactory::grove_gpio_enable_bcm(17, true);
-    usleep(200000);
+    // Power both expansion connectors before endpoint discovery starts.
+    const bool ext_power = ::nfc_app::NfcTransportFactory::set_ext_5v(true);
+    const bool ext_usb_route = ::nfc_app::NfcTransportFactory::set_ext_usb_route(true);
+    const bool grove_power = ::nfc_app::NfcTransportFactory::set_grove_5v(true);
+    std::printf("[RFID] Expansion power: top=%s usb-route=%s grove=%s\n",
+                ext_power ? "on" : "failed", ext_usb_route ? "on" : "failed",
+                grove_power ? "on" : "failed");
+    std::fflush(stdout);
+    usleep(500000);
 
     // Reset framebuffer to prevent black screen on re-entry
     {
@@ -382,7 +388,8 @@ int main(void)
     delete nfc_page;
     lv_deinit();
 
-    // Disable Grove 5V power on exit
-    ::nfc_app::NfcTransportFactory::grove_gpio_enable_bcm(17, false);
+    ::nfc_app::NfcTransportFactory::set_ext_usb_route(false);
+    ::nfc_app::NfcTransportFactory::set_ext_5v(false);
+    ::nfc_app::NfcTransportFactory::set_grove_5v(false);
     return 0;
 }

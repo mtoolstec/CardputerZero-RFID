@@ -29,8 +29,6 @@
 #include <vector>
 #if defined(__linux__)
 #include <fcntl.h>
-#include <linux/gpio.h>
-#include <sys/ioctl.h>
 #include <unistd.h>
 #endif
 
@@ -311,7 +309,7 @@ private:
     std::string usb_connect_label_;
     std::vector<std::string> usb_probe_lines_;
     bool uhf_inventory_started_ = false;
-    int ext_usb_gpio_fd_ = -1;
+    bool ext_usb_enabled_ = false;
     uint32_t nfc_automation_last_tick_ = 0;
     static constexpr const char *kNfcAutomationCmdPath = "/tmp/applaunch_nfc_automation.cmd";
     static constexpr const char *kNfcAutomationStatusPath = "/tmp/applaunch_nfc_automation.status";
@@ -1416,7 +1414,7 @@ private:
         int tab_index = static_cast<int>(current_tab_);
         tab_index = (tab_index + delta + 4) % 4;
         current_tab_ = static_cast<Tab>(tab_index);
-        if (prev_tab == Tab::Read && current_tab_ != Tab::Read && ext_usb_gpio_fd_ >= 0) {
+        if (prev_tab == Tab::Read && current_tab_ != Tab::Read && ext_usb_enabled_) {
             if (service_.uhf_continuous_scan_running()) {
                 std::string ignored;
                 (void)service_.stop_uhf_continuous_scan(&ignored);
@@ -1503,55 +1501,24 @@ private:
     {
 #if defined(__linux__)
         if (enabled) {
-            if (ext_usb_gpio_fd_ >= 0) return true;
-
-            int chip_fd = -1;
-            for (int i = 0; i < 16; ++i) {
-                const std::string path = "/dev/gpiochip" + std::to_string(i);
-                const int candidate = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-                if (candidate < 0) continue;
-                struct gpiochip_info info {};
-                if (::ioctl(candidate, GPIO_GET_CHIPINFO_IOCTL, &info) == 0 &&
-                    std::string(info.label) == "m5ioe1") {
-                    chip_fd = candidate;
-                    break;
-                }
-                ::close(candidate);
-            }
-            if (chip_fd < 0) {
-                ui_message_ = "EXT USB: M5IOE1 not found";
+            if (ext_usb_enabled_) return true;
+            const bool power_ok = nfc_app::NfcTransportFactory::set_ext_5v(true);
+            const bool route_ok = nfc_app::NfcTransportFactory::set_ext_usb_route(true);
+            if (!power_ok || !route_ok) {
+                ui_message_ = "EXT USB enable failed";
                 return false;
             }
-
-            struct gpiohandle_request request {};
-            request.lines = 2;
-            request.lineoffsets[0] = 0;   // PYG1_HAT_SW: GPIO -> USB Hub USB4
-            request.lineoffsets[1] = 12;  // PYG13_HAT_EN: HAT 5VOUT enable
-            request.flags = GPIOHANDLE_REQUEST_OUTPUT;
-            request.default_values[0] = 1;
-            request.default_values[1] = 1;
-            std::snprintf(request.consumer_label, sizeof(request.consumer_label), "RFID EXT USB");
-            if (::ioctl(chip_fd, GPIO_GET_LINEHANDLE_IOCTL, &request) != 0) {
-                const std::string why = std::strerror(errno);
-                ::close(chip_fd);
-                ui_message_ = "EXT USB enable failed: " + why;
-                return false;
-            }
-            ::close(chip_fd);
-            ext_usb_gpio_fd_ = request.fd;
-            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            ext_usb_enabled_ = true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
             service_.refresh_endpoints();
             return true;
         }
 
-        if (ext_usb_gpio_fd_ >= 0) {
-            struct gpiohandle_data values {};
-            values.values[0] = 0;
-            values.values[1] = 0;
-            (void)::ioctl(ext_usb_gpio_fd_, GPIOHANDLE_SET_LINE_VALUES_IOCTL, &values);
+        if (ext_usb_enabled_) {
+            (void)nfc_app::NfcTransportFactory::set_ext_usb_route(false);
             std::this_thread::sleep_for(std::chrono::milliseconds(30));
-            ::close(ext_usb_gpio_fd_);
-            ext_usb_gpio_fd_ = -1;
+            (void)nfc_app::NfcTransportFactory::set_ext_5v(false);
+            ext_usb_enabled_ = false;
         }
 #else
         (void)enabled;
@@ -1561,8 +1528,7 @@ private:
 
     void sync_ext_usb_power()
     {
-        const bool want_usb = current_tab_ == Tab::Read &&
-            service_.current_endpoint().kind == nfc_app::TransportKind::UsbSerial;
+        const bool want_usb = current_tab_ == Tab::Read;
         (void)set_ext_usb_power(want_usb);
     }
 
