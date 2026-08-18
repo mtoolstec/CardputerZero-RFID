@@ -864,37 +864,13 @@ private:
            }
        }
 
-        // NFC Unit EMU transport controls are global within the Emulator tab.
-        // The action popup used to consume P/S before the normal shortcut
-        // switch, leaving the listener running with no visible feedback.
+        // Keep the Space start/pause toggle available while the emulator action
+        // popup is open instead of letting the modal consume it.
         if (current_tab_ == Tab::Emulator &&
-            (modal_ == Modal::None || modal_ == Modal::EmulatorAction) &&
-            (raw_key == KEY_P || raw_key == KEY_S)) {
-            const auto conn = service_.connection_state();
-            cache_serial_device_kind(conn);
-            const auto endpoint = active_endpoint_for_ui(conn);
-            const auto kind = effective_emu_device_kind(conn);
-            if (kind == nfc_app::DeviceKind::NFCUnit ||
-                endpoint.kind == nfc_app::TransportKind::I2cBus) {
+            modal_ == Modal::EmulatorAction && raw_key == KEY_SPACE) {
+            if (toggle_emulation_shortcut()) {
                 modal_ = Modal::None;
                 modal_idx_ = 0;
-                if (raw_key == KEY_P) {
-                    const bool ok = service_.grovenfc_deactivate();
-                    {
-                        std::lock_guard<std::mutex> lock(nfcunit_emu_autostart_mutex_);
-                        nfcunit_emu_autostart_running_ = false;
-                        nfcunit_emu_autostart_result_consumed_ = true;
-                    }
-                    ui_message_ = ok ? "Emulation Stopped"
-                                     : "NFC Unit stop failed";
-                    std::fprintf(stderr, "[NFC-KEY] P pause ok=%d\n", ok ? 1 : 0);
-                } else {
-                    (void)service_.grovenfc_deactivate();
-                    start_nfcunit_emu_autostart_async();
-                    ui_message_ = "Start Emulating NTAG";
-                    std::fprintf(stderr, "[NFC-KEY] S restart queued\n");
-                }
-                std::fflush(stderr);
                 render_all();
                 return;
             }
@@ -1127,8 +1103,8 @@ private:
         case KEY_ENTER:
             activate();
             break;
-        case KEY_DELETE:
-            // DEL key on READ tab: clear log and UHF table
+        case KEY_BACKSPACE:
+            // Backspace on READ tab: clear log and UHF table.
             if (current_tab_ == Tab::Read) {
                 if (read_uses_uhf_table()) {
                     service_.clear_uhf_table();
@@ -1147,88 +1123,13 @@ private:
                 render_all();
             }
             break;
-        case KEY_S:
-            // UHF: start inventory in READ tab
+        case KEY_SPACE:
             if (current_tab_ == Tab::Read) {
-                const auto _conn = service_.connection_state();
-                if (_conn.connected && _conn.device_kind == nfc_app::DeviceKind::UHFReader) {
-                    std::string _err;
-                    if (!service_.uhf_continuous_scan_running()) {
-                        if (service_.start_uhf_continuous_scan(&_err)) {
-                            uhf_inventory_started_ = true;
-                            scan_log_lines_.push_back("> Start inventory...");
-                            ui_message_ = "Inventory running";
-                        } else {
-                            ui_message_ = _err.empty() ? "Inventory start failed" : _err;
-                        }
-                    }
-                    render_all();
-                    return;
-                }
+                toggle_read_scan_shortcut();
+            } else if (current_tab_ == Tab::Emulator) {
+                toggle_emulation_shortcut();
             }
-            if (current_tab_ == Tab::Emulator) {
-                const auto conn = service_.connection_state();
-                cache_serial_device_kind(conn);
-                const auto endpoint = active_endpoint_for_ui(conn);
-                const auto emu_device_kind = effective_emu_device_kind(conn);
-                const bool st25r_mode =
-                    (emu_device_kind == nfc_app::DeviceKind::ST25RNFC) ||
-                    (endpoint.kind == nfc_app::TransportKind::SpiBus && conn.connected);
-                if (emu_device_kind == nfc_app::DeviceKind::PN532) {
-                    std::string err;
-                    if (service_.pn532_ndef_state().running) {
-                        ui_message_ = "PN532 NDEF already running";
-                    } else if (service_.start_pn532_ndef_emulation(pn532_ndef_uri_, &err)) {
-                        ui_message_ = "PN532 NDEF emulation running";
-                    } else {
-                        ui_message_ = err.empty() ? "NDEF start failed" : err;
-                    }
-                    render_all();
-                } else if (emu_device_kind == nfc_app::DeviceKind::GroveNFC) {
-                    const auto protocol = service_.current_emulator_protocol();
-                    // Before activating, reload I2C emulator dump from JSON so
-                    // the hardware emulates the data actually shown on screen.
-                    service_.i2c_emulator_dump_lines(protocol);  // triggers JSON→cache load
-                    service_.reload_i2c_profile_from_cache(protocol);
-
-                    std::string emuErr;
-                    if (service_.grovenfc_activate(protocol, 0, &emuErr)) {
-                        scan_log_lines_.push_back(std::string("> GroveNFC EMU: ") + nfc_app::to_string(protocol) + " started");
-                        ui_message_ = "GroveNFC emulation started";
-                    } else {
-                        scan_log_lines_.push_back(std::string("ERR GroveNFC EMU: ") + (emuErr.empty() ? "activate failed" : emuErr));
-                        scan_log_lines_.push_back(std::string("  proto=") + nfc_app::to_string(protocol));
-                        ui_message_ = emuErr.empty() ? "GroveNFC start failed" : emuErr;
-                    }
-                    render_all();
-                } else if (endpoint.kind == nfc_app::TransportKind::I2cBus || emu_device_kind == nfc_app::DeviceKind::NFCUnit) {
-                    // S is explicit restart: stop the listener first, then
-                    // start the selected profile again.
-                    (void)service_.grovenfc_deactivate();
-                    {
-                        std::lock_guard<std::mutex> lock(nfcunit_emu_autostart_mutex_);
-                        nfcunit_emu_autostart_running_ = false;
-                        nfcunit_emu_autostart_result_consumed_ = true;
-                    }
-                    start_nfcunit_emu_autostart_async();
-                    ui_message_ = "Start Emulating NTAG";
-                    render_all();
-                } else if (st25r_mode) {
-                    if (service_.spi_listener_active()) {
-                        ui_message_ = "SPI ST25R already running";
-                    } else {
-                        std::string emu_err;
-                        const bool ok = service_.spi_start_current_profile(&emu_err);
-                        ui_message_ = ok
-                            ? ("SPI ST25R " + service_.spi_profile_label() + " emulating...")
-                            : ("SPI start failed: " + emu_err);
-                    }
-                    render_all();
-                }
-            } else if (current_tab_ == Tab::Read) {
-                trigger_read_scan_shortcut();
-                render_all();
-            }
+            render_all();
             break;
         case KEY_R:
             // Keep R as an alias for scan.
@@ -1249,49 +1150,6 @@ private:
                     } else {
                         ui_message_ = "Dump start failed";
                     }
-                }
-                render_all();
-            }
-            break;
-        case KEY_P:
-            if (current_tab_ == Tab::Emulator) {
-                const auto conn = service_.connection_state();
-                cache_serial_device_kind(conn);
-                const auto endpoint = active_endpoint_for_ui(conn);
-                const auto emu_device_kind = effective_emu_device_kind(conn);
-                const bool st25r_mode =
-                    (emu_device_kind == nfc_app::DeviceKind::ST25RNFC) ||
-                    (endpoint.kind == nfc_app::TransportKind::SpiBus && conn.connected);
-                if (emu_device_kind == nfc_app::DeviceKind::PN532) {
-                    service_.stop_pn532_ndef_emulation();
-                    ui_message_ = "PN532 NDEF emulation stopped";
-                    render_all();
-                } else if (endpoint.kind == nfc_app::TransportKind::I2cBus || emu_device_kind == nfc_app::DeviceKind::NFCUnit) {
-                    (void)service_.grovenfc_deactivate();
-                    {
-                        std::lock_guard<std::mutex> lock(nfcunit_emu_autostart_mutex_);
-                        nfcunit_emu_autostart_running_ = false;
-                        nfcunit_emu_autostart_result_consumed_ = true;
-                    }
-                    ui_message_ = "Emulation Stopped";
-                    render_all();
-                } else if (st25r_mode) {
-                    service_.spi_stop_listener();
-                    ui_message_ = "SPI ST25R emulation stopped";
-                    render_all();
-                }
-            } else if (current_tab_ == Tab::Read) {
-                const auto conn_state = service_.connection_state();
-                if (conn_state.connected && conn_state.device_kind == nfc_app::DeviceKind::UHFReader) {
-                    std::string error;
-                    if (service_.stop_uhf_continuous_scan(&error)) {
-                        scan_log_lines_.push_back("> Inventory stopped");
-                        ui_message_ = "Inventory stopped";
-                    } else {
-                        ui_message_ = error.empty() ? "UHF stop failed" : error;
-                    }
-                } else {
-                    ui_message_ = "P: stop inventory";
                 }
                 render_all();
             }
@@ -1320,6 +1178,116 @@ private:
         case KEY_C: return KEY_RIGHT;
         default: return key;
         }
+    }
+
+    void toggle_read_scan_shortcut()
+    {
+        const auto connection = service_.connection_state();
+        if (connection.connected && connection.device_kind == nfc_app::DeviceKind::UHFReader &&
+            service_.uhf_continuous_scan_running()) {
+            std::string error;
+            if (service_.stop_uhf_continuous_scan(&error)) {
+                scan_log_lines_.push_back("> Inventory paused");
+                ui_message_ = "Inventory paused";
+            } else {
+                ui_message_ = error.empty() ? "UHF pause failed" : error;
+            }
+            return;
+        }
+
+        const auto scan = service_.scan_state();
+        if (scan.running) {
+            ui_message_ = service_.is_current_device_uhf() ? "Inventory running" : "Scanning...";
+            return;
+        }
+
+        trigger_read_scan_shortcut();
+        if (service_.is_current_device_uhf() && service_.uhf_continuous_scan_running()) {
+            uhf_inventory_started_ = true;
+        }
+    }
+
+    bool toggle_emulation_shortcut()
+    {
+        const auto connection = service_.connection_state();
+        cache_serial_device_kind(connection);
+        const auto endpoint = active_endpoint_for_ui(connection);
+        const auto device_kind = effective_emu_device_kind(connection);
+        const bool st25r_mode =
+            device_kind == nfc_app::DeviceKind::ST25RNFC ||
+            (endpoint.kind == nfc_app::TransportKind::SpiBus && connection.connected);
+
+        if (device_kind == nfc_app::DeviceKind::PN532) {
+            if (service_.pn532_ndef_state().running) {
+                service_.stop_pn532_ndef_emulation();
+                ui_message_ = "PN532 NDEF emulation paused";
+            } else {
+                std::string error;
+                if (service_.start_pn532_ndef_emulation(pn532_ndef_uri_, &error)) {
+                    ui_message_ = "PN532 NDEF emulation running";
+                } else {
+                    ui_message_ = error.empty() ? "NDEF start failed" : error;
+                }
+            }
+            return true;
+        }
+
+        if (device_kind == nfc_app::DeviceKind::GroveNFC) {
+            if (service_.nfcunit_emulation_running()) {
+                const bool ok = service_.grovenfc_deactivate();
+                ui_message_ = ok ? "GroveNFC emulation paused" : "GroveNFC pause failed";
+                return true;
+            }
+
+            const auto protocol = service_.current_emulator_protocol();
+            service_.i2c_emulator_dump_lines(protocol);
+            service_.reload_i2c_profile_from_cache(protocol);
+            std::string error;
+            if (service_.grovenfc_activate(protocol, 0, &error)) {
+                scan_log_lines_.push_back(std::string("> GroveNFC EMU: ") +
+                                          nfc_app::to_string(protocol) + " started");
+                ui_message_ = "GroveNFC emulation running";
+            } else {
+                scan_log_lines_.push_back(std::string("ERR GroveNFC EMU: ") +
+                                          (error.empty() ? "activate failed" : error));
+                ui_message_ = error.empty() ? "GroveNFC start failed" : error;
+            }
+            return true;
+        }
+
+        if (endpoint.kind == nfc_app::TransportKind::I2cBus ||
+            device_kind == nfc_app::DeviceKind::NFCUnit) {
+            const bool starting = service_.nfcunit_emu_start_state().running ||
+                                  nfcunit_emu_autostart_running_;
+            if (service_.nfcunit_emulation_running() || starting) {
+                const bool ok = service_.grovenfc_deactivate();
+                {
+                    std::lock_guard<std::mutex> lock(nfcunit_emu_autostart_mutex_);
+                    nfcunit_emu_autostart_running_ = false;
+                    nfcunit_emu_autostart_result_consumed_ = true;
+                }
+                ui_message_ = ok ? "Emulation paused" : "NFC Unit pause failed";
+            } else {
+                start_nfcunit_emu_autostart_async();
+                ui_message_ = "Starting emulation";
+            }
+            return true;
+        }
+
+        if (st25r_mode) {
+            if (service_.spi_listener_active()) {
+                service_.spi_stop_listener();
+                ui_message_ = "SPI ST25R emulation paused";
+            } else {
+                std::string error;
+                const bool ok = service_.spi_start_current_profile(&error);
+                ui_message_ = ok
+                    ? ("SPI ST25R " + service_.spi_profile_label() + " emulating...")
+                    : ("SPI start failed: " + error);
+            }
+            return true;
+        }
+        return false;
     }
 
     void trigger_read_scan_shortcut()
@@ -3085,7 +3053,7 @@ private:
 
             if (total_rows == 0) {
                 create_text(detail, 4, 24,
-                            scan.running ? "Scanning UHF tags..." : "No UHF tag yet (S:Scan / P:Stop)",
+                            scan.running ? "Scanning UHF tags..." : "No UHF tag yet (Space: Start/Pause)",
                             0x9E9E9E, 10);
             } else {
                 for (int row = 0; row < visible_rows; ++row) {
@@ -3121,7 +3089,7 @@ private:
                         conn.connected ? "Ready" : "Device not connected",
                         0x9E9E9E, 11);
             create_text(detail, 4, 28, "OK: Menu", 0xF7A600, 10);
-            create_text(detail, 4, 42, "Tab: mode  S: scan  P: stop", 0xD8D8D8, 10);
+            create_text(detail, 4, 42, "Tab: mode  Space: start/pause", 0xD8D8D8, 10);
 
             if (conn.connected) {
                 create_text_mono(detail, 4, 56, supported_protocols_text().c_str(), 0x8DB6FF, 7);
@@ -3336,7 +3304,7 @@ private:
             create_text(left, 6, 4,  "NDEF EMU", 0x00D2FF, 12);
             create_text(left, 6, 22, ndef.running ? "Running" : "Stopped",
                         ndef.running ? 0x00FF88 : 0x9E9E9E, 11);
-            create_text(left, 6, 40, "S:start P:stop", 0xF7A600, 10);
+            create_text(left, 6, 40, "Space: toggle", 0xF7A600, 10);
             create_text(left, 6, 54, "OK:edit URI", 0x9E9E9E, 10);
 
             create_text(right, 6, 4,  "PN532 Type4 NDEF", 0x8E8E8E, 11);
@@ -3345,7 +3313,7 @@ private:
             if (!ndef.error.empty()) {
                 create_text(right, 6, 50, to_compact(std::string("ERR: ") + ndef.error, 44).c_str(), 0xFF8888, 10);
             }
-            create_text(right, 6, 76, "Quick key: S/P, OK edits URI", 0x555555, 10);
+            create_text(right, 6, 76, "Space toggles, OK edits URI", 0x555555, 10);
         } else if (emu_device_kind == nfc_app::DeviceKind::GroveNFC ||
                emu_device_kind == nfc_app::DeviceKind::NFCUnit ||
                emu_device_kind == nfc_app::DeviceKind::ST25RNFC ||
@@ -3973,7 +3941,7 @@ private:
                 scan_log_lines_.push_back("OK  " + compact_read_connection_detail(conn2));
                 scan_log_lines_.push_back(supported_protocols_text());
                 if (service_.is_current_device_uhf()) {
-                    scan_log_lines_.push_back("Shortcuts: S:start inventory  P:stop  Del:clear");
+                    scan_log_lines_.push_back("Keys: Space=start/pause  Bsp=clear");
                 }
                 ui_message_ = std::string("Connected: ") + nfc_app::to_string(conn2.device_kind);
                 modal_ = Modal::None;
@@ -4045,13 +4013,13 @@ private:
                     scan_log_lines_.push_back("OK  " + compact_read_connection_detail(conn2));
                     scan_log_lines_.push_back(supported_protocols_text());
                 if (service_.is_current_device_uhf()) {
-                    scan_log_lines_.push_back("Shortcuts: S:start inventory  P:stop  Del:clear");
+                    scan_log_lines_.push_back("Keys: Space=start/pause  Bsp=clear");
                 }
                 } else {
                     scan_log_lines_.push_back("OK  " + compact_read_connection_detail(conn));
                     scan_log_lines_.push_back(supported_protocols_text());
                 if (service_.is_current_device_uhf()) {
-                    scan_log_lines_.push_back("Shortcuts: S:start inventory  P:stop  Del:clear");
+                    scan_log_lines_.push_back("Keys: Space=start/pause  Bsp=clear");
                 }
                 }
 
@@ -4297,9 +4265,8 @@ private:
         scan_log_lines_.push_back(std::string("Device: ") + nfc_app::to_string(conn2.device_kind));
         scan_log_lines_.push_back(supported_protocols_text());
         if (conn2.device_kind == nfc_app::DeviceKind::UHFReader) {
-            scan_log_lines_.push_back("S: Start inventory");
-            scan_log_lines_.push_back("P: Stop inventory");
-            scan_log_lines_.push_back("Del: Clear list");
+            scan_log_lines_.push_back("Space: Start/pause inventory");
+            scan_log_lines_.push_back("Backspace: Clear list");
         }
         ui_message_ = std::string("Connected: ") + nfc_app::to_string(conn2.device_kind);
     }
@@ -4370,7 +4337,7 @@ private:
                     scan_log_lines_.push_back("OK  " + compact_read_connection_detail(conn2));
                     scan_log_lines_.push_back(supported_protocols_text());
                 if (service_.is_current_device_uhf()) {
-                    scan_log_lines_.push_back("Shortcuts: S:start inventory  P:stop  Del:clear");
+                    scan_log_lines_.push_back("Keys: Space=start/pause  Bsp=clear");
                 }
                     ui_message_ = std::string("Connected: ") + nfc_app::to_string(conn2.device_kind);
                 }
@@ -4450,7 +4417,7 @@ private:
                     scan_log_lines_.push_back("OK  " + compact_read_connection_detail(conn2));
                     scan_log_lines_.push_back(supported_protocols_text());
                 if (service_.is_current_device_uhf()) {
-                    scan_log_lines_.push_back("Shortcuts: S:start inventory  P:stop  Del:clear");
+                    scan_log_lines_.push_back("Keys: Space=start/pause  Bsp=clear");
                 }
                     ui_message_ = std::string("Connected: ") + nfc_app::to_string(conn2.device_kind);
                 }
@@ -4535,7 +4502,7 @@ private:
             hex_log_scroll_ = std::max(0, hex_log_scroll_ - 1);
         } else if (key == KEY_DOWN) {
             hex_log_scroll_ = std::min(max_off, hex_log_scroll_ + 1);
-        } else if (key == KEY_DELETE || key == 127 /* LV_KEY_DEL */) {
+        } else if (key == KEY_BACKSPACE) {
             // Clear in-memory log lines
             nfc_app::NfcHexLog::get().clear();
             hex_log_scroll_ = 0;
@@ -4599,7 +4566,7 @@ private:
         lv_obj_set_style_bg_opa(footer, 255, LV_PART_MAIN);
         lv_obj_set_style_border_width(footer, 0, LV_PART_MAIN);
         lv_obj_set_style_pad_all(footer, 0, LV_PART_MAIN);
-        create_text(footer, 4, 2, "U/D:scroll  Del:clear  ESC:close", 0x888888, 10);
+        create_text(footer, 4, 2, "U/D:scroll  Bsp:clear  ESC:close", 0x888888, 10);
     }
 
     // ── AppInfo modal ─────────────────────────────────────────────────────────
