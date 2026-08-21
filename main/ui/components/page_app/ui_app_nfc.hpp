@@ -1315,6 +1315,28 @@ private:
         return false;
     }
 
+    bool refresh_usb_endpoints_with_recovery()
+    {
+        service_.refresh_endpoints();
+        usb_select_list_ = service_.usb_endpoints();
+        if (!usb_select_list_.empty()) return true;
+
+        ui_message_ = "Recovering USB...";
+        render_all();
+        lv_refr_now(NULL);
+
+        std::string status;
+        const bool recovered = service_.recover_usb_endpoints(&status);
+        usb_select_list_ = service_.usb_endpoints();
+        if (recovered && !usb_select_list_.empty()) {
+            ui_message_ = status.empty() ? "USB device recovered" : status;
+            return true;
+        }
+
+        ui_message_ = status.empty() ? "No USB device" : status;
+        return false;
+    }
+
     void trigger_read_scan_shortcut()
     {
         const auto scan = service_.scan_state();
@@ -1327,12 +1349,7 @@ private:
         const auto conn = service_.connection_state();
         if (!conn.connected) {
             if (endpoint.kind == nfc_app::TransportKind::UsbSerial) {
-                service_.refresh_endpoints();
-                usb_select_list_ = service_.usb_endpoints();
-                if (usb_select_list_.empty()) {
-                    ui_message_ = "No USB device";
-                    return;
-                }
+                if (!refresh_usb_endpoints_with_recovery()) return;
                 usb_select_idx_ = 0;
                 modal_ = Modal::UsbSelect;
                 modal_idx_ = 0;
@@ -2239,11 +2256,7 @@ private:
                             modal_ = Modal::ReadMenu;
                             modal_idx_ = 0;
                         } else {
-                            service_.refresh_endpoints();
-                            usb_select_list_ = service_.usb_endpoints();
-                            if (usb_select_list_.empty()) {
-                                ui_message_ = "No USB device connected";
-                            } else {
+                            if (refresh_usb_endpoints_with_recovery()) {
                                 usb_select_idx_ = 0;
                                 modal_ = Modal::UsbSelect;
                                 modal_idx_ = 0;
@@ -3906,12 +3919,7 @@ private:
                 uhf_table_scroll_offset_ = 0;
 
                 if (ep.kind == nfc_app::TransportKind::UsbSerial) {
-                    service_.refresh_endpoints();
-                    usb_select_list_ = service_.usb_endpoints();
-                    if (usb_select_list_.empty()) {
-                        ui_message_ = "No USB device";
-                        break;
-                    }
+                    if (!refresh_usb_endpoints_with_recovery()) break;
                     usb_select_idx_ = 0;
                     modal_ = Modal::UsbSelect;
                     modal_idx_ = 0;
@@ -3998,12 +4006,7 @@ private:
                 const auto conn = service_.connection_state();
                 if (!conn.connected) {
                     if (ep.kind == nfc_app::TransportKind::UsbSerial) {
-                        service_.refresh_endpoints();
-                        usb_select_list_ = service_.usb_endpoints();
-                        if (usb_select_list_.empty()) {
-                            ui_message_ = "No USB device";
-                            break;
-                        }
+                        if (!refresh_usb_endpoints_with_recovery()) break;
                         usb_select_idx_ = 0;
                         modal_ = Modal::UsbSelect;
                         modal_idx_ = 0;

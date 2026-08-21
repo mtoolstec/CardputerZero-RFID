@@ -342,6 +342,22 @@ public:
         }
     }
 
+    bool recover_usb_endpoints(std::string *status = nullptr)
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (transport_) transport_->close();
+            transport_.reset();
+            connection_ = ConnectionState{};
+        }
+
+        const bool recovered = NfcTransportFactory::recover_ext_usb(status);
+        refresh_endpoints();
+        const bool available = !usb_endpoints().empty();
+        if (recovered && !available && status) *status = "USB device disappeared";
+        return recovered && available;
+    }
+
     // ── Device probe ─────────────────────────────────────────────────────────
 
     // Start background probe of all non-mock endpoints.

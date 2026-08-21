@@ -702,6 +702,57 @@ public:
         return set_power_rail("/sys/class/leds/grove_5v_out/brightness", enabled);
     }
 
+    static bool recover_ext_usb(std::string *status = nullptr)
+    {
+#if defined(__linux__)
+        // CZUHF can leave the downstream hub port in a protocol-error state
+        // (typically error -71). A rail toggle alone does not reset that state.
+        if (::access("/usr/bin/pinctrl", X_OK) == 0) {
+            (void)std::system(
+                "/usr/bin/pinctrl set 14 ip >/dev/null 2>&1; "
+                "/usr/bin/pinctrl set 15 ip >/dev/null 2>&1");
+        }
+
+        const bool route_off = set_ext_usb_route(false);
+        const bool power_off = set_ext_5v(false);
+        ::usleep(1000000);
+
+        const std::string hub = find_internal_usb_hub();
+        bool hub_reset = false;
+        if (!hub.empty()) {
+            hub_reset = write_sysfs_value("/sys/bus/usb/drivers/usb/unbind", hub);
+            if (hub_reset) {
+                ::usleep(500000);
+                hub_reset = write_sysfs_value("/sys/bus/usb/drivers/usb/bind", hub);
+                ::usleep(500000);
+            }
+        }
+
+        const bool route_on = set_ext_usb_route(true);
+        const bool power_on = set_ext_5v(true);
+        if (!route_off || !power_off || !route_on || !power_on || !hub_reset) {
+            if (status) *status = "USB recovery control failed";
+            return false;
+        }
+
+        for (int attempt = 0; attempt < 40; ++attempt) {
+            const auto endpoints = enumerate_endpoints();
+            for (const auto &endpoint : endpoints) {
+                if (endpoint.kind == TransportKind::UsbSerial) {
+                    if (status) *status = "USB device recovered";
+                    return true;
+                }
+            }
+            ::usleep(100000);
+        }
+        if (status) *status = "USB recovery timed out";
+        return false;
+#else
+        if (status) *status = "USB recovery unavailable";
+        return false;
+#endif
+    }
+
     // ── Grove GPIO helpers ────────────────────────────────────────────────────
     // Find the sysfs base of the gpiochip whose label matches `chip_label`.
     // Returns -1 if not found.
@@ -790,6 +841,66 @@ public:
     }
 
 private:
+    static bool write_sysfs_value(const std::string &path, const std::string &value)
+    {
+#if defined(__linux__)
+        FILE *f = fopen(path.c_str(), "w");
+        if (f) {
+            const bool wrote = std::fwrite(value.data(), 1, value.size(), f) == value.size();
+            if (fclose(f) == 0 && wrote) return true;
+        }
+
+        // APPLaunch runs applications as pi. The expansion rails are writable
+        // by that user, while USB driver bind controls require root.
+        const char *command = nullptr;
+        if (path == "/sys/bus/usb/drivers/usb/unbind") {
+            command = "/usr/bin/sudo -n /usr/bin/tee /sys/bus/usb/drivers/usb/unbind >/dev/null 2>&1";
+        } else if (path == "/sys/bus/usb/drivers/usb/bind") {
+            command = "/usr/bin/sudo -n /usr/bin/tee /sys/bus/usb/drivers/usb/bind >/dev/null 2>&1";
+        }
+        if (!command) return false;
+
+        FILE *pipe = popen(command, "w");
+        if (!pipe) return false;
+        const bool wrote = std::fwrite(value.data(), 1, value.size(), pipe) == value.size();
+        return pclose(pipe) == 0 && wrote;
+#else
+        (void)path;
+        (void)value;
+        return false;
+#endif
+    }
+
+    static std::string find_internal_usb_hub()
+    {
+#if defined(__linux__)
+        DIR *dir = opendir("/sys/bus/usb/devices");
+        if (!dir) return {};
+        std::string found;
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != nullptr) {
+            const std::string name(entry->d_name);
+            if (name.empty() || name[0] == '.' || name.find(':') != std::string::npos) continue;
+
+            const std::string base = std::string("/sys/bus/usb/devices/") + name;
+            std::string vendor;
+            std::string product;
+            if (!read_first_line_trimmed(base + "/idVendor", &vendor) ||
+                !read_first_line_trimmed(base + "/idProduct", &product)) {
+                continue;
+            }
+            if (vendor == "05e3" && product == "0610") {
+                found = name;
+                break;
+            }
+        }
+        closedir(dir);
+        return found;
+#else
+        return {};
+#endif
+    }
+
     static bool set_power_rail(const char *path, bool enabled)
     {
 #if defined(__linux__)
