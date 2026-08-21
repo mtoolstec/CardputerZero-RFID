@@ -12,6 +12,7 @@ nfc_shared_root = os.path.join(component_dir, "ui", "components")
 SRCS = Glob("src/*.c*")
 SRCS += [os.path.join(component_dir, "hal", "hal_paths_rfid.c")]
 SRCS += [os.path.join(component_dir, "hal", "hal_settings_rfid.c")]
+SRCS += [os.path.join(component_dir, "hal", "hal_screenshot_linux.cpp")]
 INCLUDE = [
     ADir("."),
     ADir("include"),

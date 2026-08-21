@@ -9,6 +9,7 @@
 #include "../ui_app_page.hpp"
 #include "compat/input_keys.h"
 #include "keyboard_input.h"
+#include "hal/hal_screenshot.h"
 
 #include <algorithm>
 #include <atomic>
@@ -258,6 +259,7 @@ private:
     uint32_t held_scroll_key_      = 0;
     uint32_t held_scroll_start_ms_ = 0;
    uint32_t held_scroll_last_ms_  = 0;
+   bool     screenshot_key_consumed_ = false;
    // ESC double-press to exit tracking
    bool     esc_exit_confirm_      = false;
    uint32_t esc_exit_confirm_tick_ = 0;
@@ -823,6 +825,18 @@ private:
         const uint32_t raw_key = LV_EVENT_KEYBOARD_GET_KEY(e);
         const auto *key_item = static_cast<struct key_item *>(lv_event_get_param(e));
         const uint32_t mods = key_item ? key_item->mods : 0;
+
+        if (raw_key == KEY_S && screenshot_key_consumed_) {
+            if (IS_KEY_RELEASED(e)) screenshot_key_consumed_ = false;
+            return;
+        }
+        if (IS_KEY_PRESSED(e) && raw_key == KEY_S &&
+            (mods & KBD_MOD_CTRL) && (mods & KBD_MOD_ALT)) {
+            screenshot_key_consumed_ = true;
+            const int result = hal_screenshot_save("/var/lib/applaunch/screenshots");
+            show_toast(result == 0 ? "Screenshot saved" : "Screenshot failed");
+            return;
+        }
 
         // Track key press for long-press scroll (Read tab or HexLog modal)
         if (IS_KEY_PRESSED(e)) {
