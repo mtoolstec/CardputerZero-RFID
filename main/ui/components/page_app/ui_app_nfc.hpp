@@ -833,8 +833,19 @@ private:
         if (IS_KEY_PRESSED(e) && raw_key == KEY_S &&
             (mods & KBD_MOD_CTRL) && (mods & KBD_MOD_ALT)) {
             screenshot_key_consumed_ = true;
-            const int result = hal_screenshot_save("/var/lib/applaunch/screenshots");
-            show_toast(result == 0 ? "Screenshot saved" : "Screenshot failed");
+            char saved_path[640] = {0};
+            const int result = hal_screenshot_save(
+                "/var/lib/applaunch/screenshots", saved_path, sizeof(saved_path));
+            if (result == 0) {
+                std::string path(saved_path);
+                const size_t slash = path.rfind('/');
+                const std::string toast = slash == std::string::npos
+                    ? ("Saved:\n" + path)
+                    : ("Saved: " + path.substr(0, slash + 1) + "\n" + path.substr(slash + 1));
+                show_toast(toast, 3000);
+            } else {
+                show_toast("Screenshot failed", 3000);
+            }
             return;
         }
 
@@ -2406,10 +2417,10 @@ private:
         ui_message_ = std::string(tool_name(active_tool_idx_)) + " opened";
     }
 
-    void show_toast(const std::string &msg)
+    void show_toast(const std::string &msg, uint32_t duration_ms = 1000)
     {
         toast_msg_          = msg;
-        toast_expire_tick_  = lv_tick_get() + 1000;
+        toast_expire_tick_  = lv_tick_get() + duration_ms;
     }
 
     void refresh_saved_records()
@@ -4479,11 +4490,23 @@ private:
         // Semi-transparent centered popup, auto-dismissed after 1 s
         lv_obj_t *card = lv_obj_create(parent);
         lv_obj_remove_style_all(card);
-        static constexpr int H = 32;
+        const size_t newline = toast_msg_.find('\n');
+        const bool multiline = newline != std::string::npos;
+        const int H = multiline ? 46 : 32;
         static constexpr int MIN_W = 120;
         static constexpr int MAX_W = 312;
-        const std::string toast_text = to_tail_compact(toast_msg_, 36);
-        const int text_w = static_cast<int>(toast_text.size()) * 8;
+        std::string toast_text;
+        size_t longest_line = 0;
+        if (multiline) {
+            const std::string first = to_tail_compact(toast_msg_.substr(0, newline), 38);
+            const std::string second = to_tail_compact(toast_msg_.substr(newline + 1), 38);
+            toast_text = first + "\n" + second;
+            longest_line = std::max(first.size(), second.size());
+        } else {
+            toast_text = to_tail_compact(toast_msg_, 36);
+            longest_line = toast_text.size();
+        }
+        const int text_w = static_cast<int>(longest_line) * 8;
         const int W = std::max(MIN_W, std::min(MAX_W, text_w + 20));
         lv_obj_set_size(card, W, H);
         lv_obj_set_pos(card, (320 - W) / 2, (CONTENT_H - H) / 2);

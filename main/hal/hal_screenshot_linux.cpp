@@ -41,8 +41,9 @@ static const char *resolve_output_directory(const char *requested, char *fallbac
     return ensure_directory(fallback) ? fallback : nullptr;
 }
 
-int hal_screenshot_save(const char *dir)
+int hal_screenshot_save(const char *dir, char *saved_path, size_t saved_path_size)
 {
+    if (saved_path && saved_path_size) saved_path[0] = '\0';
     const char *fbdev = getenv("LV_FBDEV");
     if (!fbdev || !fbdev[0]) fbdev = getenv("APPLAUNCH_LINUX_FBDEV_DEVICE");
     if (!fbdev || !fbdev[0]) fbdev = "/dev/fb0";
@@ -145,6 +146,8 @@ int hal_screenshot_save(const char *dir)
     fclose(file);
     munmap(framebuffer, framebuffer_size);
     close(fd);
+    if (saved_path && saved_path_size)
+        snprintf(saved_path, saved_path_size, "%s", filename);
     printf("[SCREENSHOT] Saved: %s (%dx%d %dbpp)\n",
            filename, width, height, bits_per_pixel);
     fflush(stdout);
