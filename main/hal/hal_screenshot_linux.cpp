@@ -12,9 +12,12 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <vector>
 
-static void write_le16(FILE *file, uint16_t value) { fwrite(&value, 2, 1, file); }
-static void write_le32(FILE *file, uint32_t value) { fwrite(&value, 4, 1, file); }
+extern "C" unsigned lodepng_encode24(
+    unsigned char **output, size_t *output_size,
+    const unsigned char *image, unsigned width, unsigned height);
+extern "C" void lv_free(void *pointer);
 
 static bool ensure_directory(const char *dir)
 {
@@ -84,43 +87,19 @@ int hal_screenshot_save(const char *dir, char *saved_path, size_t saved_path_siz
     struct tm local_time;
     localtime_r(&now, &local_time);
     char filename[640];
-    snprintf(filename, sizeof(filename), "%s/scr_%04d%02d%02d_%02d%02d%02d.bmp",
+    snprintf(filename, sizeof(filename), "%s/scr_%04d%02d%02d_%02d%02d%02d.png",
              output_dir, local_time.tm_year + 1900, local_time.tm_mon + 1,
              local_time.tm_mday, local_time.tm_hour, local_time.tm_min,
              local_time.tm_sec);
 
-    FILE *file = fopen(filename, "wb");
-    if (!file) {
+    if (width <= 0 || height <= 0 || (bits_per_pixel != 16 && bits_per_pixel != 32)) {
         munmap(framebuffer, framebuffer_size);
         close(fd);
         return -5;
     }
 
-    const int row_size = width * 3;
-    const int padding_size = (4 - (row_size % 4)) % 4;
-    const int bitmap_row_size = row_size + padding_size;
-    const uint32_t image_size = static_cast<uint32_t>(bitmap_row_size * height);
-
-    fputc('B', file);
-    fputc('M', file);
-    write_le32(file, 54 + image_size);
-    write_le16(file, 0);
-    write_le16(file, 0);
-    write_le32(file, 54);
-    write_le32(file, 40);
-    write_le32(file, static_cast<uint32_t>(width));
-    write_le32(file, static_cast<uint32_t>(height));
-    write_le16(file, 1);
-    write_le16(file, 24);
-    write_le32(file, 0);
-    write_le32(file, image_size);
-    write_le32(file, 2835);
-    write_le32(file, 2835);
-    write_le32(file, 0);
-    write_le32(file, 0);
-
-    const uint8_t padding[3] = {0, 0, 0};
-    for (int y = height - 1; y >= 0; --y) {
+    std::vector<uint8_t> rgb(static_cast<size_t>(width) * height * 3);
+    for (int y = 0; y < height; ++y) {
         const uint8_t *row = static_cast<const uint8_t *>(framebuffer) + y * line_length;
         for (int x = 0; x < width; ++x) {
             uint8_t red = 0;
@@ -137,15 +116,35 @@ int hal_screenshot_save(const char *dir, char *saved_path, size_t saved_path_siz
                 green = static_cast<uint8_t>((pixel >> variable_info.green.offset) & 0xFF);
                 blue = static_cast<uint8_t>((pixel >> variable_info.blue.offset) & 0xFF);
             }
-            const uint8_t bgr[3] = {blue, green, red};
-            fwrite(bgr, 1, sizeof(bgr), file);
+            const size_t offset = (static_cast<size_t>(y) * width + x) * 3;
+            rgb[offset] = red;
+            rgb[offset + 1] = green;
+            rgb[offset + 2] = blue;
         }
-        if (padding_size) fwrite(padding, 1, static_cast<size_t>(padding_size), file);
     }
 
-    fclose(file);
     munmap(framebuffer, framebuffer_size);
     close(fd);
+    unsigned char *png_data = nullptr;
+    size_t png_size = 0;
+    const unsigned png_error = lodepng_encode24(
+        &png_data, &png_size, rgb.data(),
+        static_cast<unsigned>(width), static_cast<unsigned>(height));
+    if (png_error != 0) {
+        std::fprintf(stderr, "[SCREENSHOT] PNG encode failed: %u\n", png_error);
+        return -6;
+    }
+
+    FILE *file = fopen(filename, "wb");
+    if (!file) {
+        lv_free(png_data);
+        return -7;
+    }
+    const bool wrote = fwrite(png_data, 1, png_size, file) == png_size;
+    const bool closed = fclose(file) == 0;
+    lv_free(png_data);
+    if (!wrote || !closed) return -8;
+
     if (saved_path && saved_path_size)
         snprintf(saved_path, saved_path_size, "%s", filename);
     printf("[SCREENSHOT] Saved: %s (%dx%d %dbpp)\n",

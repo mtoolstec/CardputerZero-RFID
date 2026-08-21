@@ -136,6 +136,13 @@ static void play_beeps(int count)
 #endif
 }
 
+static void warm_up()
+{
+#if defined(__linux__)
+    std::call_once(worker_once, []() { std::thread(audio_worker).detach(); });
+#endif
+}
+
 } // namespace rfid_scan_audio
 
 class UINfcPage : public app_base
@@ -193,6 +200,7 @@ public:
         refresh_mifare_keys();
         creat_UI();
         event_handler_init();
+        rfid_scan_audio::warm_up();
         ui_timer_ = lv_timer_create(UINfcPage::ui_timer_cb, 200, this);
         uhf_beep_timer_ = lv_timer_create(UINfcPage::uhf_beep_timer_cb, 50, this);
         sync_ext_usb_power();
@@ -253,7 +261,6 @@ private:
     uint64_t last_uhf_read_total_ = 0;
     uint64_t uhf_rate_window_total_ = 0;
     uint32_t uhf_rate_window_tick_ = 0;
-    uint32_t uhf_last_activity_tick_ = 0;
     int  app_info_scroll_ = 0;  // AppInfo modal scroll offset (line index)
     // Long-press scroll tracking
     uint32_t held_scroll_key_      = 0;
@@ -780,20 +787,13 @@ private:
         const uint32_t now = lv_tick_get();
         const bool continuous = self->service_.uhf_continuous_scan_running();
         const bool has_new_reads = read_total > self->last_uhf_read_total_;
-        if (has_new_reads) self->uhf_last_activity_tick_ = now;
-
-        // One UHF inventory round can take about 220 ms plus a 120 ms pacing
-        // delay.  Keep the cadence alive across rounds, then stop promptly once
-        // no new tag reads have arrived for 450 ms.
-        const bool tag_active = continuous && self->uhf_last_activity_tick_ != 0 &&
-            (now - self->uhf_last_activity_tick_ <= 450);
+        const bool tag_active = continuous && self->service_.uhf_tag_present();
         if (tag_active || (!continuous && has_new_reads)) {
             rfid_scan_audio::play_beeps(1);
         }
         self->last_uhf_read_total_ = read_total;
 
         if (!continuous) {
-            self->uhf_last_activity_tick_ = 0;
             self->uhf_rate_window_tick_ = now;
             self->uhf_rate_window_total_ = read_total;
             return;

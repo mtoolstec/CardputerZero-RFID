@@ -1297,6 +1297,11 @@ public:
         return scan_.running && uhf_continuous_mode_;
     }
 
+    bool uhf_tag_present() const
+    {
+        return uhf_tag_present_.load(std::memory_order_relaxed);
+    }
+
     std::vector<UhfTableRow> uhf_table_rows() const
     {
         std::vector<UhfTableRow> rows;
@@ -1327,6 +1332,7 @@ public:
         stop_pn532_ndef_emulation();
         if (scan_thread_.joinable()) scan_thread_.join();
         cancel_uhf_scan_.store(false);
+        uhf_tag_present_.store(false, std::memory_order_relaxed);
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -1362,6 +1368,7 @@ public:
         stop_pn532_ndef_emulation();
         if (scan_thread_.joinable()) scan_thread_.join();
         cancel_uhf_scan_.store(false);
+        uhf_tag_present_.store(false, std::memory_order_relaxed);
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -5704,6 +5711,7 @@ private:
             }
 
             const auto tags = parse_uhf_tags_from_raw(raw);
+            uhf_tag_present_.store(!tags.empty(), std::memory_order_relaxed);
             if (!tags.empty()) {
                 merge_uhf_tags(tags, endpoint);
                 found_any = true;
@@ -5718,8 +5726,10 @@ private:
                 if (idle_rounds > 8) break;
             }
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(continuous ? 120 : 80));
+            std::this_thread::sleep_for(std::chrono::milliseconds(continuous ? 40 : 80));
         }
+
+        uhf_tag_present_.store(false, std::memory_order_relaxed);
 
         {
             std::lock_guard<std::mutex> op_lock(transport_op_mutex_);
@@ -7164,6 +7174,7 @@ private:
     ScanState scan_;
     std::unordered_map<std::string, UhfTagSnapshot> uhf_tags_;
     bool uhf_continuous_mode_ = false;
+    std::atomic<bool> uhf_tag_present_{false};
     std::string uhf_last_csv_path_;
     std::atomic<bool> cancel_uhf_scan_{false};
     bool last_dump_success_ = false;
