@@ -5332,6 +5332,67 @@ private:
         return false;
     }
 
+    bool uhf_inventory_round_locked(INfcTransport *transport,
+                                    const TransportEndpoint &endpoint,
+                                    int listen_ms,
+                                    bool stop_after_first_tag,
+                                    std::string *error)
+    {
+        std::string io_error;
+        if (!write_all(transport, build_uhf_a0_frame(0x89, {0x01}), &io_error)) {
+            if (error) *error = io_error;
+            return false;
+        }
+
+        bool found_tag = false;
+        std::vector<uint8_t> pending;
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(listen_ms);
+        while (std::chrono::steady_clock::now() < deadline &&
+               !cancel_uhf_scan_.load()) {
+            uint8_t buf[256] = {};
+            std::string read_error;
+            const ssize_t got = transport->read_bytes(buf, sizeof(buf), 20, &read_error);
+            if (got < 0) {
+                io_error = read_error;
+                break;
+            }
+            if (got == 0) continue;
+
+            pending.insert(pending.end(), buf, buf + got);
+            while (!pending.empty()) {
+                const auto start = std::find(pending.begin(), pending.end(), 0xA0);
+                if (start != pending.begin()) pending.erase(pending.begin(), start);
+                if (pending.size() < 2) break;
+
+                const size_t frame_len = static_cast<size_t>(pending[1]) + 2;
+                if (frame_len < 5) {
+                    pending.erase(pending.begin());
+                    continue;
+                }
+                if (pending.size() < frame_len) break;
+
+                std::vector<uint8_t> frame(pending.begin(), pending.begin() + frame_len);
+                pending.erase(pending.begin(), pending.begin() + frame_len);
+                const auto tags = parse_uhf_tags_from_raw(frame);
+                if (tags.empty()) continue;
+
+                // Publish each complete report immediately; the UI no longer waits
+                // for the remainder of the inventory collection window.
+                merge_uhf_tags(tags, endpoint);
+                uhf_tag_present_.store(true, std::memory_order_relaxed);
+                found_tag = true;
+                if (stop_after_first_tag) {
+                    if (error) error->clear();
+                    return true;
+                }
+            }
+        }
+
+        if (error) *error = io_error;
+        return found_tag;
+    }
+
     bool uhf_detect_on_open_transport_locked(INfcTransport *transport, std::string *detail)
     {
         if (!transport || !transport->is_open()) return false;
@@ -5703,17 +5764,17 @@ private:
         while (true) {
             if (cancel_uhf_scan_.load()) break;
 
-            std::vector<uint8_t> raw;
+            const auto round_started = std::chrono::steady_clock::now();
             std::string io_err;
+            bool round_found = false;
             {
                 std::lock_guard<std::mutex> op_lock(transport_op_mutex_);
-                uhf_exchange_command_locked(transport_raw, 0x89, {0x01}, 220, &raw, &io_err);
+                round_found = uhf_inventory_round_locked(
+                    transport_raw, endpoint, 220, !continuous, &io_err);
             }
 
-            const auto tags = parse_uhf_tags_from_raw(raw);
-            uhf_tag_present_.store(!tags.empty(), std::memory_order_relaxed);
-            if (!tags.empty()) {
-                merge_uhf_tags(tags, endpoint);
+            uhf_tag_present_.store(round_found, std::memory_order_relaxed);
+            if (round_found) {
                 found_any = true;
                 idle_rounds = 0;
             } else {
@@ -5726,7 +5787,9 @@ private:
                 if (idle_rounds > 8) break;
             }
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(continuous ? 40 : 80));
+            const auto next_round = round_started +
+                                    std::chrono::milliseconds(continuous ? 250 : 80);
+            std::this_thread::sleep_until(next_round);
         }
 
         uhf_tag_present_.store(false, std::memory_order_relaxed);

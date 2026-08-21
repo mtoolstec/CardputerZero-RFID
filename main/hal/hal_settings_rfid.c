@@ -6,6 +6,10 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <linux/i2c.h>
+#include <linux/i2c-dev.h>
 
 // ---------------------------------------------------------------------------
 // Time
@@ -55,6 +59,27 @@ static int find_battery_supply(char *out, size_t out_size)
     return 1;
 }
 
+static int bq27220_read_word(int fd, unsigned char reg)
+{
+    unsigned char buf[2] = {0};
+    struct i2c_msg msgs[2];
+    struct i2c_rdwr_ioctl_data data;
+
+    msgs[0].addr = 0x55;
+    msgs[0].flags = 0;
+    msgs[0].len = 1;
+    msgs[0].buf = &reg;
+    msgs[1].addr = 0x55;
+    msgs[1].flags = I2C_M_RD;
+    msgs[1].len = 2;
+    msgs[1].buf = buf;
+    data.msgs = msgs;
+    data.nmsgs = 2;
+
+    if (ioctl(fd, I2C_RDWR, &data) < 0) return -1;
+    return buf[0] | (buf[1] << 8);
+}
+
 hal_battery_info_t hal_battery_read(void)
 {
     hal_battery_info_t info = {0};
@@ -71,6 +96,17 @@ hal_battery_info_t hal_battery_read(void)
             info.valid = 1;
         }
         fclose(f);
+    }
+    if (info.valid) return info;
+
+    // Match APPLaunch on kernels without a registered power_supply device.
+    const int fd = open("/dev/i2c-1", O_RDWR);
+    if (fd < 0) return info;
+    const int soc = bq27220_read_word(fd, 0x2C);
+    close(fd);
+    if (soc >= 0) {
+        info.soc = soc;
+        info.valid = 1;
     }
     return info;
 }

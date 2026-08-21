@@ -201,7 +201,7 @@ public:
         creat_UI();
         event_handler_init();
         rfid_scan_audio::warm_up();
-        ui_timer_ = lv_timer_create(UINfcPage::ui_timer_cb, 200, this);
+        ui_timer_ = lv_timer_create(UINfcPage::ui_timer_cb, 50, this);
         uhf_beep_timer_ = lv_timer_create(UINfcPage::uhf_beep_timer_cb, 50, this);
         sync_ext_usb_power();
         render_all();
