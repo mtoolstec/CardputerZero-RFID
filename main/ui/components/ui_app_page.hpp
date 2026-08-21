@@ -95,6 +95,7 @@ private:
     lv_obj_t *ui_TOP_time;
     lv_obj_t *ui_TOP_time_Label;
     lv_obj_t *ui_TOP_SignalStrength;
+    lv_obj_t *ui_TOP_WifiBars;
     lv_obj_t *ui_TOP_SignalStrength_one;
     lv_obj_t *ui_TOP_SignalStrength_two;
     lv_obj_t *ui_TOP_SignalStrength_three;
@@ -170,15 +171,12 @@ public:
             char pwr_buf[16];
             snprintf(pwr_buf, sizeof(pwr_buf), "%d%%", soc);
             lv_label_set_text(ui_TOP_power_Label, pwr_buf);
-            lv_obj_set_style_text_font(ui_TOP_power_Label,
-                soc == 100 ? &lv_font_montserrat_10 : LV_FONT_DEFAULT,
-                LV_PART_MAIN | LV_STATE_DEFAULT);
         }
     }
 
     void set_page_title(const std::string &title)
     {
-        lv_label_set_text(ui_TOP_logo, title.c_str());
+        (void)title;
     }
 
 private:
@@ -187,28 +185,28 @@ private:
     /* ================================================================== */
     void creat_Top_UI()
     {
-        ui_TOP_logo = lv_label_create(ui_root);
-        lv_obj_set_width(ui_TOP_logo, LV_SIZE_CONTENT);   /// 1
-        lv_obj_set_height(ui_TOP_logo, LV_SIZE_CONTENT);    /// 1
-        lv_obj_set_x(ui_TOP_logo, 4);
-        lv_obj_set_y(ui_TOP_logo, 0);
-        lv_obj_set_align(ui_TOP_logo, LV_ALIGN_TOP_LEFT);
-        lv_label_set_text(ui_TOP_logo, app_name.c_str());
-        lv_obj_set_style_text_color(ui_TOP_logo, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_set_style_text_opa(ui_TOP_logo, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_set_style_text_align(ui_TOP_logo, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_set_style_text_font(ui_TOP_logo, &lv_font_montserrat_16, LV_PART_MAIN | LV_STATE_DEFAULT);
+        ui_TOP_logo = lv_image_create(ui_root);
+        lv_image_set_src(ui_TOP_logo, "A:share/images/launcher_brand_logo.png");
+        lv_obj_set_width(ui_TOP_logo, LV_SIZE_CONTENT);
+        lv_obj_set_height(ui_TOP_logo, LV_SIZE_CONTENT);
+        lv_obj_set_x(ui_TOP_logo, 5);
+        lv_obj_set_y(ui_TOP_logo, 5);
+        lv_obj_add_flag(ui_TOP_logo, LV_OBJ_FLAG_ADV_HITTEST);
+        lv_obj_clear_flag(ui_TOP_logo, LV_OBJ_FLAG_SCROLLABLE);
 
 
         ui_TOP_time = lv_obj_create(ui_root);
         lv_obj_set_width(ui_TOP_time, 40);
         lv_obj_set_height(ui_TOP_time, 16);
-        lv_obj_set_x(ui_TOP_time, 236);
+        lv_obj_set_x(ui_TOP_time, 235);
         lv_obj_set_y(ui_TOP_time, 4);
         lv_obj_clear_flag(ui_TOP_time, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
         lv_obj_set_style_radius(ui_TOP_time, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_bg_color(ui_TOP_time, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_bg_opa(ui_TOP_time, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_image_src(ui_TOP_time,
+            "A:share/images/status_time_background.png",
+            LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_border_width(ui_TOP_time, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
 
         ui_TOP_time_Label = lv_label_create(ui_TOP_time);
@@ -218,12 +216,12 @@ private:
         lv_label_set_text(ui_TOP_time_Label, "19:45");
         lv_obj_set_style_text_color(ui_TOP_time_Label, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_text_opa(ui_TOP_time_Label, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_set_style_text_font(ui_TOP_time_Label, &lv_font_montserrat_12, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_text_font(ui_TOP_time_Label, &lv_font_montserrat_14, LV_PART_MAIN | LV_STATE_DEFAULT);
 
         ui_TOP_SignalStrength = lv_obj_create(ui_root);
-        lv_obj_set_width(ui_TOP_SignalStrength, 24);
+        lv_obj_set_width(ui_TOP_SignalStrength, 28);
         lv_obj_set_height(ui_TOP_SignalStrength, 15);
-        lv_obj_set_x(ui_TOP_SignalStrength, 210);
+        lv_obj_set_x(ui_TOP_SignalStrength, 203);
         lv_obj_set_y(ui_TOP_SignalStrength, 4);
         lv_obj_clear_flag(ui_TOP_SignalStrength, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
         lv_obj_set_style_radius(ui_TOP_SignalStrength, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -233,7 +231,14 @@ private:
         lv_obj_set_style_pad_all(ui_TOP_SignalStrength, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_add_flag(ui_TOP_SignalStrength, LV_OBJ_FLAG_HIDDEN);
 
-        ui_TOP_SignalStrength_one = lv_obj_create(ui_TOP_SignalStrength);
+        ui_TOP_WifiBars = lv_obj_create(ui_TOP_SignalStrength);
+        lv_obj_remove_style_all(ui_TOP_WifiBars);
+        lv_obj_set_width(ui_TOP_WifiBars, 22);
+        lv_obj_set_height(ui_TOP_WifiBars, 15);
+        lv_obj_set_align(ui_TOP_WifiBars, LV_ALIGN_CENTER);
+        lv_obj_clear_flag(ui_TOP_WifiBars, LV_OBJ_FLAG_SCROLLABLE);
+
+        ui_TOP_SignalStrength_one = lv_obj_create(ui_TOP_WifiBars);
         lv_obj_set_width(ui_TOP_SignalStrength_one, 4);
         lv_obj_set_height(ui_TOP_SignalStrength_one, 6);
         lv_obj_set_x(ui_TOP_SignalStrength_one, 0);
@@ -244,7 +249,7 @@ private:
         lv_obj_set_style_bg_opa(ui_TOP_SignalStrength_one, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_border_width(ui_TOP_SignalStrength_one, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
 
-        ui_TOP_SignalStrength_two = lv_obj_create(ui_TOP_SignalStrength);
+        ui_TOP_SignalStrength_two = lv_obj_create(ui_TOP_WifiBars);
         lv_obj_set_width(ui_TOP_SignalStrength_two, 4);
         lv_obj_set_height(ui_TOP_SignalStrength_two, 9);
         lv_obj_set_x(ui_TOP_SignalStrength_two, 6);
@@ -255,7 +260,7 @@ private:
         lv_obj_set_style_bg_opa(ui_TOP_SignalStrength_two, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_border_width(ui_TOP_SignalStrength_two, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
 
-        ui_TOP_SignalStrength_three = lv_obj_create(ui_TOP_SignalStrength);
+        ui_TOP_SignalStrength_three = lv_obj_create(ui_TOP_WifiBars);
         lv_obj_set_width(ui_TOP_SignalStrength_three, 4);
         lv_obj_set_height(ui_TOP_SignalStrength_three, 12);
         lv_obj_set_x(ui_TOP_SignalStrength_three, 12);
@@ -266,7 +271,7 @@ private:
         lv_obj_set_style_bg_opa(ui_TOP_SignalStrength_three, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_border_width(ui_TOP_SignalStrength_three, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
 
-        ui_TOP_SignalStrength_four = lv_obj_create(ui_TOP_SignalStrength);
+        ui_TOP_SignalStrength_four = lv_obj_create(ui_TOP_WifiBars);
         lv_obj_set_width(ui_TOP_SignalStrength_four, 4);
         lv_obj_set_height(ui_TOP_SignalStrength_four, 15);
         lv_obj_set_x(ui_TOP_SignalStrength_four, 18);
@@ -280,13 +285,17 @@ private:
         ui_TOP_Power = lv_obj_create(ui_root);
         lv_obj_set_width(ui_TOP_Power, 36);
         lv_obj_set_height(ui_TOP_Power, 16);
-        lv_obj_set_x(ui_TOP_Power, 280);
+        lv_obj_set_x(ui_TOP_Power, 279);
         lv_obj_set_y(ui_TOP_Power, 4);
         lv_obj_clear_flag(ui_TOP_Power, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
         lv_obj_set_style_radius(ui_TOP_Power, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_bg_color(ui_TOP_Power, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_bg_opa(ui_TOP_Power, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_image_src(ui_TOP_Power,
+            "A:share/images/status_battery_background.png",
+            LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_border_width(ui_TOP_Power, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_pad_all(ui_TOP_Power, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
 
         ui_TOP_power_Label = lv_label_create(ui_TOP_Power);
         lv_obj_set_width(ui_TOP_power_Label, LV_SIZE_CONTENT);   /// 1
@@ -295,7 +304,7 @@ private:
         lv_label_set_text(ui_TOP_power_Label, "100%");
         lv_obj_set_style_text_color(ui_TOP_power_Label, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_text_opa(ui_TOP_power_Label, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_set_style_text_font(ui_TOP_power_Label, &lv_font_montserrat_10, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_text_font(ui_TOP_power_Label, &lv_font_montserrat_14, LV_PART_MAIN | LV_STATE_DEFAULT);
 
         ui_APP_Container = lv_obj_create(ui_root);
         lv_obj_remove_style_all(ui_APP_Container);
