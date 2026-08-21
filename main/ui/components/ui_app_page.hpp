@@ -152,6 +152,8 @@ public:
             lv_color_hex(sig >= 60 ? on_color : off_color), LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_bg_color(ui_TOP_SignalStrength_four,
             lv_color_hex(sig >= 80 ? on_color : off_color), LV_PART_MAIN | LV_STATE_DEFAULT);
+
+        update_battery_status(hal_battery_read());
     }
 
     void update_battery_status(const hal_battery_info_t &bat)
