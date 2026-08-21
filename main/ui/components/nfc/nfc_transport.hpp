@@ -157,9 +157,18 @@ public:
         if (error) *error = "serial transport unsupported on Windows in v1";
         return false;
 #else
-        if ((endpoint.path == "/dev/ttyS0" || endpoint.path == "/dev/serial0") &&
-            !configure_cardputer_top_uart(error)) {
-            return false;
+        const bool top_uart = is_cardputer_top_uart(endpoint.path);
+        const bool uhf_usb = is_known_uhf_usb(endpoint);
+        if (top_uart) {
+            if (!configure_cardputer_top_uart(error)) return false;
+        } else if (uhf_usb) {
+            // The CZUHF expansion connects both its USB bridge and its module UART
+            // to CardputerZero.  Leaving GPIO14/TXD1 actively driven while using
+            // USB makes the two transmitters contend on the module RX net: USB
+            // still enumerates, but commands intermittently never reach the UHF
+            // module.  Tri-state both UART pins while USB owns the data path.
+            // RESET is board-specific and must not be driven from here.
+            if (!isolate_cardputer_top_uart_for_uhf_usb(error)) return false;
         }
 
         // Open with O_NONBLOCK so open() doesn't hang waiting for DCD/carrier
@@ -251,6 +260,9 @@ public:
             ::close(fd_);
             fd_ = -1;
         }
+        // Do not leave TXD1 driving the CZUHF RX line after switching from the
+        // top UART to the expansion's USB CDC endpoint.
+        if (is_cardputer_top_uart(endpoint_.path)) release_cardputer_top_uart();
 #endif
     }
 
@@ -369,6 +381,50 @@ public:
 
 private:
 #ifndef _WIN32
+    static bool is_cardputer_top_uart(const std::string &path)
+    {
+        return path == "/dev/ttyS0" || path == "/dev/serial0";
+    }
+
+    static bool is_known_uhf_usb(const TransportEndpoint &endpoint)
+    {
+        return endpoint.kind == TransportKind::UsbSerial &&
+               endpoint.usb_vid == 0x1A86 &&
+               (endpoint.usb_pid == 0x55D3 || endpoint.usb_pid == 0xFE1C);
+    }
+
+    static void release_cardputer_top_uart()
+    {
+#if defined(__linux__)
+        if (::access("/usr/bin/pinctrl", X_OK) == 0) {
+            (void)std::system(
+                "/usr/bin/pinctrl set 14 ip >/dev/null 2>&1; "
+                "/usr/bin/pinctrl set 15 ip >/dev/null 2>&1");
+        }
+#endif
+    }
+
+    static bool isolate_cardputer_top_uart_for_uhf_usb(std::string *error)
+    {
+#if defined(__linux__)
+        if (::access("/usr/bin/pinctrl", X_OK) != 0) {
+            if (error) *error = "pinctrl not found; cannot isolate CZUHF UART pins";
+            return false;
+        }
+        const int rc = std::system(
+            "/usr/bin/pinctrl set 14 ip >/dev/null 2>&1 && "
+            "/usr/bin/pinctrl set 15 ip >/dev/null 2>&1");
+        if (rc != 0) {
+            if (error) *error = "failed to isolate GPIO14/GPIO15 for CZUHF USB";
+            return false;
+        }
+        ::usleep(20000);
+#else
+        (void)error;
+#endif
+        return true;
+    }
+
     static bool configure_cardputer_top_uart(std::string *error)
     {
 #if defined(__linux__)

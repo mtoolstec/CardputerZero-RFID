@@ -1055,8 +1055,19 @@ public:
                     connection_.endpoint.usb_vid == 0x1A86 &&
                     (connection_.endpoint.usb_pid == 0x55D3 ||
                      connection_.endpoint.usb_pid == 0xFE1C);
-                if (!uhf_detect_on_open_transport_locked(transport_.get(), &uhf_detail) &&
-                    !descriptor_is_uhf) {
+                bool uhf_responded = false;
+                // The reader MCU can need a few hundred milliseconds after USB
+                // enumeration. Require a real firmware reply; VID/PID alone only
+                // proves that the bridge enumerated.
+                const int attempts = descriptor_is_uhf ? 5 : 1;
+                for (int attempt = 0; attempt < attempts && !uhf_responded; ++attempt) {
+                    uhf_responded = uhf_detect_on_open_transport_locked(
+                        transport_.get(), &uhf_detail);
+                    if (!uhf_responded && attempt + 1 < attempts) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+                    }
+                }
+                if (!uhf_responded) {
                     paced_log(std::string("Probe UHF Reader @") + std::to_string(baud) + " -> FAIL");
                     report_probe("UHF Reader", baud, true, false);
                     return false;
@@ -1064,8 +1075,6 @@ public:
                 connection_.device_kind = DeviceKind::UHFReader;
                 connection_.pn532_ready = false;
                 connection_.status = "Connected UHF Reader";
-                if (uhf_detail.empty() && descriptor_is_uhf)
-                    uhf_detail = connection_.endpoint.label;
                 connection_.detail = (uhf_detail.empty()
                     ? (std::string("UHFReader @ ") + endpoint_path)
                     : uhf_detail) + " @" + std::to_string(baud);
