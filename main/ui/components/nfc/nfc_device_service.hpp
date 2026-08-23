@@ -1032,10 +1032,18 @@ public:
             connection_.endpoint = ep;
             return true;
         };
+        const auto reopen_at_baud = [this](int baud, std::string *open_error) -> bool {
+            TransportEndpoint ep = connection_.endpoint;
+            ep.baud_rate = baud;
+            if (!open_transport_locked(ep, open_error)) return false;
+            connection_.endpoint = ep;
+            return true;
+        };
 
         // ====================================================================
-        // USB/UART unified probing order:
-        //   UHF @115200 -> PN532/PN532Killer @115200 -> UHF @9600
+        // Shared USB/UART probing order:
+        //   PN532 command -> PN532Killer command -> plain PN532 fallback
+        //   -> UHF @115200 -> UHF @9600
         // Log each step immediately (paced 300ms) instead of flushing at end.
         // ====================================================================
         if (connection_.endpoint.kind == TransportKind::UartSerial ||
@@ -1043,6 +1051,11 @@ public:
             const char *transport_name =
                 (connection_.endpoint.kind == TransportKind::UsbSerial) ? "USB" : "UART";
             const std::string endpoint_path = connection_.endpoint.path;
+            const bool endpoint_is_known_uhf =
+                connection_.endpoint.kind == TransportKind::UsbSerial &&
+                connection_.endpoint.usb_vid == 0x1A86 &&
+                (connection_.endpoint.usb_pid == 0x55D3 ||
+                 connection_.endpoint.usb_pid == 0xFE1C);
 
             std::string open_error;
             if (!open_at_baud(115200, &open_error)) {
@@ -1059,23 +1072,22 @@ public:
                 report_probe("UHF Reader", baud, false, false);
                 paced_log(std::string("Probe UHF Reader @") + std::to_string(baud) +
                           " (" + transport_name + ")");
-                if (!open_at_baud(baud, &baud_open_error)) {
+                // Start every protocol probe from a clean serial session.  A
+                // failed PN532 probe can otherwise leave delayed D5 frames for
+                // UHF, and a failed UHF A0/BB probe can hide a plain PN532 on a
+                // CH340 adapter.
+                if (!reopen_at_baud(baud, &baud_open_error)) {
                     paced_log(std::string("Probe UHF Reader @") + std::to_string(baud) +
                               " -> open failed: " + baud_open_error);
                     report_probe("UHF Reader", baud, true, false);
                     return false;
                 }
                 std::string uhf_detail;
-                const bool descriptor_is_uhf =
-                    connection_.endpoint.kind == TransportKind::UsbSerial &&
-                    connection_.endpoint.usb_vid == 0x1A86 &&
-                    (connection_.endpoint.usb_pid == 0x55D3 ||
-                     connection_.endpoint.usb_pid == 0xFE1C);
                 bool uhf_responded = false;
                 // The reader MCU can need a few hundred milliseconds after USB
                 // enumeration. Require a real firmware reply; VID/PID alone only
                 // proves that the bridge enumerated.
-                const int attempts = descriptor_is_uhf ? 5 : 1;
+                const int attempts = endpoint_is_known_uhf ? 5 : 1;
                 for (int attempt = 0; attempt < attempts && !uhf_responded; ++attempt) {
                     uhf_responded = uhf_detect_on_open_transport_locked(
                         transport_.get(), &uhf_detail);
@@ -1099,14 +1111,29 @@ public:
                 return true;
             };
 
-            if (try_uhf(115200)) return true;
-
             report_probe("PN532", 115200, false, false);
             paced_log(std::string("Probe PN532 @115200") + " (" + transport_name + ")");
             std::string probe_error;
             std::string firmware;
+            if (!reopen_at_baud(115200, &open_error)) {
+                connection_.connected = false;
+                connection_.status = "Connect failed";
+                connection_.detail = std::string(transport_name) +
+                                     " reopen@115200 failed: " + open_error;
+                connection_.device_kind = DeviceKind::NotConnected;
+                paced_log(connection_.detail);
+                return false;
+            }
             Pn532KillerClient client(transport_.get());
             const auto kind = client.detect_device(&firmware, &probe_error);
+
+            if (kind == DeviceKind::PN532 || kind == DeviceKind::PN532Killer) {
+                paced_log("Probe PN532 @115200 -> OK");
+                report_probe("PN532", 115200, true, true);
+            } else {
+                paced_log("Probe PN532 @115200 -> FAIL");
+                report_probe("PN532", 115200, true, false);
+            }
 
             if (kind == DeviceKind::PN532) {
                 const std::string fw_label = firmware.empty() ? "PN532" : firmware;
@@ -1114,16 +1141,12 @@ public:
                 connection_.pn532_ready = true;
                 connection_.status = "Connected PN532";
                 connection_.detail = fw_label + " @ " + endpoint_path + " @115200";
-                paced_log("Probe PN532 @115200 -> OK");
-                report_probe("PN532", 115200, true, true);
                 return true;
             }
 
-            paced_log("Probe PN532 @115200 -> FAIL");
-            report_probe("PN532", 115200, true, false);
-            report_probe("PN532Killer", 115200, false, false);
-            paced_log(std::string("Probe PN532Killer @115200") + " (" + transport_name + ")");
             if (kind == DeviceKind::PN532Killer) {
+                report_probe("PN532Killer", 115200, false, false);
+                paced_log(std::string("Probe PN532Killer @115200") + " (" + transport_name + ")");
                 const std::string fw_label = firmware.empty() ? "PN532Killer" : firmware;
                 connection_.device_kind = DeviceKind::PN532Killer;
                 connection_.pn532_ready = true;
@@ -1135,12 +1158,9 @@ public:
             }
 
             if (!probe_error.empty()) {
-                paced_log(std::string("Probe PN532Killer @115200 -> FAIL (") + probe_error + ")");
-            } else {
-                paced_log("Probe PN532Killer @115200 -> FAIL");
+                paced_log(std::string("Probe PN532 @115200 detail: ") + probe_error);
             }
-
-            report_probe("PN532Killer", 115200, true, false);
+            if (try_uhf(115200)) return true;
             if (try_uhf(9600)) return true;
 
             // Keep serial connected, but mark as unknown device after full probe order.
@@ -6918,24 +6938,31 @@ private:
             0x55, 0x44, 0x33, 0x22, 0x11, 0x00, 0x00
         };
 
-        bool init_ok = false;
-        std::string init_err;
-        for (int attempt = 0; attempt < 8 && !cancel_pn532_ndef_.load(); ++attempt) {
-            client.send_wakeup();
-            client.sam_configuration(nullptr);
-            std::vector<uint8_t> init_resp;
-            if (client.tg_init_as_target(tg_init_cfg, &init_resp, &init_err)) {
-                init_ok = true;
-                break;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(120));
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            pn532_ndef_.status = "Waiting for reader";
         }
+
+        std::string init_err;
+        client.send_wakeup();
+        client.sam_configuration(nullptr);
+        std::vector<uint8_t> init_resp;
+        const bool init_ok = client.tg_init_as_target_wait(
+            tg_init_cfg,
+            [this]() { return cancel_pn532_ndef_.load(); },
+            &init_resp,
+            &init_err);
 
         if (!init_ok) {
             std::lock_guard<std::mutex> lock(mutex_);
             pn532_ndef_.running = false;
-            pn532_ndef_.status = "Init failed";
-            pn532_ndef_.error = init_err.empty() ? "TgInitAsTarget failed" : init_err;
+            if (cancel_pn532_ndef_.load()) {
+                pn532_ndef_.status = "Stopped";
+                pn532_ndef_.error.clear();
+            } else {
+                pn532_ndef_.status = "Init failed";
+                pn532_ndef_.error = init_err.empty() ? "TgInitAsTarget failed" : init_err;
+            }
             return;
         }
 

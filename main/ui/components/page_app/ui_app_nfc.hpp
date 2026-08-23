@@ -356,6 +356,7 @@ private:
     bool        uri_edit_for_nfcunit_ = false;
     bool        uri_edit_for_grove_   = false;
     uint32_t    last_key_codepoint_  = 0; // Unicode codepoint of last key event
+    uint32_t    last_key_codepoint_key_ = 0; // key whose press produced the codepoint
     nfc_app::DeviceKind last_serial_device_kind_ = nfc_app::DeviceKind::Unknown;
     // NFC Unit async write state
     bool nfcunit_write_running_ = false;
@@ -494,6 +495,34 @@ private:
             return last_serial_device_kind_;
         }
         return conn.device_kind;
+    }
+
+    static bool is_connected_pn532_ndef_device(const nfc_app::ConnectionState &conn)
+    {
+        return conn.connected &&
+               conn.device_kind == nfc_app::DeviceKind::PN532 &&
+               (conn.endpoint.kind == nfc_app::TransportKind::UsbSerial ||
+                conn.endpoint.kind == nfc_app::TransportKind::UartSerial);
+    }
+
+    void open_pn532_ndef_uri_editor()
+    {
+        static const char *PFXS[] = {"https://", "http://", "tel:", "mailto:"};
+        uri_edit_for_nfcunit_ = false;
+        uri_edit_for_grove_ = false;
+        pn532_ndef_type_idx_ = 4;
+        pn532_ndef_body_ = pn532_ndef_uri_;
+        for (int i = 0; i < 4; ++i) {
+            const size_t prefix_len = std::strlen(PFXS[i]);
+            if (pn532_ndef_uri_.size() >= prefix_len &&
+                pn532_ndef_uri_.compare(0, prefix_len, PFXS[i]) == 0) {
+                pn532_ndef_type_idx_ = i;
+                pn532_ndef_body_ = pn532_ndef_uri_.substr(prefix_len);
+                break;
+            }
+        }
+        modal_ = Modal::Pn532NdefInput;
+        modal_idx_ = 0;
     }
 
     static std::string emulator_source_filename(nfc_app::ProtocolKind protocol)
@@ -851,6 +880,18 @@ private:
 
         // Track key press for long-press scroll (Read tab or HexLog modal)
         if (IS_KEY_PRESSED(e)) {
+            // Text is committed on key release, but printable codepoints only
+            // exist on the press event in the standalone evdev queue.  Preserve
+            // the press value for the matching release so punctuation and the
+            // Cardputer Sym layer (for example '.' and '@') are not lost.
+            if (modal_ != Modal::None && key_item) {
+                uint32_t cp = key_item->codepoint;
+                if (cp == 0 && key_item->utf8[0] != '\0' && key_item->utf8[1] == '\0') {
+                    cp = static_cast<uint32_t>(static_cast<unsigned char>(key_item->utf8[0]));
+                }
+                last_key_codepoint_key_ = raw_key;
+                last_key_codepoint_ = cp;
+            }
             const uint32_t nk = normalize_main_key(raw_key);
             const bool want_scroll_read = (nk == KEY_UP || nk == KEY_DOWN)
                                           && modal_ == Modal::None
@@ -914,7 +955,7 @@ private:
                  dev_kind2 == nfc_app::DeviceKind::ST25RNFC ||
                  ep2.kind == nfc_app::TransportKind::I2cBus ||
                  (ep2.kind == nfc_app::TransportKind::SpiBus && conn2.connected));
-            const bool pn532_ndef2 = (dev_kind2 == nfc_app::DeviceKind::PN532);
+            const bool pn532_ndef2 = is_connected_pn532_ndef_device(conn2);
             const int slot2 = profile_emu2 ? 0 : hw_emu_slot_;
             if (!pn532_ndef2 &&
                 service_.emu_dump_loaded(service_.current_emulator_protocol(), slot2)) {
@@ -974,8 +1015,15 @@ private:
             if (cp == 0 && key_item && key_item->utf8[0] != '\0' && key_item->utf8[1] == '\0') {
                 cp = static_cast<uint32_t>(static_cast<unsigned char>(key_item->utf8[0]));
             }
+            if (cp == 0 && last_key_codepoint_key_ == raw_key) {
+                cp = last_key_codepoint_;
+            }
             last_key_codepoint_ = cp;
             handle_modal_key(raw_key, mods);
+            if (last_key_codepoint_key_ == raw_key) {
+                last_key_codepoint_key_ = 0;
+                last_key_codepoint_ = 0;
+            }
             return;
         }
 
@@ -1242,7 +1290,7 @@ private:
             device_kind == nfc_app::DeviceKind::ST25RNFC ||
             (endpoint.kind == nfc_app::TransportKind::SpiBus && connection.connected);
 
-        if (device_kind == nfc_app::DeviceKind::PN532) {
+        if (is_connected_pn532_ndef_device(connection)) {
             if (service_.pn532_ndef_state().running) {
                 service_.stop_pn532_ndef_emulation();
                 ui_message_ = "PN532 NDEF emulation paused";
@@ -1425,12 +1473,20 @@ private:
         tab_index = (tab_index + delta + 4) % 4;
         current_tab_ = static_cast<Tab>(tab_index);
         if (prev_tab == Tab::Read && current_tab_ != Tab::Read && ext_usb_enabled_) {
+            const auto leaving_conn = service_.connection_state();
+            const bool keep_usb_nfc_connected =
+                leaving_conn.connected &&
+                leaving_conn.endpoint.kind == nfc_app::TransportKind::UsbSerial &&
+                (leaving_conn.device_kind == nfc_app::DeviceKind::PN532 ||
+                 leaving_conn.device_kind == nfc_app::DeviceKind::PN532Killer);
             if (service_.uhf_continuous_scan_running()) {
                 std::string ignored;
                 (void)service_.stop_uhf_continuous_scan(&ignored);
             }
-            service_.disconnect();
-            set_ext_usb_power(false);
+            if (!keep_usb_nfc_connected) {
+                service_.disconnect();
+                set_ext_usb_power(false);
+            }
         } else if (current_tab_ == Tab::Read) {
             sync_ext_usb_power();
         }
@@ -1897,9 +1953,15 @@ private:
 
         if (verb_upper == "STATUS") {
             const auto conn = service_.connection_state();
+            const auto ndef = service_.pn532_ndef_state();
             std::ostringstream oss;
             oss << "status connected=" << (conn.connected ? 1 : 0)
                 << " device=" << nfc_app::to_string(conn.device_kind)
+                << " transport=" << nfc_app::to_string(conn.endpoint.kind)
+                << " endpoint=" << conn.endpoint.path
+                << " ndef_running=" << (ndef.running ? 1 : 0)
+                << " ndef_status=" << ndef.status
+                << " ndef_error=" << ndef.error
                 << " profile=" << service_.nfcunit_profile_label()
                 << " running=" << (service_.nfcunit_emulation_running() ? 1 : 0)
                 << " nfc_profile=" << service_.nfcunit_profile_label()
@@ -1909,6 +1971,113 @@ private:
                 << " spi_iso15693_emu=" << (service_.spi_supports_iso15693_emulation() ? 1 : 0);
             emit_ok(oss.str());
             ui_message_ = "Automation status exported";
+            return;
+        }
+
+        if (verb_upper == "USB_CONNECT") {
+            std::string path;
+            std::getline(iss, path);
+            path = trim_ascii(path);
+            service_.refresh_endpoints();
+            const auto endpoints = service_.usb_endpoints();
+            if (endpoints.empty()) {
+                emit_err("no USB serial endpoint");
+                ui_message_ = "Automation: no USB device";
+                return;
+            }
+            if (path.empty()) path = endpoints.front().path;
+            if (!service_.select_usb_endpoint_by_path(path)) {
+                emit_err("USB endpoint not found: " + path);
+                ui_message_ = "Automation: USB not found";
+                return;
+            }
+            if (!service_.connect_current()) {
+                const auto conn = service_.connection_state();
+                emit_err(conn.detail.empty() ? "USB connect failed" : conn.detail);
+                ui_message_ = "Automation: USB connect failed";
+                return;
+            }
+            const auto conn = service_.connection_state();
+            emit_ok(std::string("usb connected device=") +
+                    nfc_app::to_string(conn.device_kind) +
+                    " endpoint=" + conn.endpoint.path);
+            ui_message_ = std::string("USB: ") + nfc_app::to_string(conn.device_kind);
+            render_all();
+            return;
+        }
+
+        if (verb_upper == "NDEF_START") {
+            std::string uri;
+            std::getline(iss, uri);
+            uri = trim_ascii(uri);
+            if (uri.empty()) uri = "https://m5stack.com";
+            std::string err;
+            if (!service_.start_pn532_ndef_emulation(uri, &err)) {
+                emit_err(err.empty() ? "NDEF start failed" : err);
+                ui_message_ = "Automation: NDEF start failed";
+                return;
+            }
+            pn532_ndef_uri_ = uri;
+            current_tab_ = Tab::Emulator;
+            emit_ok("ndef started uri=" + uri);
+            ui_message_ = "PN532 NDEF emulation running";
+            render_all();
+            return;
+        }
+
+        if (verb_upper == "NDEF_STOP") {
+            service_.stop_pn532_ndef_emulation();
+            emit_ok("ndef stopped");
+            ui_message_ = "PN532 NDEF emulation stopped";
+            render_all();
+            return;
+        }
+
+        if (verb_upper == "UI_EMU_OK") {
+            current_tab_ = Tab::Read;
+            modal_ = Modal::None;
+            switch_tab(2);
+            activate();
+            const auto conn = service_.connection_state();
+            if (is_connected_pn532_ndef_device(conn) &&
+                modal_ == Modal::Pn532NdefInput) {
+                emit_ok("emu OK opened PN532 URL editor");
+            } else {
+                emit_err(std::string("emu OK route failed device=") +
+                         nfc_app::to_string(conn.device_kind));
+            }
+            render_all();
+            return;
+        }
+
+        if (verb_upper == "UI_URI_SYMBOL_TEST") {
+            if (modal_ != Modal::Pn532NdefInput) {
+                emit_err("URL editor is not open");
+                return;
+            }
+            const std::string original = pn532_ndef_body_;
+            auto send_printable_key = [](uint32_t raw_key, char ch) {
+                struct key_item press{};
+                press.key_code = raw_key;
+                press.key_state = KBD_KEY_PRESSED;
+                press.codepoint = static_cast<uint32_t>(static_cast<unsigned char>(ch));
+                press.utf8[0] = ch;
+                lv_obj_send_event(lv_screen_active(),
+                                  static_cast<lv_event_code_t>(LV_EVENT_KEYBOARD), &press);
+
+                struct key_item release{};
+                release.key_code = raw_key;
+                release.key_state = KBD_KEY_RELEASED;
+                lv_obj_send_event(lv_screen_active(),
+                                  static_cast<lv_event_code_t>(LV_EVENT_KEYBOARD), &release);
+            };
+            send_printable_key(232, '.');
+            send_printable_key(184, '@');
+            const bool ok = pn532_ndef_body_ == original + ".@";
+            pn532_ndef_body_ = original;
+            if (ok) emit_ok("URL editor accepted . and @");
+            else emit_err("URL editor symbol input failed");
+            render_all();
             return;
         }
 
@@ -2303,6 +2472,10 @@ private:
             {
                 const auto conn0 = service_.connection_state();
                 cache_serial_device_kind(conn0);
+                if (is_connected_pn532_ndef_device(conn0)) {
+                    open_pn532_ndef_uri_editor();
+                    break;
+                }
                 const auto endpoint = active_endpoint_for_ui(conn0);
                 if (endpoint.kind == nfc_app::TransportKind::I2cBus ||
                     (endpoint.kind == nfc_app::TransportKind::SpiBus && conn0.connected)) {
@@ -3336,7 +3509,7 @@ private:
         lv_obj_set_style_clip_corner(right, true, 0);
 
         if (false) { // placeholder — PN532Killer handled above
-        } else if (emu_device_kind == nfc_app::DeviceKind::PN532) {
+        } else if (is_connected_pn532_ndef_device(connection)) {
             // ── PN532 NDEF target emulation ───────────────────────────────────
             const auto ndef = service_.pn532_ndef_state();
             create_text(left, 6, 4,  "NDEF EMU", 0x00D2FF, 12);
@@ -3545,7 +3718,7 @@ private:
         cache_serial_device_kind(conn);
         const auto endpoint = active_endpoint_for_ui(conn);
         const auto emu_device_kind = effective_emu_device_kind(conn);
-        const bool pn532_ndef_menu = (emu_device_kind == nfc_app::DeviceKind::PN532);
+        const bool pn532_ndef_menu = is_connected_pn532_ndef_device(conn);
         const bool st25r_mode =
             (emu_device_kind == nfc_app::DeviceKind::ST25RNFC) ||
             (endpoint.kind == nfc_app::TransportKind::SpiBus && conn.connected);
@@ -3682,6 +3855,8 @@ private:
                     ui_message_ = "Set URL failed (save error)";
                 }
                 uri_edit_for_grove_ = false;
+            } else {
+                ui_message_ = "PN532 NDEF URL updated";
             }
             modal_ = Modal::None;
             return;
@@ -5322,6 +5497,28 @@ private:
     // General text input (letters + digits + basic symbols, lowercase)
     static char keycode_to_char(uint32_t key)
     {
+        // Cardputer Sym-layer keycodes.  The event codepoint path is preferred,
+        // but this keeps text entry usable with keyboard stacks that only emit
+        // the extended raw keycode on release.
+        switch (key) {
+        case 183: return '!'; case 184: return '@'; case 185: return '#';
+        case 186: return '$'; case 187: return '%'; case 188: return '^';
+        case 189: return '&'; case 190: return '*'; case 191: return '(';
+        case 192: return ')'; case 193: return '~'; case 194: return '`';
+        case 195: return '+'; case 196: return '-'; case 197: return '/';
+        case 198: return '\\'; case 199: return '{'; case 200: return '}';
+        case 201: return '['; case 202: return ']';
+        case 203: case 233: return '|';
+        case 204: case 209: return '=';
+        case 205: case 210: return ':';
+        case 206: case 211: return ';';
+        case 207: case 212: return '_';
+        case 208: case 213: return '?';
+        case 214: return '<'; case 215: return '>';
+        case 216: return '\''; case 217: return '"';
+        case 231: return ','; case 232: return '.';
+        default: break;
+        }
         if (key >= KEY_1 && key <= KEY_9) return '0' + (int)(key - KEY_1) + 1;
         if (key == KEY_0) return '0';
         static const char qwerty[] = "qwertyuiop";
@@ -6087,7 +6284,7 @@ private:
         cache_serial_device_kind(conn);
         const auto dev_kind = effective_emu_device_kind(conn);
         const auto endpoint = active_endpoint_for_ui(conn);
-        const bool pn532_ndef_menu = (dev_kind == nfc_app::DeviceKind::PN532);
+        const bool pn532_ndef_menu = is_connected_pn532_ndef_device(conn);
         const bool st25r_mode =
             (dev_kind == nfc_app::DeviceKind::ST25RNFC) ||
             (endpoint.kind == nfc_app::TransportKind::SpiBus && conn.connected);
@@ -6118,22 +6315,7 @@ private:
             }
             if (pn532_ndef_menu) {
                 if (modal_idx_ == 0) {
-                    // Edit URI: parse existing URI to pre-fill type + body
-                    static const char *PFXS[] = {"https://", "http://", "tel:", "mailto:"};
-                    uri_edit_for_nfcunit_ = false;
-                    pn532_ndef_type_idx_ = 4; // default: custom
-                    pn532_ndef_body_ = pn532_ndef_uri_;
-                    for (int i = 0; i < 4; ++i) {
-                        const size_t plen = strlen(PFXS[i]);
-                        if (pn532_ndef_uri_.size() >= plen &&
-                            pn532_ndef_uri_.substr(0, plen) == PFXS[i]) {
-                            pn532_ndef_type_idx_ = i;
-                            pn532_ndef_body_ = pn532_ndef_uri_.substr(plen);
-                            break;
-                        }
-                    }
-                    modal_ = Modal::Pn532NdefInput;
-                    modal_idx_ = 0;
+                    open_pn532_ndef_uri_editor();
                     break;
                 }
             }

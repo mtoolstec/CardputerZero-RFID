@@ -373,6 +373,45 @@ public:
         return true;
     }
 
+    // TgInitAsTarget normally returns only after an external initiator activates
+    // the target.  A short command timeout is therefore not an initialization
+    // failure.  Keep the command pending until activation or caller cancellation.
+    bool tg_init_as_target_wait(const std::vector<uint8_t> &config,
+                                const std::function<bool()> &cancelled,
+                                std::vector<uint8_t> *resp_data,
+                                std::string *error)
+    {
+        const std::vector<uint8_t> frame = Pn532FrameCodec::build_command(0x8C, config);
+        if (transport_->write_bytes(frame.data(), frame.size(), error) < 0) return false;
+
+        std::vector<uint8_t> rx;
+        uint8_t buffer[128];
+        while (!cancelled || !cancelled()) {
+            const ssize_t got = transport_->read_bytes(buffer, sizeof(buffer), 100, error);
+            if (got < 0) return false;
+            if (got == 0) continue;
+            rx.insert(rx.end(), buffer, buffer + got);
+
+            std::vector<uint8_t> fd;
+            if (Pn532FrameCodec::parse_first_frame(rx, &fd)) {
+                if (fd.size() >= 2 && fd[0] == 0xD5 && fd[1] == 0x8D) {
+                    if (resp_data) resp_data->assign(fd.begin() + 2, fd.end());
+                    if (error) error->clear();
+                    return true;
+                }
+                if (error) *error = "unexpected TgInitAsTarget response";
+                return false;
+            }
+
+            // ACK plus a target response is tiny.  Bound stale/noisy input while
+            // preserving enough tail bytes for a split PN532 frame.
+            if (rx.size() > 4096) rx.erase(rx.begin(), rx.end() - 512);
+        }
+
+        if (error) *error = "TgInitAsTarget cancelled";
+        return false;
+    }
+
     // TgGetData (0x86): receive one APDU/data packet from initiator.
     // Output includes the PN532 target status byte at out[0].
     bool tg_get_data(std::vector<uint8_t> *out, std::string *error)
@@ -551,15 +590,10 @@ public:
         // Build preliminary firmware label (overridden for PN532Killer).
         if (firmware_out) *firmware_out = fw->chip + " " + fw->version;
 
-        // Step 3: checkPn532Killer (0xAA) to distinguish Killer from plain PN532.
-        // Fallback: PN532Killer encodes build date as vYEAR.MONTH (≥ v10), while
-        // plain PN532 reports v1.xx (NXP silicon revision).
-        bool version_looks_like_killer = false;
-        if (!fw->version.empty() && fw->version[0] == 'v') {
-            int ver = std::atoi(fw->version.c_str() + 1);
-            version_looks_like_killer = (ver >= 10);
-        }
-        const bool is_killer = probe_pn532killer(nullptr) || version_looks_like_killer;
+        // Step 3: after a real PN532 GetFirmwareVersion response, explicitly
+        // check the PN532Killer-only 0xAA command.  If it does not respond, the
+        // already-confirmed device is a plain PN532.
+        const bool is_killer = probe_pn532killer(nullptr);
 
         if (is_killer) {
             if (firmware_out) {
