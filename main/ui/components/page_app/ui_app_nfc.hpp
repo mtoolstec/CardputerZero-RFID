@@ -3816,14 +3816,20 @@ private:
                     pfx[0] ? 0xF7A600 : 0x888888, 10);
         create_text(card, 170, 20, "[Tab:type]", 0x555555, 9);
 
-        // Body input – tail-compact so cursor stays visible when text is long
-        create_text(card, 8, 36,
-                    to_tail_compact(pn532_ndef_body_ + "_", 36).c_str(),
-                    0xFFFFFF, 11);
+        // Body input is the primary content on this small screen.  Use a
+        // clearly larger font than the action hints and keep the editable tail
+        // visible after increasing the glyph size.
+        lv_obj_t *body = create_text(card, 8, 34,
+                                     to_tail_compact(pn532_ndef_body_ + "_", 28).c_str(),
+                                     0xFFFFFF, 12);
+        lv_obj_set_style_text_font(body, &lv_font_montserrat_14,
+                                   LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_width(body, 264);
+        lv_label_set_long_mode(body, LV_LABEL_LONG_CLIP);
 
-        // Hints
-        create_text(card, 8, 56, "Bsp:del  Enter:save", 0x555555, 9);
-        create_text(card, 8, 70, "Tab:type  ESC:cancel", 0x7A7A7A, 9);
+        // Secondary actions should stay legible without competing with the URL.
+        create_text(card, 8, 56, "Bsp:del  Enter:save", 0x666666, 7);
+        create_text(card, 8, 69, "Tab:type  ESC:cancel", 0x777777, 7);
     }
 
     void handle_pn532_ndef_input_key(uint32_t key)
