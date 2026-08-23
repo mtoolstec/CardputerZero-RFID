@@ -2071,8 +2071,10 @@ private:
                 lv_obj_send_event(lv_screen_active(),
                                   static_cast<lv_event_code_t>(LV_EVENT_KEYBOARD), &release);
             };
-            send_printable_key(232, '.');
-            send_printable_key(184, '@');
+            // Use the real built-in TCA8418 Sys-layer keycodes from the device
+            // keymap: Sys+B -> 91 (period), Sys+2 -> 27 (at).
+            send_printable_key(91, '.');
+            send_printable_key(27, '@');
             const bool ok = pn532_ndef_body_ == original + ".@";
             pn532_ndef_body_ = original;
             if (ok) emit_ok("URL editor accepted . and @");
@@ -5497,6 +5499,24 @@ private:
     // General text input (letters + digits + basic symbols, lowercase)
     static char keycode_to_char(uint32_t key)
     {
+        // Built-in TCA8418 Sys-layer keycodes as emitted by evdev after the
+        // kernel matrix keymap.  This is the release-event fallback for the
+        // same table used by main.cpp's press-event codepoint conversion.
+        switch (key) {
+        case 26: return '!'; case 27: return '@'; case 39: return '#';
+        case 40: return '$'; case 41: return '%'; case 43: return '^';
+        case 51: return '&'; case 52: return '*'; case 53: return '(';
+        case 94: return ')'; case 55: return '~'; case 69: return '`';
+        case 70: return '_'; case 71: return '-'; case 72: return '+';
+        case 73: return '='; case 74: return '['; case 75: return ']';
+        case 76: return '{'; case 77: return '}'; case 79: return ';';
+        case 80: return ':'; case 81: return '\''; case 82: return '"';
+        case 83: return '<'; case 85: return '>'; case 86: return '\\';
+        case 89: return '|'; case 90: return ','; case 91: return '.';
+        case 92: return '/'; case 93: return '?';
+        default: break;
+        }
+
         // Cardputer Sym-layer keycodes.  The event codepoint path is preferred,
         // but this keeps text entry usable with keyboard stacks that only emit
         // the extended raw keycode on release.

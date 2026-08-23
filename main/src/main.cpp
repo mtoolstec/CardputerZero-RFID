@@ -84,6 +84,31 @@ static bool g_alt_active   = false;
 // ---------------------------------------------------------------------------
 static uint32_t keycode_to_codepoint(uint32_t keycode, bool shift, bool alt, char *utf8_out)
 {
+    // Built-in TCA8418 Sys-layer keycodes after the kernel matrix keymap has
+    // translated the physical scan code.  RFID reads evdev directly (without
+    // APPLaunch's xkbcommon layer), so these numbers must match
+    // /usr/share/keymaps/tca8418_keypad_m5stack_keymap.map.  In particular,
+    // Sys+B emits keycode 91 for '.', and Sys+2 emits keycode 27 for '@'.
+    struct SysSymbol { uint32_t code; char value; };
+    static const SysSymbol sys_symbols[] = {
+        {26, '!'}, {27, '@'}, {39, '#'}, {40, '$'}, {41, '%'},
+        {43, '^'}, {51, '&'}, {52, '*'}, {53, '('}, {94, ')'},
+        {55, '~'}, {69, '`'}, {70, '_'}, {71, '-'}, {72, '+'},
+        {73, '='}, {74, '['}, {75, ']'}, {76, '{'}, {77, '}'},
+        {79, ';'}, {80, ':'}, {81, '\''}, {82, '"'}, {83, '<'},
+        {85, '>'}, {86, '\\'}, {89, '|'}, {90, ','}, {91, '.'},
+        {92, '/'}, {93, '?'},
+    };
+    for (const auto &symbol : sys_symbols) {
+        if (symbol.code == keycode) {
+            if (utf8_out) {
+                utf8_out[0] = symbol.value;
+                utf8_out[1] = '\0';
+            }
+            return static_cast<uint32_t>(static_cast<unsigned char>(symbol.value));
+        }
+    }
+
     // Cardputer Sym-layer extended keycodes emitted by some keyboard stacks.
     // Keep these explicit so URI/text input can receive punctuation reliably.
     switch (keycode) {
