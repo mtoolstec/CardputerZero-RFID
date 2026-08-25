@@ -137,13 +137,13 @@ cd projects/RFID
 python3 tools/package_deb.py --maintainer "yourname <you@example.com>"
 ```
 
-Output: `build/rfid_0.1-m5stack1_arm64.deb`
+Output: `build/rfid_0.3-m5stack1_arm64.deb`
 
 Install:
 
 ```bash
-scp build/rfid_0.1-m5stack1_arm64.deb pi@<device-ip>:/tmp/
-ssh pi@<device-ip> "echo pi | sudo -S dpkg -i /tmp/rfid_0.1-m5stack1_arm64.deb"
+scp build/rfid_0.3-m5stack1_arm64.deb pi@<device-ip>:/tmp/
+ssh pi@<device-ip> "echo pi | sudo -S dpkg -i /tmp/rfid_0.3-m5stack1_arm64.deb"
 ```
 
 ## APPLaunch Integration

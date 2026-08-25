@@ -19,10 +19,6 @@ from datetime import datetime
 from pathlib import Path
 
 
-FORCED_ICON_SOURCE = Path(
-    "/Users/wilson/Github/M5CardputerZero-UserDemo/projects/APPLaunch/APPLaunch/share/images/ic_rfid.png"
-)
-
 TOOL_BINARY_DIR_CANDIDATES = [
     "dist_mfkey",
 ]
@@ -144,10 +140,6 @@ def create_package(
     (app_install_dir).mkdir(parents=True, exist_ok=True)
     tool_install_dir.mkdir(parents=True, exist_ok=True)
 
-    if FORCED_ICON_SOURCE.exists():
-        forced_local_icon = project_root / "share" / "images" / "ic_rfid.png"
-        copy_if_exists(FORCED_ICON_SOURCE, forced_local_icon)
-
     # Binary + desktop + share assets
     copy_if_exists(bin_src, app_install_dir / bin_name)
     (app_install_dir / bin_name).chmod(0o755)
@@ -162,7 +154,12 @@ def create_package(
 
     share_src = project_root / "share"
     if share_src.exists():
-        shutil.copytree(share_src, app_install_dir / "share", dirs_exist_ok=True)
+        shutil.copytree(
+            share_src,
+            app_install_dir / "share",
+            dirs_exist_ok=True,
+            ignore=shutil.ignore_patterns(".DS_Store"),
+        )
 
     # ── Default emulator dumps for Reset to default ───────────────────────────
     config_defaults_src = project_root / "config" / "defaults"
@@ -182,11 +179,10 @@ def create_package(
 
     icon_rel = Path(meta.get("icon", "share/images/ic_rfid.png")).as_posix().strip()
     icon_dst = app_root / icon_rel
-    if FORCED_ICON_SOURCE.exists():
-        copy_if_exists(FORCED_ICON_SOURCE, icon_dst)
-    else:
-        icon_src = project_root / icon_rel
-        copy_if_exists(icon_src, icon_dst)
+    icon_src = project_root / icon_rel
+    if not icon_src.exists():
+        raise RuntimeError(f"missing icon: {icon_src}")
+    copy_if_exists(icon_src, icon_dst)
 
     control = (
         f"Package: {package_name}\n"
@@ -276,7 +272,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--version", default=None, help="Override version from app-builder.json")
     parser.add_argument(
         "--maintainer",
-        default="wilson <wilson@example.com>",
+        default="m5stack <m5stack@m5stack.com>",
         help="Maintainer field in DEBIAN/control",
     )
     parser.add_argument(

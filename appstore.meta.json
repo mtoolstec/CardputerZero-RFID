@@ -12,7 +12,12 @@
   "license": "MIT",
   "source_repo": "https://github.com/CardputerZero/RFID",
   "icon": "share/images/ic_rfid.png",
-  "screenshots": ["screenshots/01.png"],
+  "screenshots": [
+    "screenshots/01.png",
+    "screenshots/02.png",
+    "screenshots/03.png",
+    "screenshots/04.png"
+  ],
   "permissions": {
     "keyboard_input": true,
     "external_hardware": true,
