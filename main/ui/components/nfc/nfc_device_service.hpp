@@ -6578,15 +6578,10 @@ private:
                 const auto p = base_record.tag.protocol;
                 const auto &id = base_record.tag.identity_fields;
                 const bool is_mfc = (p == ProtocolKind::MifareClassic);
-                // SPI returns ATQA in wire order (LSB first: "4400" for NTAG)
-                auto norm_atqa = [](const std::string &s) -> std::string {
-                    if (s.size() == 4) return s.substr(2, 2) + s.substr(0, 2);
-                    return s;
-                };
+                // All selected SAK=00 NFC-A tags use the Type 2 / Ultralight
+                // read path. ATQA is not a reliable NTAG-vs-MFU discriminator.
                 const bool is_ntag = (p == ProtocolKind::Iso14443A &&
-                    id.count("SAK") && id.at("SAK") == "00" &&
-                    id.count("ATQA") &&
-                    (id.at("ATQA") == "0044" || norm_atqa(id.at("ATQA")) == "0044"));
+                    id.count("SAK") && normalize_hex(id.at("SAK")) == "00");
 
                 I2cCardInfo card_info;
                 std::vector<std::vector<uint8_t>> blocks;

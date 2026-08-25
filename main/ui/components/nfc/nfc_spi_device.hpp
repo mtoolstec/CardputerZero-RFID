@@ -1266,6 +1266,10 @@ private:
             if (last_irq_main) *last_irq_main = irq;
             if (last_fifo_bytes) *last_fifo_bytes = fifo_b;
             if (last_irq_timer) *last_irq_timer = irq_t;
+            // Avoid saturating the level-translated SPI bus while waiting for
+            // the RF response. The official Cap driver also sleeps between
+            // FIFO checks.
+            sleep_ms(1);
         }
         return false;
     }
@@ -1276,9 +1280,11 @@ private:
         direct_cmd(st25r_cmd::SET_DEFAULT);
         sleep_ms(2);
 
-        // Keep IO configuration aligned with probe path. After SET_DEFAULT,
-        // IO_CONF2 must be restored or MISO may float and read back as 0xFF.
-        write_reg(st25r_reg::IO_CONF2, 0x04);
+        // Match the official Cap-CC1101-NFC driver. Both MISO pull-downs are
+        // needed for stable direction switching through CardputerZero's level
+        // translated SPI bus; without them transfers can echo MOSI or read FF.
+        write_reg(st25r_reg::IO_CONF1, 0x07);
+        write_reg(st25r_reg::IO_CONF2, 0x3C);
 
         // Calibrate regulators before enabling RF blocks.
         direct_cmd(st25r_cmd::ADJUST_REGULATORS);
@@ -1468,10 +1474,8 @@ private:
             return "MFC1K";
         }
         if (sak == 0x00) {
-            // NTAG / MIFARE Ultralight
-            if (atqa[0] == 0x44) return "NTAG213";
-            if (atqa[0] == 0x04 && atqa[1] == 0x00) return "MFUL";
-            return "ISO14443A";
+            // ATQA/SAK alone cannot distinguish NTAG from MIFARE Ultralight.
+            return "NTAG/MFU";
         }
         if ((sak & 0x20) != 0) return "ISO14443A"; // ISO-DEP
         return "ISO14443A";
@@ -1695,30 +1699,64 @@ public:
             return false;
         }
 
-        const auto &info = out_info ? *out_info : local_info;
-        // SPI returns ATQA in LSB-first wire order ("4400" for NTAG).
-        // Normalize to canonical "0044" for comparison.
-        auto norm4 = [](const std::string &s) -> std::string {
-            if (s.size() == 4) return s.substr(2, 2) + s.substr(0, 2);
-            return s;
-        };
-        const std::string atqa_norm = norm4(info.atqa_hex);
-        const bool is_ntag = (info.sak_hex == "00" && atqa_norm == "0044");
-        if (!is_ntag) {
+        auto &info = out_info ? *out_info : local_info;
+        // SAK=00 identifies an NFC Forum Type 2 / Ultralight-compatible tag.
+        // ATQA is not a reliable NTAG-vs-MFU gate: genuine Ultralight variants
+        // and clones use more than one ATQA value.
+        if (info.sak_hex != "00") {
             set_rf_field(false);
-            if (error) *error = "Not an NTAG/MFU card";
+            if (error) *error = "Not a Type 2 / NTAG / MFU card";
             return false;
         }
 
-        // Default NTAG213 = 45 pages
-        int total_pages = 45;
+        // Prove that the mandatory Type 2 READ works before sending optional
+        // identification commands. Older Ultralight tags do not support
+        // GET_VERSION and can stop responding after receiving it.
+        uint8_t manufacturer[16] = {0};
+        if (!mfu_read_block(0x30, 0, manufacturer, sizeof(manufacturer))) {
+            I2cCardInfo retry_info;
+            if (!select_card_iso14443a(&retry_info, true) || retry_info.sak_hex != "00" ||
+                !mfu_read_block(0x30, 0, manufacturer, sizeof(manufacturer))) {
+                set_rf_field(false);
+                if (error) *error = "Type 2 page 0 read failed";
+                return false;
+            }
+            info = retry_info;
+        }
+
+        // Original MIFARE Ultralight has 16 pages. A valid NFC Forum
+        // capability container safely expands the readable user/NDEF range.
+        int total_pages = 16;
+        if (manufacturer[12] == 0xE1 && manufacturer[14] != 0) {
+            total_pages = std::max(total_pages, 4 + static_cast<int>(manufacturer[14]) * 2);
+        }
+
+        std::string detected_protocol = info.protocol;
         uint8_t version[8] = {0};
         if (mfu_read_block(0x60, 0, version, 8)) {
-            if (version[6] == 0x0B || version[6] == 0x0E ||
-                version[6] == 0x0F || version[6] == 0x11) total_pages = 45;
-            else if (version[6] == 0x12) total_pages = 135;
-            else if (version[6] == 0x13) total_pages = 231;
+            const uint8_t ic_type = version[2];
+            const uint8_t storage = version[6];
+            if (ic_type == 0x03) {
+                if      (storage == 0x06) { total_pages = 16; detected_protocol = "MFUL"; }
+                else if (storage == 0x0B) { total_pages = 20; detected_protocol = "MFUL11"; }
+                else if (storage == 0x0E) { total_pages = 41; detected_protocol = "MFUL21"; }
+            } else if (ic_type == 0x04) {
+                if      (storage == 0x0F) { total_pages = 45; detected_protocol = "NTAG213"; }
+                else if (storage == 0x11 || storage == 0x12) { total_pages = 135; detected_protocol = "NTAG215"; }
+                else if (storage == 0x13) { total_pages = 231; detected_protocol = "NTAG216"; }
+            }
         }
+
+        // GET_VERSION may be unsupported and can alter the selected state.
+        // Always reselect before the actual dump.
+        I2cCardInfo dump_info;
+        if (!select_card_iso14443a(&dump_info, true) || dump_info.sak_hex != "00") {
+            set_rf_field(false);
+            if (error) *error = "Type 2 tag reselection failed";
+            return false;
+        }
+        info = dump_info;
+        info.protocol = detected_protocol;
 
         if (out_pages) *out_pages = total_pages;
 
@@ -1728,28 +1766,37 @@ public:
         }
 
         out_blocks->clear();
-        int failures = 0;
         for (int pg = 0; pg < total_pages; pg += 4) {
             uint8_t buf[16] = {0};
-            if (mfu_read_block(0x30, static_cast<uint8_t>(pg), buf, 16)) {
-                for (int i = 0; i < 4 && (pg + i) < total_pages; ++i) {
-                    std::vector<uint8_t> block(buf + i*4, buf + i*4 + 4);
-                    out_blocks->push_back(std::move(block));
+            bool read_ok = mfu_read_block(0x30, static_cast<uint8_t>(pg), buf, sizeof(buf));
+            if (!read_ok) {
+                // Never turn a transport failure into a fabricated zero page.
+                // Reselect once and retry the same four-page group.
+                I2cCardInfo retry_info;
+                read_ok = select_card_iso14443a(&retry_info, true) && retry_info.sak_hex == "00" &&
+                          mfu_read_block(0x30, static_cast<uint8_t>(pg), buf, sizeof(buf));
+                if (read_ok) {
+                    info = retry_info;
+                    info.protocol = detected_protocol;
                 }
-            } else {
-                ++failures;
-                for (int i = 0; i < 4 && (pg + i) < total_pages; ++i) {
-                    out_blocks->push_back({0x00, 0x00, 0x00, 0x00});
+            }
+            if (!read_ok) {
+                set_rf_field(false);
+                out_blocks->clear();
+                if (error) {
+                    char msg[72];
+                    std::snprintf(msg, sizeof(msg), "Type 2 read failed at page %d", pg);
+                    *error = msg;
                 }
+                return false;
+            }
+            for (int i = 0; i < 4 && (pg + i) < total_pages; ++i) {
+                std::vector<uint8_t> block(buf + i*4, buf + i*4 + 4);
+                out_blocks->push_back(std::move(block));
             }
         }
 
         set_rf_field(false);
-        if (failures > 0 && error) {
-            char buf[64];
-            std::snprintf(buf, sizeof(buf), "dump completed with %d page read errors", failures);
-            *error = buf;
-        }
         return true;
 #else
         if (error) *error = "SPI not supported";
@@ -1769,12 +1816,13 @@ private:
             write_reg(st25r_reg::ISO14443A_NFC, iso_mode);
 
             uint8_t tx[4] = {cmd, param, 0x00, 0x00};
-            size_t tx_len = 2;
+            const size_t payload_len = (cmd == 0x60) ? 1u : 2u;
+            size_t tx_len = payload_len;
             if (append_crc) {
-                const uint16_t crc = crc_a(tx, 2);
-                tx[2] = static_cast<uint8_t>(crc & 0xFF);
-                tx[3] = static_cast<uint8_t>((crc >> 8) & 0xFF);
-                tx_len = 4;
+                const uint16_t crc = crc_a(tx, payload_len);
+                tx[payload_len] = static_cast<uint8_t>(crc & 0xFF);
+                tx[payload_len + 1] = static_cast<uint8_t>((crc >> 8) & 0xFF);
+                tx_len = payload_len + 2;
             }
 
             write_reg(st25r_reg::NUM_TX_BYTES1, 0x00);
@@ -1793,6 +1841,9 @@ private:
         };
 
         if (try_read(0x00, true,  false)) return true;
+        // GET_VERSION is optional. Do not repeatedly send alternate malformed
+        // profiles to older Ultralight tags that correctly NAK it.
+        if (cmd == 0x60) return false;
         if (try_read(0x40, true,  false)) return true;
         if (try_read(0x00, false, true )) return true;
         if (try_read(0x40, false, true )) return true;
@@ -1938,7 +1989,8 @@ public:
         // Full software reset to recover from SubCarrierStream mode
         direct_cmd(st25r_cmd::SET_DEFAULT);
         usleep(2000);
-        write_reg(st25r_reg::IO_CONF2, 0x04);
+        write_reg(st25r_reg::IO_CONF1, 0x07);
+        write_reg(st25r_reg::IO_CONF2, 0x3C);
         direct_cmd(st25r_cmd::ADJUST_REGULATORS);
         write_reg(st25r_reg::OP_CONTROL, 0x80);
     }
