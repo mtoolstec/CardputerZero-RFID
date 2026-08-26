@@ -176,6 +176,8 @@ class UINfcPage : public app_base
         SpiSelect,     // SPI bus scan: choose which device to connect
         HexLog,        // Ctrl+L full-screen hex TX/RX log overlay
         Pn532NdefInput,// PN532 NDEF URI input popup
+        UhfTagAction,  // EPC/TID/User Data operations for selected inventory row
+        UhfTagEdit,    // Hex editor for the selected UHF memory bank
     };
 
     enum class ReadMenuAction {
@@ -257,6 +259,12 @@ private:
     int log_scroll_offset_ = 0;
     std::vector<nfc_app::NfcDeviceService::UhfTableRow> uhf_table_rows_;
     int uhf_table_scroll_offset_ = 0;
+    int uhf_table_selected_idx_ = -1;
+    int uhf_tag_bank_idx_ = 0;
+    std::string uhf_selected_epc_;
+    std::string uhf_bank_values_[3];
+    bool uhf_bank_loaded_[3] = {false, false, false};
+    std::string uhf_tag_edit_buf_;
     bool last_scan_running_ = false;
     uint64_t last_uhf_read_total_ = 0;
     uint64_t uhf_rate_window_total_ = 0;
@@ -1027,6 +1035,13 @@ private:
             return;
         }
 
+        if (current_tab_ == Tab::Read && read_uses_uhf_table() &&
+            (raw_key == KEY_F || raw_key == KEY_X)) {
+            select_uhf_inventory_row(raw_key == KEY_X ? 1 : -1);
+            render_all();
+            return;
+        }
+
         // In EMU tab: 1-8 keys switch PN532Killer slot; F/X scroll dump
         if (current_tab_ == Tab::Emulator && modal_ == Modal::None &&
             (raw_key >= KEY_1 && raw_key <= KEY_8)) {
@@ -1093,6 +1108,12 @@ private:
             break;
         case KEY_TAB:
             if (current_tab_ == Tab::Read) {
+                const auto current_connection = service_.connection_state();
+                if (current_connection.connected) {
+                    ui_message_ = "Reader connected";
+                    render_all();
+                    break;
+                }
                 service_.cycle_device_mode(&ui_message_);
                 sync_ext_usb_power();
                 // Auto-scroll pill bar so the newly active transport is visible
@@ -1183,6 +1204,8 @@ private:
                     service_.clear_uhf_table();
                     uhf_table_rows_.clear();
                     uhf_table_scroll_offset_ = 0;
+                    uhf_table_selected_idx_ = -1;
+                    uhf_selected_epc_.clear();
                 }
                 scan_log_lines_.clear();
                 log_scroll_offset_ = 0;
@@ -2347,17 +2370,103 @@ private:
         ui_message_ = "Automation: unknown command";
     }
 
+    nfc_app::NfcDeviceService::UhfMemoryBank selected_uhf_bank() const
+    {
+        if (uhf_tag_bank_idx_ == 1) return nfc_app::NfcDeviceService::UhfMemoryBank::Tid;
+        if (uhf_tag_bank_idx_ == 2) return nfc_app::NfcDeviceService::UhfMemoryBank::User;
+        return nfc_app::NfcDeviceService::UhfMemoryBank::Epc;
+    }
+
+    static const char *uhf_bank_name(int index)
+    {
+        static const char *names[] = {"EPC", "TID", "User Data"};
+        return names[std::max(0, std::min(index, 2))];
+    }
+
+    void select_uhf_inventory_row(int delta)
+    {
+        uhf_table_rows_ = service_.uhf_table_rows();
+        if (uhf_table_rows_.empty()) {
+            uhf_table_selected_idx_ = -1;
+            ui_message_ = "No UHF tag to select";
+            return;
+        }
+
+        if (service_.uhf_continuous_scan_running()) {
+            std::string stop_error;
+            if (!service_.stop_uhf_continuous_scan(&stop_error)) {
+                ui_message_ = stop_error.empty() ? "Inventory stop failed" : stop_error;
+                return;
+            }
+            ui_message_ = "Inventory paused; tag selected";
+        }
+
+        const int total = static_cast<int>(uhf_table_rows_.size());
+        if (uhf_table_selected_idx_ < 0 || uhf_table_selected_idx_ >= total) {
+            uhf_table_selected_idx_ = delta < 0 ? total - 1 : 0;
+        } else {
+            uhf_table_selected_idx_ = std::max(
+                0, std::min(total - 1, uhf_table_selected_idx_ + delta));
+        }
+        uhf_selected_epc_ = uhf_table_rows_[static_cast<size_t>(uhf_table_selected_idx_)].epc;
+        const int visible = read_uhf_visible_rows();
+        if (uhf_table_selected_idx_ < uhf_table_scroll_offset_) {
+            uhf_table_scroll_offset_ = uhf_table_selected_idx_;
+        } else if (uhf_table_selected_idx_ >= uhf_table_scroll_offset_ + visible) {
+            uhf_table_scroll_offset_ = uhf_table_selected_idx_ - visible + 1;
+        }
+    }
+
+    void open_uhf_tag_action()
+    {
+        if (uhf_table_selected_idx_ < 0 ||
+            uhf_table_selected_idx_ >= static_cast<int>(uhf_table_rows_.size())) return;
+        if (service_.uhf_continuous_scan_running()) {
+            std::string stop_error;
+            if (!service_.stop_uhf_continuous_scan(&stop_error)) {
+                ui_message_ = stop_error.empty() ? "Inventory stop failed" : stop_error;
+                return;
+            }
+        }
+        uhf_selected_epc_ = uhf_table_rows_[static_cast<size_t>(uhf_table_selected_idx_)].epc;
+        uhf_tag_bank_idx_ = 0;
+        uhf_bank_values_[0] = uhf_selected_epc_;
+        uhf_bank_values_[1].clear();
+        uhf_bank_values_[2].clear();
+        uhf_bank_loaded_[0] = true;
+        uhf_bank_loaded_[1] = false;
+        uhf_bank_loaded_[2] = false;
+        modal_ = Modal::UhfTagAction;
+        ui_message_ = "Inventory paused";
+    }
+
+    void load_selected_uhf_bank()
+    {
+        if (uhf_bank_loaded_[uhf_tag_bank_idx_]) return;
+        ui_message_ = std::string("Reading ") + uhf_bank_name(uhf_tag_bank_idx_) + "...";
+        std::string value;
+        std::string error;
+        if (service_.read_uhf_tag_bank(
+                uhf_selected_epc_, selected_uhf_bank(), &value, &error)) {
+            uhf_bank_values_[uhf_tag_bank_idx_] = value;
+            uhf_bank_loaded_[uhf_tag_bank_idx_] = true;
+            ui_message_ = std::string(uhf_bank_name(uhf_tag_bank_idx_)) + " read";
+        } else {
+            ui_message_ = error.empty() ? "Tag read failed" : error;
+        }
+    }
+
     void navigate(int delta)
     {
         switch (current_tab_) {
         case Tab::Read:
             {
-                const int max_scroll = read_scroll_max_offset();
                 if (read_uses_uhf_table()) {
-                    uhf_table_scroll_offset_ = std::max(0, std::min(max_scroll, uhf_table_scroll_offset_ + delta));
-                } else {
-                    log_scroll_offset_ = std::max(0, std::min(max_scroll, log_scroll_offset_ + delta));
+                    select_uhf_inventory_row(delta);
+                    break;
                 }
+                const int max_scroll = read_scroll_max_offset();
+                log_scroll_offset_ = std::max(0, std::min(max_scroll, log_scroll_offset_ + delta));
             }
             break;
         case Tab::Saved:
@@ -2413,6 +2522,11 @@ private:
         switch (current_tab_) {
         case Tab::Read:
             {
+                if (read_uses_uhf_table() && uhf_table_selected_idx_ >= 0 &&
+                    uhf_table_selected_idx_ < static_cast<int>(uhf_table_rows_.size())) {
+                    open_uhf_tag_action();
+                    break;
+                }
                 const auto scan = service_.scan_state();
                 if (!scan.running) {
                     const auto ep = service_.current_endpoint();
@@ -2700,6 +2814,8 @@ private:
             else if (modal_ == Modal::UsbSelect) render_usb_select_modal(content);
             else if (modal_ == Modal::I2cSelect) render_i2c_select_modal(content);
             else if (modal_ == Modal::SpiSelect) render_spi_select_modal(content);
+            else if (modal_ == Modal::UhfTagAction) render_uhf_tag_action_modal(content);
+            else if (modal_ == Modal::UhfTagEdit) render_uhf_tag_edit_modal(content);
             break;
         case Tab::Saved:
             render_saved_tab(content);
@@ -2732,6 +2848,15 @@ private:
     {
         uhf_table_rows_ = service_.uhf_table_rows();
         {
+            if (!uhf_selected_epc_.empty() && uhf_table_selected_idx_ >= 0) {
+                const auto selected = std::find_if(
+                    uhf_table_rows_.begin(), uhf_table_rows_.end(),
+                    [&](const nfc_app::NfcDeviceService::UhfTableRow &row) {
+                        return row.epc == uhf_selected_epc_;
+                    });
+                uhf_table_selected_idx_ = selected == uhf_table_rows_.end()
+                    ? -1 : static_cast<int>(std::distance(uhf_table_rows_.begin(), selected));
+            }
             const int max_scroll = std::max(0, static_cast<int>(uhf_table_rows_.size()) - read_uhf_visible_rows());
             uhf_table_scroll_offset_ = std::max(0, std::min(max_scroll, uhf_table_scroll_offset_));
         }
@@ -3273,6 +3398,7 @@ private:
                     const int idx = scroll + row;
                     if (idx >= total_rows) break;
                     const auto &item = uhf_table_rows_[static_cast<size_t>(idx)];
+                    const bool selected = idx == uhf_table_selected_idx_;
 
                     const int epc_max_chars = std::max(8, (cnt_x - epc_x) / 8 - 1);
                     std::string epc = item.epc;
@@ -3291,9 +3417,14 @@ private:
                     std::snprintf(cnt_text, sizeof(cnt_text), "%5d", item.read_count);
 
                     const int y = row_y + row * row_h;
-                    create_text(detail, idx_x, y, idx_text, 0xD6F0FF, 7);
-                    create_text(detail, epc_x, y, epc.c_str(), 0xD6F0FF, 7);
-                    create_text(detail, cnt_x, y, cnt_text, 0xD6F0FF, 7);
+                    if (selected) {
+                        lv_obj_t *highlight = create_panel(detail, 1, y - 1, 318, row_h, 0xF7A600);
+                        (void)highlight;
+                    }
+                    const uint32_t color = selected ? 0x000000 : 0xD6F0FF;
+                    create_text(detail, idx_x, y, idx_text, color, 7);
+                    create_text(detail, epc_x, y, epc.c_str(), color, 7);
+                    create_text(detail, cnt_x, y, cnt_text, color, 7);
                 }
             }
         } else if (!scan.running && !scan.has_result && scan_log_lines_.empty()) {
@@ -3302,7 +3433,9 @@ private:
                         conn.connected ? "Ready" : "Device not connected",
                         0x9E9E9E, 11);
             create_text(detail, 4, 28, "OK: Menu", 0xF7A600, 10);
-            create_text(detail, 4, 42, "Tab: mode  Space: start/pause", 0xD8D8D8, 10);
+            create_text(detail, 4, 42,
+                        conn.connected ? "Space: start/pause" : "Tab: mode  Space: start/pause",
+                        0xD8D8D8, 10);
 
             if (conn.connected) {
                 create_text_mono(detail, 4, 56, supported_protocols_text().c_str(), 0x8DB6FF, 7);
@@ -4100,6 +4233,8 @@ private:
                 log_scroll_offset_ = 0;
                 uhf_table_rows_.clear();
                 uhf_table_scroll_offset_ = 0;
+                uhf_table_selected_idx_ = -1;
+                uhf_selected_epc_.clear();
 
                 if (ep.kind == nfc_app::TransportKind::UsbSerial) {
                     if (!refresh_usb_endpoints_with_recovery()) break;
@@ -4338,6 +4473,8 @@ private:
                 log_scroll_offset_ = 0;
                 uhf_table_rows_.clear();
                 uhf_table_scroll_offset_ = 0;
+                uhf_table_selected_idx_ = -1;
+                uhf_selected_epc_.clear();
                 std::string clear_error;
                 if (service_.clear_last_scan_result(&clear_error)) {
                     const auto conn = service_.connection_state();
@@ -4473,6 +4610,8 @@ private:
         uhf_inventory_started_ = false;
         service_.clear_uhf_table();
         uhf_table_rows_.clear();
+        uhf_table_selected_idx_ = -1;
+        uhf_selected_epc_.clear();
         scan_log_lines_.push_back(std::string("Device: ") + nfc_app::to_string(conn2.device_kind));
         scan_log_lines_.push_back(supported_protocols_text());
         if (conn2.device_kind == nfc_app::DeviceKind::UHFReader) {
@@ -5979,6 +6118,160 @@ private:
         }
     }
 
+    void render_uhf_tag_action_modal(lv_obj_t *parent)
+    {
+        lv_obj_t *overlay = lv_obj_create(parent);
+        lv_obj_remove_style_all(overlay);
+        lv_obj_set_size(overlay, 320, CONTENT_H);
+        lv_obj_set_pos(overlay, 0, 0);
+        lv_obj_set_style_bg_color(overlay, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_opa(overlay, 190, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *card = make_modal_card(overlay, 304, 112, 0x00D2FF);
+        const char *tabs[] = {"EPC", "TID", "USER"};
+        const int tab_x[] = {8, 77, 146};
+        const int tab_w[] = {63, 63, 78};
+        for (int i = 0; i < 3; ++i) {
+            const bool active = i == uhf_tag_bank_idx_;
+            lv_obj_t *tab = create_panel(card, tab_x[i], 5, tab_w[i], 17,
+                                         active ? 0x00D2FF : 0x282828);
+            create_text(tab, 5, 3, tabs[i], active ? 0x000000 : 0xA0A0A0, 10);
+        }
+
+        const std::string &value = uhf_bank_values_[uhf_tag_bank_idx_];
+        const bool loaded = uhf_bank_loaded_[uhf_tag_bank_idx_];
+        char size_text[16];
+        std::snprintf(size_text, sizeof(size_text), "%zu B", loaded ? value.size() / 2 : 0);
+        create_text(card, 246, 8, loaded ? size_text : "--", loaded ? 0x7FBFFF : 0x707070, 10);
+
+        lv_obj_t *data = create_panel(card, 8, 27, 288, 38, 0x101820);
+        if (!loaded) {
+            create_text(data, 6, 12, "Select tab to read tag memory", 0x808C96, 10);
+        } else if (value.empty()) {
+            create_text(data, 6, 12, "(empty)", 0x808C96, 10);
+        } else {
+            constexpr size_t chars_per_line = 32;
+            for (int row = 0; row < 2; ++row) {
+                const size_t offset = static_cast<size_t>(row) * chars_per_line;
+                if (offset >= value.size()) break;
+                create_text_mono(data, 6, 4 + row * 15,
+                                 value.substr(offset, chars_per_line).c_str(), 0xD6F0FF, 7);
+            }
+        }
+
+        lv_obj_t *edit_hint = create_panel(card, 8, 70, 82, 18, 0x282828);
+        create_text(edit_hint, 6, 4, "E  Edit", 0xD0D0D0, 10);
+        lv_obj_t *write_hint = create_panel(card, 96, 70, 120, 18, 0xF7A600);
+        create_text(write_hint, 6, 4, "OK  Write tag", 0x000000, 10);
+        create_text(card, 8, 94, "Z/C switch bank     ESC close", 0x68747D, 7);
+    }
+
+    void render_uhf_tag_edit_modal(lv_obj_t *parent)
+    {
+        lv_obj_t *overlay = lv_obj_create(parent);
+        lv_obj_remove_style_all(overlay);
+        lv_obj_set_size(overlay, 320, CONTENT_H);
+        lv_obj_set_pos(overlay, 0, 0);
+        lv_obj_set_style_bg_color(overlay, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_opa(overlay, 190, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *card = make_modal_card(overlay, 304, 104, 0x00FF88);
+        const std::string title = std::string("Edit ") + uhf_bank_name(uhf_tag_bank_idx_) +
+                                  " (16-bit words)";
+        create_text(card, 8, 6, title.c_str(), 0x00FF88, 12);
+        lv_obj_t *data = create_panel(card, 8, 25, 288, 51, 0x0D1712);
+        constexpr size_t chars_per_line = 32;
+        const size_t first = uhf_tag_edit_buf_.size() > 96
+            ? ((uhf_tag_edit_buf_.size() - 1) / chars_per_line - 2) * chars_per_line : 0;
+        for (int row = 0; row < 3; ++row) {
+            const size_t offset = first + static_cast<size_t>(row) * chars_per_line;
+            if (offset > uhf_tag_edit_buf_.size()) break;
+            std::string line = uhf_tag_edit_buf_.substr(offset, chars_per_line);
+            if (offset + line.size() == uhf_tag_edit_buf_.size()) line += "_";
+            create_text_mono(data, 5, 4 + row * 15, line.c_str(), 0xD8FFE8, 7);
+        }
+        const size_t max_chars = uhf_tag_bank_idx_ == 0 ? 96 :
+                                 (uhf_tag_bank_idx_ == 1 ? 64 : 128);
+        char hint[64];
+        std::snprintf(hint, sizeof(hint), "%zu/%zu hex  OK apply  Bsp delete  ESC cancel",
+                      uhf_tag_edit_buf_.size(), max_chars);
+        create_text(card, 8, 84, hint, 0x687D70, 7);
+    }
+
+    void handle_uhf_tag_action_key(uint32_t key)
+    {
+        if (key == KEY_ESC) {
+            modal_ = Modal::None;
+            ui_message_ = "Tag operation closed";
+            return;
+        }
+        if (key == KEY_LEFT || key == KEY_Z || key == KEY_RIGHT || key == KEY_C) {
+            const int delta = (key == KEY_RIGHT || key == KEY_C) ? 1 : -1;
+            uhf_tag_bank_idx_ = (uhf_tag_bank_idx_ + delta + 3) % 3;
+            load_selected_uhf_bank();
+            return;
+        }
+        if (key == KEY_E) {
+            if (!uhf_bank_loaded_[uhf_tag_bank_idx_]) load_selected_uhf_bank();
+            uhf_tag_edit_buf_ = uhf_bank_loaded_[uhf_tag_bank_idx_] &&
+                                !uhf_bank_values_[uhf_tag_bank_idx_].empty()
+                ? uhf_bank_values_[uhf_tag_bank_idx_] : "0000";
+            modal_ = Modal::UhfTagEdit;
+            return;
+        }
+
+        if (key != KEY_ENTER && key != KEY_KPENTER) return;
+
+        if (!uhf_bank_loaded_[uhf_tag_bank_idx_] ||
+            uhf_bank_values_[uhf_tag_bank_idx_].empty()) {
+            ui_message_ = "No data to write";
+            return;
+        }
+        std::string error;
+        if (service_.write_uhf_tag_bank(
+                selected_uhf_bank(), uhf_bank_values_[uhf_tag_bank_idx_], &error)) {
+            ui_message_ = std::string(uhf_bank_name(uhf_tag_bank_idx_)) + " write verified";
+            show_toast("Write verified", 1800);
+            if (uhf_tag_bank_idx_ == 0) uhf_selected_epc_ = uhf_bank_values_[0];
+        } else {
+            ui_message_ = error.empty() ? "Tag write failed" : error;
+            show_toast("Write failed", 1800);
+        }
+    }
+
+    void handle_uhf_tag_edit_key(uint32_t key)
+    {
+        if (key == KEY_ESC) {
+            modal_ = Modal::UhfTagAction;
+            ui_message_ = "Edit canceled";
+            return;
+        }
+        if (key == KEY_ENTER || key == KEY_KPENTER) {
+            if (uhf_tag_edit_buf_.empty() || (uhf_tag_edit_buf_.size() % 4) != 0) {
+                ui_message_ = "Data must contain complete 16-bit words";
+                return;
+            }
+            uhf_bank_values_[uhf_tag_bank_idx_] = uhf_tag_edit_buf_;
+            uhf_bank_loaded_[uhf_tag_bank_idx_] = true;
+            modal_ = Modal::UhfTagAction;
+            ui_message_ = std::string(uhf_bank_name(uhf_tag_bank_idx_)) + " edited; not written";
+            return;
+        }
+        if (key == KEY_BACKSPACE) {
+            if (!uhf_tag_edit_buf_.empty()) uhf_tag_edit_buf_.pop_back();
+            return;
+        }
+
+        const size_t max_chars = uhf_tag_bank_idx_ == 0 ? 96 :
+                                 (uhf_tag_bank_idx_ == 1 ? 64 : 128);
+        const char ch = keycode_to_hex_char(key);
+        if (ch && ch != ' ' && ch != ':' && uhf_tag_edit_buf_.size() < max_chars) {
+            uhf_tag_edit_buf_.push_back(ch);
+        }
+    }
+
     // ── Modal key handling ───────────────────────────────────────────────────
 
     void handle_modal_key(uint32_t key, uint32_t mods)
@@ -6032,6 +6325,12 @@ private:
             break;
         case Modal::Pn532NdefInput:
             handle_pn532_ndef_input_key(key);
+            break;
+        case Modal::UhfTagAction:
+            handle_uhf_tag_action_key(key);
+            break;
+        case Modal::UhfTagEdit:
+            handle_uhf_tag_edit_key(key);
             break;
         default: break;
         }

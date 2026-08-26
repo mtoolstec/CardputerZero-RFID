@@ -64,6 +64,12 @@ enum class UidMagicGeneration {
 class NfcDeviceService {
     struct UhfTagSnapshot;
 public:
+    enum class UhfMemoryBank {
+        Epc = 0,
+        Tid,
+        User,
+    };
+
     struct UhfTableRow {
         std::string epc;
         std::string rssi;
@@ -1503,6 +1509,150 @@ public:
             }
         }
         if (scan_thread_.joinable()) scan_thread_.join();
+        if (error) error->clear();
+        return true;
+    }
+
+    bool read_uhf_tag_bank(const std::string &selected_epc,
+                           UhfMemoryBank bank,
+                           std::string *value_hex,
+                           std::string *error = nullptr)
+    {
+        if (value_hex) value_hex->clear();
+        if (bank == UhfMemoryBank::Epc) {
+            const std::string epc = keep_hex_chars_upper(selected_epc);
+            if (!is_accepted_uhf_inventory_epc(epc)) {
+                if (error) *error = "Invalid selected EPC";
+                return false;
+            }
+            if (value_hex) *value_hex = epc;
+            if (error) error->clear();
+            return true;
+        }
+
+        std::vector<uint8_t> epc_bytes;
+        if (!parse_hex_bytes(selected_epc, &epc_bytes) || epc_bytes.empty() || epc_bytes.size() > 48) {
+            if (error) *error = "Invalid selected EPC";
+            return false;
+        }
+
+        INfcTransport *transport_raw = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!transport_ || !transport_->is_open() ||
+                connection_.device_kind != DeviceKind::UHFReader) {
+                if (error) *error = "Connect UHF reader first";
+                return false;
+            }
+            if (scan_.running) {
+                if (error) *error = "Stop inventory before tag access";
+                return false;
+            }
+            transport_raw = transport_.get();
+        }
+
+        std::lock_guard<std::mutex> op_lock(transport_op_mutex_);
+        std::vector<uint8_t> filter_payload;
+        filter_payload.reserve(epc_bytes.size() + 2);
+        filter_payload.push_back(0x00);
+        filter_payload.push_back(static_cast<uint8_t>(epc_bytes.size()));
+        filter_payload.insert(filter_payload.end(), epc_bytes.begin(), epc_bytes.end());
+
+        std::vector<uint8_t> reply;
+        if (!uhf_tag_command_locked(transport_raw, 0x85, filter_payload, 1200, &reply, error) ||
+            reply.size() != 1 || reply[0] != 0x10) {
+            if (error && error->empty()) *error = "EPC filter failed";
+            return false;
+        }
+
+        const uint8_t memory_bank = bank == UhfMemoryBank::Tid ? 0x02 : 0x03;
+        const uint8_t word_count = bank == UhfMemoryBank::Tid ? 6 : 16;
+        std::vector<uint8_t> read_payload = {
+            memory_bank,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, word_count,
+            0x00, 0x00, 0x00, 0x00,
+        };
+
+        const bool read_ok = uhf_tag_command_locked(
+            transport_raw, 0x81, read_payload, 2500, &reply, error);
+        const uint8_t clear_mode = 0x01;
+        std::vector<uint8_t> ignored;
+        std::string ignored_error;
+        (void)uhf_tag_command_locked(
+            transport_raw, 0x85, {clear_mode}, 600, &ignored, &ignored_error);
+        if (!read_ok) return false;
+
+        std::string parsed;
+        if (!parse_uhf_tag_read_reply(reply, &parsed, error)) return false;
+        if (value_hex) *value_hex = parsed;
+        if (error) error->clear();
+        return true;
+    }
+
+    bool write_uhf_tag_bank(UhfMemoryBank bank,
+                            const std::string &value_hex,
+                            std::string *error = nullptr)
+    {
+        std::vector<uint8_t> value;
+        if (!parse_hex_bytes(value_hex, &value) || value.empty() ||
+            (value.size() % 2) != 0 || value.size() > 64) {
+            if (error) *error = "Data must contain complete 16-bit words";
+            return false;
+        }
+
+        INfcTransport *transport_raw = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!transport_ || !transport_->is_open() ||
+                connection_.device_kind != DeviceKind::UHFReader) {
+                if (error) *error = "Connect UHF reader first";
+                return false;
+            }
+            if (scan_.running) {
+                if (error) *error = "Stop inventory before tag access";
+                return false;
+            }
+            transport_raw = transport_.get();
+        }
+
+        const uint8_t memory_bank = bank == UhfMemoryBank::Epc ? 0x01 :
+                                    (bank == UhfMemoryBank::Tid ? 0x02 : 0x03);
+        const uint8_t word_address = bank == UhfMemoryBank::Epc ? 0x02 : 0x00;
+        std::vector<uint8_t> payload(11 + value.size(), 0x00);
+        payload[4] = memory_bank;
+        payload[8] = word_address;
+        payload[10] = static_cast<uint8_t>(value.size() / 2);
+        std::copy(value.begin(), value.end(), payload.begin() + 11);
+
+        std::lock_guard<std::mutex> op_lock(transport_op_mutex_);
+        std::vector<uint8_t> reply;
+        if (!uhf_tag_command_locked(transport_raw, 0x82, payload, 3000, &reply, error)) {
+            return false;
+        }
+        const uint8_t status = uhf_tag_reply_status(reply);
+        if (status != 0x10) {
+            if (error) *error = uhf_tag_error_text(status);
+            return false;
+        }
+
+        std::vector<uint8_t> verify_payload = {
+            memory_bank,
+            0x00, 0x00, 0x00, word_address,
+            0x00, static_cast<uint8_t>(value.size() / 2),
+            0x00, 0x00, 0x00, 0x00,
+        };
+        if (!uhf_tag_command_locked(
+                transport_raw, 0x81, verify_payload, 2500, &reply, error)) {
+            if (error && error->empty()) *error = "Write succeeded; verification timed out";
+            return false;
+        }
+        std::string verified;
+        if (!parse_uhf_tag_read_reply(reply, &verified, error)) return false;
+        if (verified != keep_hex_chars_upper(value_hex)) {
+            if (error) *error = "Write verification mismatch";
+            return false;
+        }
         if (error) error->clear();
         return true;
     }
@@ -5379,6 +5529,16 @@ private:
                 const ssize_t got = transport->read_bytes(buf, sizeof(buf), 40, &read_err);
                 if (got > 0) {
                     out->insert(out->end(), buf, buf + got);
+                    std::vector<std::vector<uint8_t>> frames;
+                    if (extract_a0_frames(*out, &frames)) {
+                        for (const auto &frame : frames) {
+                            uint8_t response_cmd = 0;
+                            if (parse_a0_frame(frame, &response_cmd, nullptr) &&
+                                response_cmd == cmd) {
+                                return;
+                            }
+                        }
+                    }
                     continue;
                 }
                 if (got < 0) {
@@ -5408,6 +5568,111 @@ private:
         }
         if (error) *error = io_error.empty() ? "no response" : io_error;
         return false;
+    }
+
+    bool uhf_tag_command_locked(INfcTransport *transport,
+                                uint8_t cmd,
+                                const std::vector<uint8_t> &payload,
+                                int listen_ms,
+                                std::vector<uint8_t> *reply_data,
+                                std::string *error)
+    {
+        if (reply_data) reply_data->clear();
+        std::string io_error;
+        if (!write_all(transport, build_uhf_a0_frame(cmd, payload), &io_error)) {
+            if (error) *error = io_error.empty() ? "UHF command write failed" : io_error;
+            return false;
+        }
+
+        std::vector<uint8_t> raw;
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(listen_ms);
+        while (std::chrono::steady_clock::now() < deadline) {
+            uint8_t buf[256] = {};
+            std::string read_error;
+            const ssize_t got = transport->read_bytes(buf, sizeof(buf), 40, &read_error);
+            if (got < 0) {
+                if (error) *error = read_error.empty() ? "UHF command read failed" : read_error;
+                return false;
+            }
+            if (got == 0) continue;
+            raw.insert(raw.end(), buf, buf + got);
+
+            std::vector<std::vector<uint8_t>> frames;
+            if (!extract_a0_frames(raw, &frames)) continue;
+            for (const auto &frame : frames) {
+                uint8_t response_cmd = 0;
+                std::vector<uint8_t> data;
+                if (!parse_a0_frame(frame, &response_cmd, &data) || response_cmd != cmd) continue;
+                if (reply_data) *reply_data = std::move(data);
+                if (error) error->clear();
+                return true;
+            }
+        }
+        if (error) *error = "UHF tag response timeout";
+        return false;
+    }
+
+    static uint8_t uhf_tag_reply_status(const std::vector<uint8_t> &reply)
+    {
+        if (reply.size() == 1) return reply[0];
+        if (reply.size() >= 6) {
+            const size_t record_end = 3 + static_cast<size_t>(reply[2]);
+            if (record_end < reply.size()) return reply[record_end];
+        }
+        return 0xFF;
+    }
+
+    static const char *uhf_tag_error_text(uint8_t status)
+    {
+        switch (status) {
+        case 0x10: return "OK";
+        case 0x20: return "No tag in field";
+        case 0x22: return "Wrong access password";
+        case 0x23: return "Memory overrun";
+        case 0x24: return "Memory is locked";
+        case 0x31: return "Tag access failed";
+        case 0x32: return "Tag read failed";
+        case 0x33: return "Tag write failed";
+        default: return "Tag operation failed";
+        }
+    }
+
+    static bool parse_uhf_tag_read_reply(const std::vector<uint8_t> &reply,
+                                         std::string *value_hex,
+                                         std::string *error)
+    {
+        if (value_hex) value_hex->clear();
+        if (reply.size() == 1) {
+            if (error) *error = uhf_tag_error_text(reply[0]);
+            return false;
+        }
+        if (reply.size() < 6) {
+            if (error) *error = "Malformed tag read response";
+            return false;
+        }
+
+        const size_t record_len = reply[2];
+        const size_t record_end = 3 + record_len;
+        if (record_end + 3 > reply.size()) {
+            if (error) *error = "Malformed tag data record";
+            return false;
+        }
+        size_t read_len = reply[record_end];
+        if (record_end + 4 <= reply.size()) {
+            const size_t extended_len =
+                (static_cast<size_t>(reply[record_end]) << 8) | reply[record_end + 1];
+            if (extended_len > 0 && extended_len <= record_len) read_len = extended_len;
+        }
+        if (read_len == 0 || read_len > record_len || record_end < read_len) {
+            if (error) *error = "Invalid tag data length";
+            return false;
+        }
+        const std::string parsed = bytes_to_hex_string(
+            reply.data() + record_end - read_len, read_len);
+        if (value_hex) *value_hex = parsed;
+        if (error) error->clear();
+        return true;
     }
 
     bool uhf_inventory_round_locked(INfcTransport *transport,
