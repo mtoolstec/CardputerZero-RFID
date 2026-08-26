@@ -6192,6 +6192,7 @@ private:
         lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
 
         lv_obj_t *card = make_modal_card(overlay, 280, 90, 0x00D2FF);
+        lv_obj_set_style_radius(card, 6, LV_PART_MAIN | LV_STATE_DEFAULT);
         const char *tabs[] = {"EPC", "TID", "User Data"};
         for (int i = 0; i < 3; ++i) {
             const bool active = i == uhf_tag_bank_idx_;
@@ -6229,8 +6230,8 @@ private:
         lv_obj_t *write_label = create_text(write_button, 0, 0, "OK  WRITE", 0x000000, 10);
         lv_obj_center(write_label);
 
-        create_text(card, 8, 79, "TAB: bank", 0x68747D, 7);
-        create_text(card, 194, 79, "ESC: close", 0x68747D, 7);
+        create_text(card, 8, 77, "TAB: bank", 0x68747D, 7);
+        create_text(card, 194, 77, "ESC: close", 0x68747D, 7);
     }
 
     void render_uhf_tag_edit_modal(lv_obj_t *parent)
