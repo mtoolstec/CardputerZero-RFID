@@ -6191,43 +6191,46 @@ private:
         lv_obj_set_style_bg_opa(overlay, 190, LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
 
-        lv_obj_t *card = make_modal_card(overlay, 304, 112, 0x00D2FF);
-        const char *tabs[] = {"EPC", "TID", "USER"};
-        const int tab_x[] = {8, 77, 146};
-        const int tab_w[] = {63, 63, 78};
+        lv_obj_t *card = make_modal_card(overlay, 280, 90, 0x00D2FF);
+        const char *tabs[] = {"EPC", "TID", "User Data"};
         for (int i = 0; i < 3; ++i) {
             const bool active = i == uhf_tag_bank_idx_;
-            lv_obj_t *tab = create_panel(card, tab_x[i], 5, tab_w[i], 17,
+            lv_obj_t *tab = create_panel(card, 8 + i * 88, 5, 84, 18,
                                          active ? 0x00D2FF : 0x282828);
-            create_text(tab, 5, 3, tabs[i], active ? 0x000000 : 0xA0A0A0, 10);
+            lv_obj_set_style_radius(tab, 3, LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_t *label = create_text(
+                tab, 0, 0, tabs[i], active ? 0x000000 : 0xA0A0A0, 10);
+            lv_obj_center(label);
         }
 
         const std::string &value = uhf_bank_values_[uhf_tag_bank_idx_];
         const bool loaded = uhf_bank_loaded_[uhf_tag_bank_idx_];
-        char size_text[16];
-        std::snprintf(size_text, sizeof(size_text), "%zu B", loaded ? value.size() / 2 : 0);
-        create_text(card, 246, 8, loaded ? size_text : "--", loaded ? 0x7FBFFF : 0x707070, 10);
-
-        lv_obj_t *data = create_panel(card, 8, 27, 288, 38, 0x101820);
+        lv_obj_t *data = create_panel(card, 8, 28, 264, 19, 0x101820);
+        lv_obj_set_style_radius(data, 3, LV_PART_MAIN | LV_STATE_DEFAULT);
         if (!loaded) {
-            create_text(data, 6, 12, "Select tab to read tag memory", 0x808C96, 10);
+            create_text(data, 6, 4, "Reading tag memory...", 0x808C96, 10);
         } else if (value.empty()) {
-            create_text(data, 6, 12, "(empty)", 0x808C96, 10);
+            create_text(data, 6, 4, "(empty)", 0x808C96, 10);
         } else {
-            constexpr size_t chars_per_line = 32;
-            for (int row = 0; row < 2; ++row) {
-                const size_t offset = static_cast<size_t>(row) * chars_per_line;
-                if (offset >= value.size()) break;
-                create_text_mono(data, 6, 4 + row * 15,
-                                 value.substr(offset, chars_per_line).c_str(), 0xD6F0FF, 7);
-            }
+            create_text_mono(data, 6, 5, to_compact(value, 31).c_str(), 0xD6F0FF, 7);
         }
 
-        lv_obj_t *edit_hint = create_panel(card, 8, 70, 82, 18, 0x282828);
-        create_text(edit_hint, 6, 4, "E  Edit", 0xD0D0D0, 10);
-        lv_obj_t *write_hint = create_panel(card, 96, 70, 120, 18, 0xF7A600);
-        create_text(write_hint, 6, 4, "OK  Write tag", 0x000000, 10);
-        create_text(card, 8, 94, "Z/C switch bank     ESC close", 0x68747D, 7);
+        lv_obj_t *edit_button = create_panel(card, 8, 52, 108, 22, 0x242A2E);
+        lv_obj_set_style_radius(edit_button, 4, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_border_color(edit_button, lv_color_hex(0x70818A), LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_border_width(edit_button, 1, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_t *edit_label = create_text(edit_button, 0, 0, "E  EDIT", 0xD7E0E5, 10);
+        lv_obj_center(edit_label);
+
+        lv_obj_t *write_button = create_panel(card, 124, 52, 148, 22, 0xF7A600);
+        lv_obj_set_style_radius(write_button, 4, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_border_color(write_button, lv_color_hex(0xFFD36A), LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_border_width(write_button, 1, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_t *write_label = create_text(write_button, 0, 0, "OK  WRITE", 0x000000, 10);
+        lv_obj_center(write_label);
+
+        create_text(card, 8, 79, "TAB: bank", 0x68747D, 7);
+        create_text(card, 194, 79, "ESC: close", 0x68747D, 7);
     }
 
     void render_uhf_tag_edit_modal(lv_obj_t *parent)
@@ -6270,9 +6273,8 @@ private:
             ui_message_ = "Tag operation closed";
             return;
         }
-        if (key == KEY_LEFT || key == KEY_Z || key == KEY_RIGHT || key == KEY_C) {
-            const int delta = (key == KEY_RIGHT || key == KEY_C) ? 1 : -1;
-            uhf_tag_bank_idx_ = (uhf_tag_bank_idx_ + delta + 3) % 3;
+        if (key == KEY_TAB) {
+            uhf_tag_bank_idx_ = (uhf_tag_bank_idx_ + 1) % 3;
             load_selected_uhf_bank();
             return;
         }
