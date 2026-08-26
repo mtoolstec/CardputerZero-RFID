@@ -556,6 +556,53 @@ public:
         return (data[1] == 0xAB);
     }
 
+    // The USB product name can identify PN532Killer before protocol probing.
+    // In that case send the Killer-only command first, then query firmware only
+    // for the display version and finish reader-mode initialization.
+    DeviceKind detect_pn532killer(std::string *firmware_out, std::string *error)
+    {
+        if (firmware_out) firmware_out->clear();
+
+        {
+            uint8_t flush[256];
+            for (int i = 0; i < 3; ++i)
+                transport_->read_bytes(flush, sizeof(flush), 30, nullptr);
+        }
+
+        send_wakeup();
+        sam_configuration(nullptr);
+
+        {
+            uint8_t drain[128];
+            for (int i = 0; i < 2; ++i)
+                transport_->read_bytes(drain, sizeof(drain), 30, nullptr);
+        }
+
+        if (!probe_pn532killer(error)) {
+            if (error && error->empty()) *error = "PN532Killer command did not respond";
+            return DeviceKind::Unknown;
+        }
+
+        auto fw = query_firmware(nullptr);
+        if (firmware_out) {
+            if (fw) {
+                char killer_ver[48];
+                std::snprintf(killer_ver, sizeof(killer_ver), "PN532Killer %s.%02d",
+                              fw->version.c_str(), static_cast<int>(fw->day));
+                *firmware_out = killer_ver;
+            } else {
+                *firmware_out = "PN532Killer";
+            }
+        }
+
+        send_wakeup();
+        sam_configuration(nullptr);
+        set_work_mode(0x01, 0x01, 0x00, nullptr);
+        set_rf_passive_retries(0x20, nullptr);
+        if (error) error->clear();
+        return DeviceKind::PN532Killer;
+    }
+
     // Probe device kind: D402 (GetFirmwareVersion) → D4AA (checkKiller).
     // Flow: wakeup → SAMConfig → GetFirmwareVersion → if fails → Unknown
     //       → checkPN532Killer(0xAA) → if responds → PN532Killer

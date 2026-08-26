@@ -1041,9 +1041,10 @@ public:
         };
 
         // ====================================================================
-        // Shared USB/UART probing order:
-        //   PN532 command -> PN532Killer command -> plain PN532 fallback
-        //   -> UHF @115200 -> UHF @9600
+        // Shared USB/UART probing order. USB product-name hints take priority:
+        //   CZUHF/FZUHF -> UHF @115200/@9600 first
+        //   PN532Killer -> Killer-only command first
+        // Unknown names retain the generic PN532 -> UHF fallback order.
         // Log each step immediately (paced 300ms) instead of flushing at end.
         // ====================================================================
         if (connection_.endpoint.kind == TransportKind::UartSerial ||
@@ -1051,11 +1052,23 @@ public:
             const char *transport_name =
                 (connection_.endpoint.kind == TransportKind::UsbSerial) ? "USB" : "UART";
             const std::string endpoint_path = connection_.endpoint.path;
-            const bool endpoint_is_known_uhf =
+            std::string endpoint_label_upper = connection_.endpoint.label;
+            std::transform(endpoint_label_upper.begin(), endpoint_label_upper.end(),
+                           endpoint_label_upper.begin(), [](unsigned char ch) {
+                               return static_cast<char>(std::toupper(ch));
+                           });
+            const bool endpoint_is_named_uhf =
                 connection_.endpoint.kind == TransportKind::UsbSerial &&
-                connection_.endpoint.usb_vid == 0x1A86 &&
-                (connection_.endpoint.usb_pid == 0x55D3 ||
-                 connection_.endpoint.usb_pid == 0xFE1C);
+                (endpoint_label_upper.find("CZUHF") != std::string::npos ||
+                 endpoint_label_upper.find("FZUHF") != std::string::npos);
+            const bool endpoint_is_known_uhf = endpoint_is_named_uhf ||
+                (connection_.endpoint.kind == TransportKind::UsbSerial &&
+                 connection_.endpoint.usb_vid == 0x1A86 &&
+                 (connection_.endpoint.usb_pid == 0x55D3 ||
+                  connection_.endpoint.usb_pid == 0xFE1C));
+            const bool endpoint_is_named_killer =
+                connection_.endpoint.kind == TransportKind::UsbSerial &&
+                endpoint_label_upper.find("PN532KILLER") != std::string::npos;
 
             std::string open_error;
             if (!open_at_baud(115200, &open_error)) {
@@ -1111,6 +1124,49 @@ public:
                 return true;
             };
 
+            // A descriptive USB product name is a stronger routing signal than
+            // the generic serial-port probe order. Confirm the hinted protocol
+            // first so known devices never begin with a PN532 check.
+            if (endpoint_is_known_uhf) {
+                if (try_uhf(115200)) return true;
+                if (try_uhf(9600)) return true;
+                paced_log("Named UHF probe failed; trying generic detection");
+            }
+
+            if (endpoint_is_named_killer) {
+                report_probe("PN532Killer", 115200, false, false);
+                paced_log(std::string("Probe PN532Killer @115200") + " (" + transport_name + ")");
+                if (!reopen_at_baud(115200, &open_error)) {
+                    connection_.connected = false;
+                    connection_.status = "Connect failed";
+                    connection_.detail = std::string(transport_name) +
+                                         " reopen@115200 failed: " + open_error;
+                    connection_.device_kind = DeviceKind::NotConnected;
+                    paced_log(connection_.detail);
+                    return false;
+                }
+                std::string killer_error;
+                std::string killer_firmware;
+                Pn532KillerClient killer_client(transport_.get());
+                if (killer_client.detect_pn532killer(&killer_firmware, &killer_error) ==
+                    DeviceKind::PN532Killer) {
+                    connection_.device_kind = DeviceKind::PN532Killer;
+                    connection_.pn532_ready = true;
+                    connection_.status = "Connected PN532Killer";
+                    connection_.detail = (killer_firmware.empty() ? "PN532Killer" : killer_firmware) +
+                                         " @ " + endpoint_path + " @115200";
+                    paced_log("Probe PN532Killer @115200 -> OK");
+                    report_probe("PN532Killer", 115200, true, true);
+                    return true;
+                }
+                paced_log("Probe PN532Killer @115200 -> FAIL");
+                report_probe("PN532Killer", 115200, true, false);
+                if (!killer_error.empty()) {
+                    paced_log(std::string("Probe PN532Killer @115200 detail: ") + killer_error);
+                }
+                paced_log("Named PN532Killer probe failed; trying generic detection");
+            }
+
             report_probe("PN532", 115200, false, false);
             paced_log(std::string("Probe PN532 @115200") + " (" + transport_name + ")");
             std::string probe_error;
@@ -1160,8 +1216,10 @@ public:
             if (!probe_error.empty()) {
                 paced_log(std::string("Probe PN532 @115200 detail: ") + probe_error);
             }
-            if (try_uhf(115200)) return true;
-            if (try_uhf(9600)) return true;
+            if (!endpoint_is_known_uhf) {
+                if (try_uhf(115200)) return true;
+                if (try_uhf(9600)) return true;
+            }
 
             // Keep serial connected, but mark as unknown device after full probe order.
             std::string restore_error;

@@ -229,8 +229,7 @@ public:
         // PN532 / CH340 ports keep DTR HIGH.
         const bool is_cdc_acm = endpoint.path.find("usbmodem") != std::string::npos
                              || endpoint.path.find("ttyACM")   != std::string::npos;
-        const bool is_known_uhf = endpoint.usb_vid == 0x1A86 &&
-                                  (endpoint.usb_pid == 0x55D3 || endpoint.usb_pid == 0xFE1C);
+        const bool is_known_uhf = is_known_uhf_usb(endpoint);
         if (is_cdc_acm && !is_known_uhf) {
             // PN532Killer: pulse HIGH → LOW, then stay LOW
             int bits = TIOCM_DTR | TIOCM_RTS;
@@ -388,9 +387,18 @@ private:
 
     static bool is_known_uhf_usb(const TransportEndpoint &endpoint)
     {
-        return endpoint.kind == TransportKind::UsbSerial &&
-               endpoint.usb_vid == 0x1A86 &&
-               (endpoint.usb_pid == 0x55D3 || endpoint.usb_pid == 0xFE1C);
+        if (endpoint.kind != TransportKind::UsbSerial) return false;
+        if (endpoint.usb_vid == 0x1A86 &&
+            (endpoint.usb_pid == 0x55D3 || endpoint.usb_pid == 0xFE1C)) {
+            return true;
+        }
+
+        std::string label = endpoint.label;
+        std::transform(label.begin(), label.end(), label.begin(), [](unsigned char ch) {
+            return static_cast<char>(std::toupper(ch));
+        });
+        return label.find("CZUHF") != std::string::npos ||
+               label.find("FZUHF") != std::string::npos;
     }
 
     static void release_cardputer_top_uart()
