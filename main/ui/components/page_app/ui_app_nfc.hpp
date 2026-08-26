@@ -35,7 +35,14 @@
 
 namespace rfid_scan_audio {
 
-static std::atomic<int> pending_beep{0};
+enum class SoundCue : int {
+    None = 0,
+    TagFound,
+    WriteSuccess,
+    WriteFailure,
+};
+
+static std::atomic<int> pending_sound{static_cast<int>(SoundCue::None)};
 static std::once_flag worker_once;
 
 static void audio_worker()
@@ -44,10 +51,6 @@ static void audio_worker()
     constexpr int sample_rate = 16000;
     constexpr int block_ms = 10;
     constexpr int frames_per_block = sample_rate * block_ms / 1000;
-    constexpr int tone_blocks = 3;
-    constexpr int gap_blocks = 2;
-    constexpr int tone_frames = frames_per_block * tone_blocks;
-    constexpr double frequency_hz = 1850.0;
     constexpr double pi = 3.14159265358979323846;
 
     for (;;) {
@@ -78,29 +81,71 @@ static void audio_worker()
             continue;
         }
 
-        int tone_left = 0;
-        int gap_left = 0;
+        SoundCue active_cue = SoundCue::None;
+        int cue_step = 0;
+        int step_blocks_left = 0;
+        int step_total_frames = 0;
         int tone_pos = 0;
         bool stream_ok = true;
         while (stream_ok) {
-            if (tone_left == 0 && gap_left == 0 && pending_beep.exchange(0) > 0) {
-                tone_left = tone_blocks;
-                tone_pos = 0;
+            if (active_cue == SoundCue::None) {
+                active_cue = static_cast<SoundCue>(
+                    pending_sound.exchange(static_cast<int>(SoundCue::None)));
+                cue_step = 0;
+                step_blocks_left = 0;
+            }
+
+            auto step_spec = [](SoundCue cue, int step, double *frequency, int *blocks) -> bool {
+                if (!frequency || !blocks) return false;
+                if (cue == SoundCue::TagFound) {
+                    if (step == 0) { *frequency = 1850.0; *blocks = 3; return true; }
+                    if (step == 1) { *frequency = 0.0; *blocks = 2; return true; }
+                    return false;
+                }
+                if (cue == SoundCue::WriteSuccess) {
+                    if (step == 0) { *frequency = 880.0; *blocks = 7; return true; }
+                    if (step == 1) { *frequency = 0.0; *blocks = 3; return true; }
+                    if (step == 2) { *frequency = 1320.0; *blocks = 12; return true; }
+                    return false;
+                }
+                if (cue == SoundCue::WriteFailure) {
+                    if (step == 0) { *frequency = 420.0; *blocks = 12; return true; }
+                    if (step == 1) { *frequency = 0.0; *blocks = 4; return true; }
+                    if (step == 2) { *frequency = 220.0; *blocks = 22; return true; }
+                    return false;
+                }
+                return false;
+            };
+
+            double frequency_hz = 0.0;
+            int step_blocks = 0;
+            if (active_cue != SoundCue::None && step_blocks_left == 0) {
+                if (!step_spec(active_cue, cue_step, &frequency_hz, &step_blocks)) {
+                    active_cue = SoundCue::None;
+                } else {
+                    step_blocks_left = step_blocks;
+                    step_total_frames = frames_per_block * step_blocks;
+                    tone_pos = 0;
+                }
+            } else if (active_cue != SoundCue::None) {
+                (void)step_spec(active_cue, cue_step, &frequency_hz, &step_blocks);
             }
 
             int16_t samples[frames_per_block * 2] = {};
-            if (tone_left > 0) {
+            if (active_cue != SoundCue::None && step_blocks_left > 0 && frequency_hz > 0.0) {
                 for (int i = 0; i < frames_per_block; ++i, ++tone_pos) {
                     const double edge = std::min(1.0,
-                        std::min(tone_pos / 80.0, (tone_frames - tone_pos - 1) / 80.0));
+                        std::min(tone_pos / 80.0,
+                                 (step_total_frames - tone_pos - 1) / 80.0));
                     const int16_t value = static_cast<int16_t>(14000.0 * edge *
                         std::sin(2.0 * pi * frequency_hz * tone_pos / sample_rate));
                     samples[i * 2] = value;
                     samples[i * 2 + 1] = value;
                 }
-                if (--tone_left == 0) gap_left = gap_blocks;
-            } else if (gap_left > 0) {
-                --gap_left;
+            }
+            if (active_cue != SoundCue::None && step_blocks_left > 0 &&
+                --step_blocks_left == 0) {
+                ++cue_step;
             }
 
             const char *data = reinterpret_cast<const char *>(samples);
@@ -129,10 +174,21 @@ static void play_beeps(int count)
 {
 #if defined(__linux__)
     if (count <= 0) return;
-    pending_beep.store(1); // Coalesce bursts; never build an audio backlog.
+    pending_sound.store(static_cast<int>(SoundCue::TagFound));
     std::call_once(worker_once, []() { std::thread(audio_worker).detach(); });
 #else
     (void)count;
+#endif
+}
+
+static void play_write_result(bool success)
+{
+#if defined(__linux__)
+    pending_sound.store(static_cast<int>(
+        success ? SoundCue::WriteSuccess : SoundCue::WriteFailure));
+    std::call_once(worker_once, []() { std::thread(audio_worker).detach(); });
+#else
+    (void)success;
 #endif
 }
 
@@ -284,6 +340,7 @@ private:
     int emu_dump_scroll_ = 0;
     // Toast notification (auto-dismiss 1s popup)
     std::string toast_msg_;
+    bool           toast_is_error_ = false;
     uint32_t    toast_expire_tick_ = 0;  // 0 = no active toast
     // EMU dump completion tracking (to show toast when async dump finishes)
     bool last_emu_dump_running_   = false;
@@ -2719,9 +2776,12 @@ private:
         ui_message_ = std::string(tool_name(active_tool_idx_)) + " opened";
     }
 
-    void show_toast(const std::string &msg, uint32_t duration_ms = 1000)
+    void show_toast(const std::string &msg,
+                    uint32_t duration_ms = 1000,
+                    bool is_error = false)
     {
         toast_msg_          = msg;
+        toast_is_error_     = is_error;
         toast_expire_tick_  = lv_tick_get() + duration_ms;
     }
 
@@ -4836,9 +4896,12 @@ private:
         lv_obj_set_size(card, W, H);
         lv_obj_set_pos(card, (320 - W) / 2, (CONTENT_H - H) / 2);
         lv_obj_set_style_radius(card, 6, LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_set_style_bg_color(card, lv_color_hex(0x1A3A1A), LV_PART_MAIN | LV_STATE_DEFAULT);
+        const uint32_t bg_color = toast_is_error_ ? 0x3A1515 : 0x1A3A1A;
+        const uint32_t border_color = toast_is_error_ ? 0xFF3B30 : 0x00CC44;
+        const uint32_t text_color = toast_is_error_ ? 0xFF6B63 : 0x00EE55;
+        lv_obj_set_style_bg_color(card, lv_color_hex(bg_color), LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_bg_opa(card, 230, LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_set_style_border_color(card, lv_color_hex(0x00CC44), LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_border_color(card, lv_color_hex(border_color), LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_border_width(card, 1, LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
@@ -4847,7 +4910,7 @@ private:
         lv_label_set_long_mode(lbl, LV_LABEL_LONG_CLIP);
         lv_obj_set_width(lbl, W - 10);
         lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_set_style_text_color(lbl, lv_color_hex(0x00EE55), LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_text_color(lbl, lv_color_hex(text_color), LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_text_font(lbl, &lv_font_unscii_8, LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_center(lbl);
     }
@@ -6234,10 +6297,12 @@ private:
                 selected_uhf_bank(), uhf_bank_values_[uhf_tag_bank_idx_], &error)) {
             ui_message_ = std::string(uhf_bank_name(uhf_tag_bank_idx_)) + " write verified";
             show_toast("Write verified", 1800);
+            rfid_scan_audio::play_write_result(true);
             if (uhf_tag_bank_idx_ == 0) uhf_selected_epc_ = uhf_bank_values_[0];
         } else {
             ui_message_ = error.empty() ? "Tag write failed" : error;
-            show_toast("Write failed", 1800);
+            show_toast("Write failed", 1800, true);
+            rfid_scan_audio::play_write_result(false);
         }
     }
 
