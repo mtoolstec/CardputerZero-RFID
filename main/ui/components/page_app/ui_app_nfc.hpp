@@ -3157,7 +3157,7 @@ private:
     // block0 field coloring based on UID length (4-byte / 7-byte UID).
     void render_dump_line_colored(lv_obj_t *parent, int x_base, int y,
                                   const std::string &line, int uid_len,
-                                  bool skip_mfc_ascii = false,
+                                  bool skip_mfc_ascii = true,
                                   bool hex_block_index = false)
     {
         constexpr int CW = 8;  // unscii_8 char width in px
