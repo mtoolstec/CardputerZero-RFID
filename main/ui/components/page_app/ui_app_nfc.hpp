@@ -367,6 +367,9 @@ private:
     // mfkey32v2: 0=uid_input 1=sniffing 2=cracking 3=results
     // mfkey64:   0=ready     1=sniffing 2=cracking 3=results
     int  mfkey_step_ = 0;
+    float mfkey_display_progress_ = 0.0f;
+    uint32_t mfkey_progress_tick_ = 0;
+    uint32_t mfkey_complete_tick_ = 0;
     std::string mfkey_uid_input_; // hex UID typed by user (mfkey32v2 only)
     bool mfkey_save_mode_      = false; // save-all-to-file filename input overlay
     std::string mfkey_save_filename_;   // filename being typed in save overlay
@@ -801,19 +804,26 @@ private:
         self->last_hw_upload_running_ = upload_running_now;
         // Detect MFKey crack completion → cache results and advance wizard to step 3
         const bool mfkey_running_now = self->service_.hw_mfkey_running();
-        if (self->last_hw_mfkey_running_ && !mfkey_running_now) {
-            // Normal path: saw running=true, now running=false
-            self->mfkey_results_ = self->service_.hw_mfkey_results();
-            self->mfkey_result_idx_ = 0;
-            if (self->mfkey_step_ == 2) self->mfkey_step_ = 3;
-            self->show_toast(self->mfkey_results_.empty() ? "No results" : "Cracking done");
-        } else if (self->mfkey_step_ == 2 && !mfkey_running_now) {
-            // Race-condition path: task finished before timer ever saw running=true
-            // (e.g. no captured nonces → returns instantly; binary missing → returns instantly)
-            self->mfkey_results_ = self->service_.hw_mfkey_results();
-            self->mfkey_result_idx_ = 0;
-            self->mfkey_step_ = 3;
-            self->show_toast(self->mfkey_results_.empty() ? "No results" : "Cracking done");
+        if (self->mfkey_step_ == 2) {
+            const uint32_t now = lv_tick_get();
+            const float dt = static_cast<float>(std::min<uint32_t>(lv_tick_elaps(self->mfkey_progress_tick_), 100));
+            self->mfkey_progress_tick_ = now;
+            const float target = mfkey_running_now
+                ? static_cast<float>(std::min(99, self->service_.hw_mfkey_progress())) : 100.0f;
+            const float gap = std::max(0.0f, target - self->mfkey_display_progress_);
+            // Ease toward real progress; never invent progress ahead of the worker.
+            self->mfkey_display_progress_ += std::min(gap, std::max(0.5f, gap * dt / (180.0f + dt)));
+            if (!mfkey_running_now && self->mfkey_display_progress_ >= 99.9f) {
+                self->mfkey_display_progress_ = 100.0f;
+                if (!self->mfkey_complete_tick_) self->mfkey_complete_tick_ = now;
+                // Briefly show the completed bar before opening the result list.
+                if (lv_tick_elaps(self->mfkey_complete_tick_) >= 200) {
+                    self->mfkey_results_ = self->service_.hw_mfkey_results();
+                    self->mfkey_result_idx_ = 0;
+                    self->mfkey_step_ = 3;
+                    self->show_toast(self->mfkey_results_.empty() ? "No results" : "Cracking done");
+                }
+            }
         }
         self->last_hw_mfkey_running_ = mfkey_running_now;
         // Detect write card completion
@@ -2177,6 +2187,29 @@ private:
             emit_ok(oss.str());
             ui_message_ = "Automation status exported";
             return;
+        }
+
+        if (verb_upper == "MFKEY_START") {
+            std::string uid; iss >> uid;
+            if (!uid.empty() && (uid.size() != 8 || !service_.hw_sniff_set_uid(uid))) {
+                emit_err("invalid UID or UID upload failed"); return;
+            }
+            if (!service_.hw_sniff_enter_mode(false)) { emit_err("sniffer start failed"); return; }
+            emit_ok("sniffer no tag active"); return;
+        }
+        if (verb_upper == "MFKEY_CALCULATE") {
+            service_.hw_switch_to_reader_mode();
+            if (!service_.hw_start_mfkey_async(false)) { emit_err("calculation busy"); return; }
+            emit_ok("mfkey calculation started"); return;
+        }
+        if (verb_upper == "MFKEY_RESULTS") {
+            if (service_.hw_mfkey_running()) { emit_ok("calculation running"); return; }
+            std::ostringstream results;
+            for (const auto &r : service_.hw_mfkey_results()) {
+                results << std::hex << r.uid << " sector=" << std::dec << int(r.sector)
+                        << " key=" << r.key_hex << "; ";
+            }
+            emit_ok(results.str()); return;
         }
 
         if (verb_upper == "USB_CONNECT") {
@@ -5303,104 +5336,64 @@ private:
         const bool with_card = (active_tool_idx_ == 3);
         const char *title    = with_card ? "MFkey64" : "MFKey32v2";
 
-        // Title bar with step indicator
-        create_text(parent, 8, 4, title, 0xFFFFFF, 12);
-        // ①②③ step indicator
-        {
-            const char *step_ch[3] = {"(1)", "(2)", "(3)"};
-            int sx = 250;
-            for (int si = 0; si < 3; ++si) {
-                const bool is_cur = (si == (mfkey_step_ < 3 ? mfkey_step_ : 2));
-                const bool is_done = (si < (mfkey_step_ < 3 ? mfkey_step_ : 3));
-                const uint32_t col = is_cur ? 0xF7A600 : (is_done ? 0x00AA55 : 0x444444);
-                create_text(parent, sx, 4, step_ch[si], col, is_cur ? 12 : 10);
-                sx += is_cur ? 16 : 14;
-            }
+        create_text(parent, 8, 3, title, 0xFFFFFF, 12);
+        const int stage = mfkey_step_ == 0 ? 0 : (mfkey_step_ == 1 ? 1 : 2);
+        const char *stages[] = {"1 Setup", "2 Capture", "3 Keys"};
+        for (int i = 0; i < 3; ++i) {
+            create_text(parent, 102 + i * 70, 4, stages[i],
+                        i == stage ? 0xF7A600 : (i < stage ? 0x00CC88 : 0x666666), 12);
         }
-
-        // ── mfkey32v2 ────────────────────────────────────────────────────────
-        if (!with_card) {
-            switch (mfkey_step_) {
-            case 0: {
-                create_text(parent, 8, 22, "(1) Set sniffer UID (optional)", 0xF7A600, 11);
-                create_text(parent, 8, 38, "Target card UID (8 hex chars):", 0xD8D8D8, 11);
-                const std::string disp = mfkey_uid_input_.empty() ? "_" : mfkey_uid_input_ + "_";
-                create_text_mono(parent, 8, 54, disp.c_str(), 0x00FFAA, 12);
-                create_text(parent, 8, 74, "Leave empty to use device default UID", 0x888888, 10);
-                create_text(parent, 8, 90, "Bsp:del  Enter:confirm  ESC:back", 0x7A7A7A, 10);
-                break;
+        if (mfkey_step_ >= 3) {
+            render_mfkey_results(parent);
+            return;
+        }
+        if (mfkey_step_ == 2) {
+            char progress[32];
+            const int pct = static_cast<int>(mfkey_display_progress_);
+            std::snprintf(progress, sizeof(progress), "Calculating keys  %d%%", pct);
+            create_text(parent, 12, 32, progress, 0xF7A600, 12);
+            create_panel(parent, 12, 59, 292, 6, 0x303030);
+            if (pct > 0) create_panel(parent, 12, 59, std::max(1, 292 * pct / 100), 6, 0xF7A600);
+            create_text(parent, 12, 78, "Please wait...", 0x888888, 10);
+            return;
+        }
+        if (mfkey_step_ == 0) {
+            if (with_card) {
+                create_text(parent, 12, 29, "Place card near reader", 0xFFFFFF, 12);
+                create_text(parent, 12, 53, "Keep PN532Killer beside the card.", 0x999999, 10);
+            } else {
+                create_text(parent, 12, 27, "UID (optional)", 0x999999, 10);
+                const std::string uid = mfkey_uid_input_.empty() ? "Default UID" : mfkey_uid_input_ + "_";
+                create_text_mono(parent, 12, 47, uid.c_str(), 0x00FFAA, 12);
+                create_text(parent, 12, 69, "8 hex digits, or leave empty", 0x888888, 10);
             }
-            case 1: {
-                create_text(parent, 8, 22, "(2) Sniffer active", 0xF7A600, 11);
-                if (mfkey_uid_input_.empty()) {
-                    create_text(parent, 8, 38, "No UID set. Device uses its own UID.", 0xD8D8D8, 11);
-                } else {
-                    create_text_mono(parent, 8, 38, (std::string("UID: ") + mfkey_uid_input_).c_str(), 0xD8D8D8, 11);
-                }
-                create_text(parent, 8, 54, "Approach reader, capture auth sessions.", 0xD8D8D8, 11);
-                create_text(parent, 8, 70, "Press Enter when done sniffing.", 0x8DB6FF, 11);
-                create_text(parent, 8, 90, "Enter:stop+crack  ESC:abort", 0x7A7A7A, 10);
-                break;
-            }
-            case 2: {
-                const int pct32 = service_.hw_mfkey_progress();
-                char buf32[48];
-                std::snprintf(buf32, sizeof(buf32), "Cracking... %d%%", pct32);
-                create_text(parent, 8, 22, "(3) Calculating keys", 0xF7A600, 11);
-                create_text(parent, 8, 38, buf32, 0xF7A600, 12);
-                create_text(parent, 8, 56, "Running mfkey32v2 on nonce pairs...", 0xD8D8D8, 11);
-                break;
-            }
-            default:
-                render_mfkey_results(parent);
-                break;
-            }
+            create_text(parent, 12, 90, "Enter: Start                 Esc: Back", 0x8DB6FF, 10);
+            return;
+        }
+        const bool editing_uid = !with_card && !mfkey_uid_input_.empty();
+        create_text(parent, 12, 27, editing_uid ? "Change capture UID" : "Capturing...",
+                    editing_uid ? 0xF7A600 : 0x00FFAA, 12);
+        if (editing_uid) {
+            create_text_mono(parent, 12, 49, (mfkey_uid_input_ + "_").c_str(), 0xFFFFFF, 12);
+            create_text(parent, 12, 69, "Enter restarts capture with this UID", 0x999999, 10);
         } else {
-        // ── mfkey64 ──────────────────────────────────────────────────────────
-            switch (mfkey_step_) {
-            case 0: {
-                create_text(parent, 8, 22, "(1) Enter sniffer mode", 0xF7A600, 11);
-                create_text(parent, 8, 38, "Place real card on device, then", 0xD8D8D8, 11);
-                create_text(parent, 8, 54, "let reader authenticate the card.", 0xD8D8D8, 11);
-                create_text(parent, 8, 70, "Press Enter to start sniffing.", 0x8DB6FF, 11);
-                create_text(parent, 8, 90, "Enter:start  ESC:back", 0x7A7A7A, 10);
-                break;
-            }
-            case 1: {
-                create_text(parent, 8, 22, "(2) Sniffer active (card-present)", 0xF7A600, 11);
-                create_text(parent, 8, 38, "Device is in card-present sniffer mode.", 0xD8D8D8, 11);
-                create_text(parent, 8, 54, "Hold card near reader, let it auth.", 0xD8D8D8, 11);
-                create_text(parent, 8, 70, "Press Enter when auth captured.", 0x8DB6FF, 11);
-                create_text(parent, 8, 90, "Enter:stop+crack  ESC:back", 0x7A7A7A, 10);
-                break;
-            }
-            case 2: {
-                const int pct64 = service_.hw_mfkey_progress();
-                char buf64[48];
-                std::snprintf(buf64, sizeof(buf64), "Cracking... %d%%", pct64);
-                create_text(parent, 8, 22, "(3) Calculating keys", 0xF7A600, 11);
-                create_text(parent, 8, 38, buf64, 0xF7A600, 12);
-                create_text(parent, 8, 56, "Running mfkey64 on captured auth...", 0xD8D8D8, 11);
-                break;
-            }
-            default:
-                render_mfkey_results(parent);
-                break;
-            }
+            create_text(parent, 12, 49, with_card ? "Let reader authenticate the card." : "Hold PN532Killer near the reader.", 0xD8D8D8, 10);
+            create_text(parent, 12, 69, with_card ? "Keep card in place until finished." : "New UID? Type 8 hex digits.", 0x888888, 10);
         }
+        create_text(parent, 12, 90, editing_uid ? "Enter: Restart            Esc: Cancel" : "Enter: Calculate          Esc: Cancel", 0x8DB6FF, 10);
     }
 
     void render_mfkey_results(lv_obj_t *parent)
     {
         if (mfkey_results_.empty()) {
             create_text(parent, 8, 22, "No keys found", 0xFF6666, 12);
-            create_text(parent, 8, 42, "Not enough nonce pairs captured.", 0xD8D8D8, 11);
-            create_text(parent, 8, 56, "Try again: approach reader more times.", 0xD8D8D8, 11);
+            create_text(parent, 8, 42, "No usable authentication captured.", 0xD8D8D8, 11);
+            create_text(parent, 8, 56, "R: Set up and capture again", 0xD8D8D8, 11);
             create_text(parent, 8, 90, "R:retry  ESC:back", 0x7A7A7A, 10);
             return;
         }
-        // Result list (up to 4 visible rows of 20px each)
-        constexpr int visible = 4;
+        // Three rows leave room for the step header and action footer.
+        constexpr int visible = 3;
         const int total = static_cast<int>(mfkey_results_.size());
         int offset = mfkey_result_idx_ - 1;
         if (offset < 0) offset = 0;
@@ -5414,7 +5407,7 @@ private:
             lv_obj_t *row = lv_obj_create(parent);
             lv_obj_remove_style_all(row);
             lv_obj_set_size(row, 306, 18);
-            lv_obj_set_pos(row, 6, 18 + r * 19);
+            lv_obj_set_pos(row, 6, 24 + r * 20);
             lv_obj_set_style_bg_color(row, lv_color_hex(sel ? 0xF7A600 : 0x1E1E1E), LV_PART_MAIN | LV_STATE_DEFAULT);
             lv_obj_set_style_bg_opa(row, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
             lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
@@ -5422,10 +5415,12 @@ private:
             std::snprintf(col, sizeof(col), "Sec%02u Key%c", res.sector, res.key_type == 0 ? 'A' : 'B');
             const std::string kd = res.key_hex.empty() ? "(not found)" : res.key_hex;
             std::snprintf(val, sizeof(val), "%s", kd.c_str());
-            create_text(row, 4, 1, col, sel ? 0x000000 : 0xFFFFFF, 10);
-            create_text_mono(row, 80, 1, val, sel ? 0x2F2F2F : 0x8DB6FF, 10);
+            lv_obj_t *sector_label = create_text(row, 4, 0, col, sel ? 0x000000 : 0xFFFFFF, 10);
+            lv_obj_t *key_label = create_text_mono(row, 80, 0, val, sel ? 0x2F2F2F : 0x8DB6FF, 10);
+            lv_obj_align(sector_label, LV_ALIGN_LEFT_MID, 4, 0);
+            lv_obj_align(key_label, LV_ALIGN_LEFT_MID, 80, 0);
         }
-        create_text(parent, 6, 92, "Enter:import  S:save all  R:retry  ESC:back", 0x7A7A7A, 10);
+        create_text(parent, 6, 92, "Enter:Import  S:Save  R:Retry  Esc:Back", 0x7A7A7A, 10);
         // Save-to-file filename input overlay
         if (mfkey_save_mode_) {
             lv_obj_t *box = create_panel(parent, 16, 26, 288, 62, 0x131320);
@@ -7621,7 +7616,13 @@ private:
     {
         const bool with_card = (active_tool_idx_ == 3);
 
-        // Global: ESC always goes back (or resets step)
+        // Cancel UID editing without interrupting the current capture.
+        if (key == KEY_ESC && !with_card && mfkey_step_ == 1 && !mfkey_uid_input_.empty()) {
+            mfkey_uid_input_.clear();
+            ui_message_ = "Capture continues";
+            return;
+        }
+        // ESC backs out one wizard step.
         if (key == KEY_ESC) {
             if (mfkey_step_ == 0) {
                 modal_ = Modal::None;
@@ -7667,6 +7668,7 @@ private:
                     ui_message_ = mfkey_uid_input_.empty()
                         ? "Sniffer active (no UID set). Approach reader."
                         : "Sniffer active (UID set). Approach reader.";
+                    mfkey_uid_input_.clear();
                     return;
                 }
                 // Hex char input (max 8)
@@ -7677,13 +7679,40 @@ private:
                 break;
             }
             case 1: {
-                // Sniffer active — wait for Enter to stop and crack
+                // Empty UID reads the current log; a new UID starts a new capture.
+                if (key == KEY_BACKSPACE) {
+                    if (!mfkey_uid_input_.empty()) mfkey_uid_input_.pop_back();
+                    return;
+                }
+                if (key != KEY_ENTER) {
+                    const char ch = keycode_to_hex_char(key);
+                    if (ch && mfkey_uid_input_.size() < 8) mfkey_uid_input_ += ch;
+                    return;
+                }
                 if (key == KEY_ENTER) {
+                    if (!mfkey_uid_input_.empty()) {
+                        if (mfkey_uid_input_.size() != 8) {
+                            ui_message_ = "UID must be 8 hex chars (4 bytes)";
+                            return;
+                        }
+                        service_.hw_switch_to_reader_mode();
+                        if (!service_.hw_sniff_set_uid(mfkey_uid_input_) ||
+                            !service_.hw_sniff_enter_mode(false)) {
+                            ui_message_ = "Failed to restart sniffer with UID";
+                            return;
+                        }
+                        mfkey_uid_input_.clear();
+                        ui_message_ = "Sniffer no tag: approach reader, Enter to crack";
+                        return;
+                    }
                     // Switch back to reader mode, then start async crack
                     service_.hw_switch_to_reader_mode();
                     mfkey_results_.clear();
                     mfkey_result_idx_ = 0;
                     if (service_.hw_start_mfkey_async(false)) {
+                        mfkey_display_progress_ = 0.0f;
+                        mfkey_progress_tick_ = lv_tick_get();
+                        mfkey_complete_tick_ = 0;
                         mfkey_step_ = 2;
                         ui_message_ = "MFKey32v2 cracking...";
                     } else {
@@ -7724,6 +7753,9 @@ private:
                     mfkey_results_.clear();
                     mfkey_result_idx_ = 0;
                     if (service_.hw_start_mfkey_async(true)) {
+                        mfkey_display_progress_ = 0.0f;
+                        mfkey_progress_tick_ = lv_tick_get();
+                        mfkey_complete_tick_ = 0;
                         mfkey_step_ = 2;
                         ui_message_ = "MFkey64 cracking...";
                     } else {

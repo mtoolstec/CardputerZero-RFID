@@ -114,7 +114,7 @@ public:
         const std::vector<uint8_t> frame = Pn532FrameCodec::build_command(0xAC, {mode, type, index});
         if (transport_->write_bytes(frame.data(), frame.size(), error) < 0) return false;
         std::vector<uint8_t> rx;
-        if (!collect_response(&rx, error)) return false;
+        if (!collect_response(&rx, error, 0xAD)) return false;
         std::vector<uint8_t> fd;
         if (!Pn532FrameCodec::parse_first_frame(rx, &fd) || fd.size() < 3 ||
             fd[0] != 0xD5 || fd[1] != 0xAD) {
@@ -234,7 +234,7 @@ public:
             const auto frame = Pn532FrameCodec::build_command(0x1E, payload);
             if (transport_->write_bytes(frame.data(), frame.size(), nullptr) < 0) return false;
             std::vector<uint8_t> rx;
-            collect_response(&rx, nullptr);
+            collect_response(&rx, nullptr, 0x1F);
         }
         // upload_data_block_done: type=1, slot=0x11, index=0xFFFF, 16 zero bytes
         {
@@ -243,7 +243,7 @@ public:
             const auto frame = Pn532FrameCodec::build_command(0x1E, payload);
             if (transport_->write_bytes(frame.data(), frame.size(), nullptr) < 0) return false;
             std::vector<uint8_t> rx;
-            collect_response(&rx, nullptr);
+            collect_response(&rx, nullptr, 0x1F);
             std::vector<uint8_t> fd;
             if (!Pn532FrameCodec::parse_first_frame(rx, &fd)) return false;
             return !fd.empty() && fd.back() == 0x00;
@@ -266,7 +266,7 @@ public:
         const std::vector<uint8_t> frame = Pn532FrameCodec::build_command(0x22, payload);
         if (transport_->write_bytes(frame.data(), frame.size(), nullptr) < 0) return false;
         std::vector<uint8_t> rx;
-        collect_response(&rx, nullptr);
+        collect_response(&rx, nullptr, 0x23);
         std::vector<uint8_t> fd;
         if (!Pn532FrameCodec::parse_first_frame(rx, &fd)) return false;
         return !fd.empty() && fd.back() == 0x00;
@@ -286,7 +286,7 @@ public:
         if (transport_->write_bytes(frame.data(), frame.size(), nullptr) < 0) return result;
 
         std::vector<uint8_t> rx;
-        collect_response(&rx, nullptr);
+        collect_response(&rx, nullptr, 0x21);
         std::vector<uint8_t> fd;
         if (!Pn532FrameCodec::parse_first_frame(rx, &fd)) return result;
         // fd layout: D5 21 [mode_flag] [pad] [entries...]
@@ -2039,7 +2039,7 @@ private:
         }
     }
 
-    bool collect_response(std::vector<uint8_t> *rx, std::string *error)
+    bool collect_response(std::vector<uint8_t> *rx, std::string *error, uint8_t expected_command = 0)
     {
         rx->clear();
         uint8_t buffer[128];
@@ -2050,8 +2050,22 @@ private:
             if (got < 0) return false;
             if (got == 0) continue;
             rx->insert(rx->end(), buffer, buffer + got);
-            if (Pn532FrameCodec::parse_first_frame(*rx, nullptr)) {
-                return true;
+            if (!expected_command) {
+                if (Pn532FrameCodec::parse_first_frame(*rx, nullptr)) return true;
+            } else {
+                // A delayed response must never satisfy a different command.
+                // Scan all frames, including multiple responses in one read.
+                for (size_t i = 0; i + 7 < rx->size(); ++i) {
+                    if ((*rx)[i] || (*rx)[i+1] || (*rx)[i+2] != 0xFF) continue;
+                    const size_t end = i + 7 + (*rx)[i+3];
+                    if (end > rx->size()) continue;
+                    std::vector<uint8_t> frame(rx->begin()+i, rx->begin()+end), data;
+                    if (Pn532FrameCodec::parse_first_frame(frame, &data) &&
+                        data.size() >= 2 && data[0] == 0xD5 && data[1] == expected_command) {
+                        *rx = std::move(frame);
+                        return true;
+                    }
+                }
             }
         }
         if (error) *error = "timeout waiting for PN532 response";

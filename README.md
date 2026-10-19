@@ -7,6 +7,8 @@ NFC tags across multiple hardware devices.
 
 ## Device Feature Matrix
 
+完整中文横向功能列表见 [外接设备功能对比](FEATURE_MATRIX.md)。以下旧版概览仅供参考，以该列表和实际代码限制为准。
+
 | Device | Interface | Scan | Read / Dump | Write (UID) | Emulate | Sniff | UHF | NDEF | Key Mgmt |
 |--------|-----------|:----:|:-----------:|:-----------:|:-------:|:-----:|:---:|:----:|:--------:|
 | **PN532Killer** | USB / UART | ✅ | ✅ MFC/NTAG/15693 | ✅ Gen1A/2/3/4 | ✅ HW slot 0-7 | ✅ Both modes | ❌ | ✅ | ✅ |
