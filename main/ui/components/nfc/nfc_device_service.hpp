@@ -1069,6 +1069,7 @@ public:
                  endpoint_label_upper.find("FZUHF") != std::string::npos);
             const bool endpoint_is_known_uhf = endpoint_is_named_uhf ||
                 (connection_.endpoint.kind == TransportKind::UsbSerial &&
+                 endpoint_label_upper.find("PN532") == std::string::npos &&
                  connection_.endpoint.usb_vid == 0x1A86 &&
                  (connection_.endpoint.usb_pid == 0x55D3 ||
                   connection_.endpoint.usb_pid == 0xFE1C));
