@@ -13,6 +13,7 @@
 #include <set>
 #include <string>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <vector>
 
 namespace nfc_app {
@@ -173,6 +174,11 @@ public:
         // Reorder blocks keys numerically (nlohmann::json sorts alphabetically by default)
         reorder_blocks_keys(document);
         output << document.dump(2);
+        output.close();
+        if (!output.good()) {
+            if (error) *error = "Failed to write record JSON";
+            return false;
+        }
         return true;
     }
 

@@ -27,7 +27,7 @@ NFC tags across multiple hardware devices.
 | **ISO 15693** | ✅ | ✅ | ✅ | ❌ | Tag-it, I-Code SLI, ST LRI |
 | **FeliCa** | ✅ (GroveNFC) | ❌ | ❌ | ❌ | Limited to Grove NFC reader |
 | **DESFire** | ❌ | ❌ | ❌ | ❌ | Detected but not read |
-| **UHF RFID (EPC C1G2)** | ✅ | ✅ Continuous | ❌ | ❌ | Read once or continuous, CSV export |
+| **UHF RFID (EPC C1G2)** | ✅ | ✅ Memory banks | ❌ | ❌ | Inventory, CSV export, per-tag Reserved/EPC/TID/User capture |
 
 ---
 
@@ -39,11 +39,16 @@ NFC tags across multiple hardware devices.
 - **Save** — persist scanned dump to local storage
 - **Hex log** — Ctrl+L toggles full TX/RX frame log overlay
 - **Auto-detect** card type and display ATQA/SAK/UID
+- **UHF inventory** — F/X selects a tag and pauses inventory; Ctrl+S immediately
+  adds it to Saved, then reads its memory banks in the background. Each bank
+  records its hex data, completeness, and error/status. Protected or truncated
+  banks are explicitly marked partial.
 
 ### Saved Tab
 - Browse saved dumps, rename, edit raw hex
 - Upload dump to emulator slot (PN532Killer HW slots 0-7)
 - Export / delete records
+- UHF records show a read-only bank viewer (Tab changes bank, Up/Down scrolls)
 
 ### Emulator Tab
 - **PN532Killer HW Emulation** — up to 8 slots, ISO14443A / ISO15693 / MIFARE Classic

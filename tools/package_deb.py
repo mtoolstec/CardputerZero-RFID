@@ -240,10 +240,9 @@ if id -u pi >/dev/null 2>&1; then
     chown -R pi:pi "$RFID_DIR"
 fi
 
-# ── Restart APPLaunch if running ─────────────────────────────────────────
-if [ -f "/lib/systemd/system/APPLaunch.service" ]; then
-  systemctl restart APPLaunch.service || true
-fi
+# APPLaunch may currently be running this app and using its USB reader.
+# Replacing package files is enough; the next launch picks up the new binary.
+# Do not restart the launcher and interrupt an active reader session.
 exit 0
 """
 

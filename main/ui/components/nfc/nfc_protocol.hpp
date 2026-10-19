@@ -46,23 +46,6 @@ public:
         return frame;
     }
 
-    static bool is_ack(const std::vector<uint8_t> &bytes)
-    {
-        static const uint8_t ack[] = {0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00};
-        if (bytes.size() < sizeof(ack)) return false;
-        for (size_t i = 0; i < bytes.size() - sizeof(ack) + 1; ++i) {
-            bool same = true;
-            for (size_t j = 0; j < sizeof(ack); ++j) {
-                if (bytes[i + j] != ack[j]) {
-                    same = false;
-                    break;
-                }
-            }
-            if (same) return true;
-        }
-        return false;
-    }
-
     static bool parse_first_frame(const std::vector<uint8_t> &bytes, std::vector<uint8_t> *data_out)
     {
         for (size_t i = 0; i + 7 < bytes.size(); ++i) {

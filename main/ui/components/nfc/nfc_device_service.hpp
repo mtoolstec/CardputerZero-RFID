@@ -1027,7 +1027,7 @@ public:
         const auto report_probe = [&](const std::string &name, int baud, bool done, bool ok) {
             if (!probe_progress) return;
             std::string line = "Checking " + name + " @" + std::to_string(baud) + " ...";
-            if (done) line += ok ? " v" : " x";
+            if (done) line += ok ? " [OK]" : " [FAIL]";
             probe_progress(line);
         };
         const auto open_at_baud = [this](int baud, std::string *open_error) -> bool {
@@ -1228,15 +1228,16 @@ public:
                 if (try_uhf(9600)) return true;
             }
 
-            // Keep serial connected, but mark as unknown device after full probe order.
-            std::string restore_error;
-            (void)open_at_baud(115200, &restore_error);
-            connection_.device_kind = DeviceKind::OtherSerial;
+            // Opening a USB/UART port is not a successful reader connection.
+            // Release it so a failed probe can be retried cleanly.
+            if (transport_) { transport_->close(); transport_.reset(); }
+            connection_.connected = false;
+            connection_.device_kind = DeviceKind::NotConnected;
             connection_.pn532_ready = false;
-            connection_.status = "Connected Serial";
+            connection_.status = "Connect failed";
             connection_.detail = std::string("No known device on ") + transport_name +
                                  " (tested PN532/PN532Killer/UHF @9600/@115200)";
-            return true;
+            return false;
         } else if (connection_.endpoint.kind == TransportKind::I2cBus) {
             // Parse "/dev/i2c-1:0x48" → bus + addr
             const std::string &path = connection_.endpoint.path;
@@ -1589,6 +1590,185 @@ public:
         if (value_hex) *value_hex = parsed;
         if (error) error->clear();
         return true;
+    }
+
+    bool save_uhf_tag_snapshot(const std::string &selected_epc,
+                               std::string *record_id,
+                               std::string *error = nullptr)
+    {
+        UhfTagSnapshot snapshot;
+        TransportEndpoint endpoint;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            const auto found = uhf_tags_.find(selected_epc);
+            if (found == uhf_tags_.end()) {
+                if (error) *error = "Selected UHF tag not in inventory";
+                return false;
+            }
+            snapshot = found->second;
+            endpoint = connection_.endpoint;
+        }
+        SavedRecord record = make_record_from_tag(
+            uhf_snapshot_to_tag_info(snapshot), endpoint, false, "uhf_memory");
+        record.meta.schema_version = 2;
+        record.meta.schema_name = "m5cz.uhf.record";
+        record.meta.display_name = "UHF_" + selected_epc;
+        record.meta.record_id += "_" + std::to_string(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+        record.meta.notes = "UHF memory read pending";
+        record.tag.raw_data.clear();
+        UhfMemoryDump memory;
+        memory.epc = selected_epc;
+        const char *names[] = {"Reserved", "EPC", "TID", "User"};
+        for (int bank = 0; bank < 4; ++bank) {
+            memory.banks.push_back({bank, names[bank], "", false, "Reading..."});
+        }
+        record.uhf_memory = std::move(memory);
+        if (!storage_.save_record(record, error)) return false;
+        SavedRecord verified;
+        if (!storage_.load_record_by_id(record.meta.record_id, &verified)) {
+            if (error) *error = "Saved UHF record could not be reopened";
+            return false;
+        }
+        if (record_id) *record_id = record.meta.record_id;
+        if (error) error->clear();
+        return true;
+    }
+
+    bool save_uhf_tag_memory(const std::string &selected_epc,
+                             const std::string &record_id,
+                             bool *complete = nullptr,
+                             std::string *error = nullptr)
+    {
+        if (complete) *complete = false;
+        std::vector<uint8_t> epc_bytes;
+        if (!parse_hex_bytes(selected_epc, &epc_bytes) || epc_bytes.empty() ||
+            epc_bytes.size() > 48) {
+            if (error) *error = "Invalid selected EPC";
+            return false;
+        }
+
+        INfcTransport *transport_raw = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!transport_ || !transport_->is_open() ||
+                connection_.device_kind != DeviceKind::UHFReader) {
+                if (error) *error = "Connect UHF reader first";
+                return false;
+            }
+            if (scan_.running) {
+                if (error) *error = "Stop inventory before saving tag";
+                return false;
+            }
+            transport_raw = transport_.get();
+        }
+
+        UhfMemoryDump memory;
+        memory.epc = selected_epc;
+        const char *names[] = {"Reserved", "EPC", "TID", "User"};
+        bool all_complete = true;
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(8);
+        {
+            std::lock_guard<std::mutex> op_lock(transport_op_mutex_);
+            std::vector<uint8_t> filter = {0x00, static_cast<uint8_t>(epc_bytes.size())};
+            filter.insert(filter.end(), epc_bytes.begin(), epc_bytes.end());
+            std::vector<uint8_t> reply;
+            std::string filter_error;
+            const bool filter_ok = uhf_tag_command_locked(
+                transport_raw, 0x85, filter, 800, &reply, &filter_error) &&
+                reply.size() == 1 && reply[0] == 0x10;
+            if (!filter_ok && filter_error.empty()) filter_error = "EPC filter failed";
+
+            for (int bank = 0; bank < 4; ++bank) {
+                UhfMemoryBankDump dump;
+                dump.bank = bank;
+                dump.name = names[bank];
+                unsigned int offset = 0;
+                // Keep the read bounded. A partial bank remains visible in
+                // Saved with its status instead of blocking the UI indefinitely.
+                while (filter_ok && offset < 128 &&
+                       std::chrono::steady_clock::now() < deadline) {
+                    unsigned int words = std::min(16u, 128u - offset);
+                    bool advanced = false;
+                    while (words > 0 && std::chrono::steady_clock::now() < deadline) {
+                        std::vector<uint8_t> payload = {
+                            static_cast<uint8_t>(bank), 0, 0,
+                            static_cast<uint8_t>(offset >> 8),
+                            static_cast<uint8_t>(offset),
+                            0, static_cast<uint8_t>(words), 0, 0, 0, 0,
+                        };
+                        std::string read_error;
+                        if (!uhf_tag_command_locked(transport_raw, 0x81, payload, 700,
+                                                    &reply, &read_error)) {
+                            dump.status = read_error;
+                            break;
+                        }
+                        if (reply.size() == 1 && reply[0] == 0x23) {
+                            if (words == 1) {
+                                dump.complete = true;
+                                dump.status = dump.hex.empty() ? "empty" : "complete";
+                                break;
+                            }
+                            words /= 2;
+                            continue;
+                        }
+                        std::string chunk;
+                        if (!parse_uhf_tag_read_reply(reply, &chunk, &read_error)) {
+                            dump.status = read_error;
+                            break;
+                        }
+                        if (chunk.size() != words * 4) {
+                            dump.status = "Short bank read";
+                            break;
+                        }
+                        dump.hex += chunk;
+                        offset += words;
+                        advanced = true;
+                        break;
+                    }
+                    if (!advanced) break;
+                }
+                if (!filter_ok) dump.status = filter_error;
+                else if (offset == 128 && !dump.complete) dump.status = "Read limit (128 words)";
+                else if (dump.status.empty() && !dump.complete) dump.status = "Time limit";
+                all_complete &= dump.complete;
+                memory.banks.push_back(std::move(dump));
+            }
+
+            if (filter_ok) {
+                std::vector<uint8_t> ignored;
+                std::string ignored_error;
+                (void)uhf_tag_command_locked(transport_raw, 0x85, {0x01}, 250,
+                                             &ignored, &ignored_error);
+            }
+        }
+
+        SavedRecord record;
+        if (!storage_.load_record_by_id(record_id, &record)) {
+            if (error) *error = "Saved UHF record missing";
+            return false;
+        }
+        record.meta.notes = all_complete ? "All UHF memory banks read" :
+            "Partial UHF memory; inspect each bank status";
+        record.uhf_memory = std::move(memory);
+        if (!storage_.save_record(record, error)) return false;
+        if (complete) *complete = all_complete;
+        if (error) error->clear();
+        return true;
+    }
+
+    void mark_uhf_tag_memory_failed(const std::string &record_id,
+                                    const std::string &reason)
+    {
+        SavedRecord record;
+        if (!storage_.load_record_by_id(record_id, &record) || !record.uhf_memory) return;
+        for (auto &bank : record.uhf_memory->banks) {
+            if (bank.status == "Reading...") bank.status = reason;
+        }
+        record.meta.notes = "Partial UHF memory: " + reason;
+        (void)storage_.save_record(record, nullptr);
     }
 
     bool write_uhf_tag_bank(UhfMemoryBank bank,

@@ -279,12 +279,56 @@ struct RecordMeta {
     bool mock = false;
 };
 
+// Gen2 tags have memory banks, not MIFARE sectors. Keep each bank and its
+// read status separate so a protected or truncated bank is never shown as a
+// complete dump.
+struct UhfMemoryBankDump {
+    int bank = 0;
+    std::string name;
+    std::string hex;
+    bool complete = false;
+    std::string status;
+};
+
+struct UhfMemoryDump {
+    std::string epc;
+    std::vector<UhfMemoryBankDump> banks;
+};
+
 struct SavedRecord {
     RecordMeta meta;
     TagInfo tag;
     std::optional<MifareClassicDump> mifare_dump;
     std::optional<EmulatorSlotRecord> emulator_slot;
+    std::optional<UhfMemoryDump> uhf_memory;
 };
+
+inline void to_json(nlohmann::json &j, const UhfMemoryBankDump &value)
+{
+    j = nlohmann::json{{"bank", value.bank}, {"name", value.name},
+                       {"hex", value.hex}, {"complete", value.complete},
+                       {"status", value.status}};
+}
+
+inline void from_json(const nlohmann::json &j, UhfMemoryBankDump &value)
+{
+    value.bank = j.value("bank", 0);
+    value.name = j.value("name", "");
+    value.hex = j.value("hex", "");
+    value.complete = j.value("complete", false);
+    value.status = j.value("status", "");
+}
+
+inline void to_json(nlohmann::json &j, const UhfMemoryDump &value)
+{
+    j = nlohmann::json{{"epc", value.epc}, {"banks", value.banks}};
+}
+
+inline void from_json(const nlohmann::json &j, UhfMemoryDump &value)
+{
+    value.epc = j.value("epc", "");
+    value.banks = j.value("banks", std::vector<UhfMemoryBankDump>{});
+}
 
 inline void to_json(nlohmann::json &j, const AttackSummary &value)
 {
@@ -509,6 +553,7 @@ inline void to_json(nlohmann::json &j, const SavedRecord &value)
         {"tag", value.tag},
         {"mifare_classic_dump", value.mifare_dump ? nlohmann::json(*value.mifare_dump) : nlohmann::json()},
         {"emulator_slot", value.emulator_slot ? nlohmann::json(*value.emulator_slot) : nlohmann::json()},
+        {"uhf_memory", value.uhf_memory ? nlohmann::json(*value.uhf_memory) : nlohmann::json()},
     };
 }
 
@@ -621,6 +666,11 @@ inline void from_json(const nlohmann::json &j, SavedRecord &value)
         value.emulator_slot = j["emulator_slot"].get<EmulatorSlotRecord>();
     } else {
         value.emulator_slot.reset();
+    }
+    if (j.contains("uhf_memory") && !j["uhf_memory"].is_null()) {
+        value.uhf_memory = j["uhf_memory"].get<UhfMemoryDump>();
+    } else {
+        value.uhf_memory.reset();
     }
 }
 

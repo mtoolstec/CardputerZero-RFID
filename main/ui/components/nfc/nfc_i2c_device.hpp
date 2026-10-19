@@ -2378,31 +2378,6 @@ private:
         return out;
     }
 
-    class FibonacciLFSRRight32 {
-    public:
-        explicit FibonacciLFSRRight32(uint32_t seed) : state_(seed) {}
-
-        bool step()
-        {
-            const bool out = (state_ & 0x1U) != 0;
-            const bool fb = (((state_ >> 16) ^ (state_ >> 18) ^ (state_ >> 19) ^ (state_ >> 21)) & 0x1U) != 0;
-            state_ = (state_ >> 1) | (static_cast<uint32_t>(fb) << 31);
-            return out;
-        }
-
-        uint32_t next32()
-        {
-            uint32_t v = 0;
-            for (uint32_t i = 0; i < 32; ++i) {
-                v |= (static_cast<uint32_t>(step()) << i);
-            }
-            return v;
-        }
-
-    private:
-        uint32_t state_ = 0;
-    };
-
     class Crypto1Local {
     public:
         void init(uint64_t key48)
@@ -2537,15 +2512,6 @@ private:
             prng = (prng >> 1U) | (feedback << 31U);
         }
         return bswap32_local(prng);
-    }
-
-    static void suc_23(uint32_t nt, uint32_t &suc2, uint32_t &suc3)
-    {
-        FibonacciLFSRRight32 lfsr(nt);
-        lfsr.next32();
-        lfsr.next32();
-        suc2 = lfsr.next32();
-        suc3 = lfsr.next32();
     }
 
     static uint64_t key_to64(const std::array<uint8_t, 6> &k)

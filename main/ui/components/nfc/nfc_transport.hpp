@@ -392,7 +392,6 @@ private:
         std::string product = endpoint.label;
         std::transform(product.begin(), product.end(), product.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
         if (product.find("PN532") != std::string::npos) return false;
-
         if (endpoint.usb_vid == 0x1A86 &&
             (endpoint.usb_pid == 0x55D3 || endpoint.usb_pid == 0xFE1C)) {
             return true;
@@ -1039,11 +1038,6 @@ private:
         (void)devname;
 #endif
         return {};
-    }
-
-    static bool is_known_uhf_vid_pid(int vid, int pid)
-    {
-        return vid == 0x1A86 && (pid == 0xFE1C || pid == 0x55D3);
     }
 
     static bool parse_hex_u16(const std::string &text, int *value)

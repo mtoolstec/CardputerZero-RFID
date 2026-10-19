@@ -234,6 +234,7 @@ class UINfcPage : public app_base
         Pn532NdefInput,// PN532 NDEF URI input popup
         UhfTagAction,  // EPC/TID/User Data operations for selected inventory row
         UhfTagEdit,    // Hex editor for the selected UHF memory bank
+        UhfSavedView,  // Read-only view of a saved UHF memory bank
     };
 
     enum class ReadMenuAction {
@@ -267,6 +268,7 @@ public:
 
     ~UINfcPage()
     {
+        if (uhf_save_thread_.joinable()) uhf_save_thread_.join();
         (void)service_.grovenfc_deactivate();
         (void)service_.stop_pn532_ndef_emulation();
         (void)service_.spi_stop_listener();
@@ -285,7 +287,6 @@ private:
     std::unordered_map<std::string, lv_obj_t *> ui_obj_;
     std::vector<nfc_app::SavedRecord> saved_records_;
     Tab current_tab_ = Tab::Read;
-    int read_action_idx_ = 0;
     int saved_idx_ = 0;
     int tools_idx_ = 0;
     lv_timer_t *ui_timer_ = nullptr;
@@ -314,6 +315,7 @@ private:
     std::vector<std::string> scan_log_lines_;
     int log_scroll_offset_ = 0;
     std::vector<nfc_app::NfcDeviceService::UhfTableRow> uhf_table_rows_;
+    bool uhf_show_ascii_ = false;
     int uhf_table_scroll_offset_ = 0;
     int uhf_table_selected_idx_ = -1;
     int uhf_tag_bank_idx_ = 0;
@@ -321,6 +323,12 @@ private:
     std::string uhf_bank_values_[3];
     bool uhf_bank_loaded_[3] = {false, false, false};
     std::string uhf_tag_edit_buf_;
+    std::thread uhf_save_thread_;
+    std::atomic<bool> uhf_save_running_{false};
+    bool uhf_save_complete_ = false;
+    std::string uhf_save_error_;
+    int saved_uhf_bank_idx_ = 0;
+    int saved_uhf_scroll_ = 0;
     bool last_scan_running_ = false;
     uint64_t last_uhf_read_total_ = 0;
     uint64_t uhf_rate_window_total_ = 0;
@@ -524,6 +532,28 @@ private:
         return uhf_inventory_started_;
     }
 
+    static std::string uhf_epc_printable_ascii(const std::string &epc)
+    {
+        if (epc.empty() || (epc.size() % 2) != 0) return {};
+        std::string ascii;
+        ascii.reserve(epc.size() / 2);
+        auto hex_digit = [](char ch) -> int {
+            if (ch >= '0' && ch <= '9') return ch - '0';
+            if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+            if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+            return -1;
+        };
+        for (size_t i = 0; i < epc.size(); i += 2) {
+            const int hi = hex_digit(epc[i]);
+            const int lo = hex_digit(epc[i + 1]);
+            if (hi < 0 || lo < 0) return {};
+            const unsigned char byte = static_cast<unsigned char>((hi << 4) | lo);
+            if (byte < 0x20 || byte > 0x7e) return {};
+            ascii.push_back(static_cast<char>(byte));
+        }
+        return ascii;
+    }
+
     nfc_app::TransportEndpoint active_endpoint_for_ui(const nfc_app::ConnectionState &conn) const
     {
         return conn.connected ? conn.endpoint : service_.current_endpoint();
@@ -625,6 +655,18 @@ private:
     {
         UINfcPage *self = static_cast<UINfcPage *>(lv_timer_get_user_data(timer));
         if (!self) return;
+        if (self->uhf_save_thread_.joinable() && !self->uhf_save_running_.load()) {
+            self->uhf_save_thread_.join();
+            self->refresh_saved_records();
+            self->ui_message_ = self->uhf_save_error_.empty()
+                ? (self->uhf_save_complete_ ? "UHF memory complete" : "UHF memory partial")
+                : ("UHF memory partial: " + self->uhf_save_error_);
+            self->show_toast(self->ui_message_, 2200, !self->uhf_save_error_.empty());
+            if (self->current_tab_ != Tab::Read) {
+                self->service_.disconnect();
+                self->set_ext_usb_power(false);
+            }
+        }
         if (self->pending_usb_connect_) {
             self->perform_pending_usb_connect();
         }
@@ -983,6 +1025,26 @@ private:
                     static_cast<int>(current_tab_), static_cast<int>(modal_));
        std::fflush(stderr);
 
+       if (uhf_save_running_.load() &&
+           !((mods & KBD_MOD_CTRL) && raw_key == KEY_S)) {
+           if (modal_ == Modal::UhfTagAction && raw_key == KEY_ESC) {
+               modal_ = Modal::None;
+           } else if (modal_ == Modal::None &&
+                      ((current_tab_ == Tab::Read && raw_key == KEY_RIGHT) ||
+                       (current_tab_ == Tab::Saved && raw_key == KEY_LEFT))) {
+               switch_tab(raw_key == KEY_RIGHT ? 1 : -1);
+               return;
+           } else if (modal_ == Modal::None && current_tab_ == Tab::Saved &&
+                      (raw_key == KEY_UP || raw_key == KEY_DOWN)) {
+               navigate(raw_key == KEY_DOWN ? 1 : -1);
+               return;
+           } else {
+               ui_message_ = "Reading UHF memory...";
+           }
+           render_all();
+           return;
+       }
+
        // On release, clear held scroll key.
        {
            const uint32_t nk = normalize_main_key(raw_key);
@@ -1035,6 +1097,64 @@ private:
                 }
                 modal_ = Modal::None;
                 modal_idx_ = 0;
+            }
+            render_all();
+            return;
+        }
+
+        // Ctrl+S on a selected UHF row reads that tag's memory banks and stores
+        // a bank-structured record. Inventory must be paused for tag access.
+        if ((modal_ == Modal::None || modal_ == Modal::UhfTagAction) &&
+            (mods & KBD_MOD_CTRL) && raw_key == KEY_S &&
+            current_tab_ == Tab::Read && read_uses_uhf_table()) {
+            if (uhf_save_running_.load()) {
+                ui_message_ = "UHF memory read in progress";
+            } else if (uhf_table_selected_idx_ < 0 || uhf_selected_epc_.empty()) {
+                ui_message_ = "Select one UHF tag with F/X first";
+            } else {
+                std::string save_error;
+                if (service_.uhf_continuous_scan_running()) {
+                    service_.stop_uhf_continuous_scan(&save_error);
+                }
+                if (save_error.empty()) {
+                    std::string record_id;
+                    if (service_.save_uhf_tag_snapshot(
+                            uhf_selected_epc_, &record_id, &save_error)) {
+                        refresh_saved_records();
+                        const auto saved = std::find_if(
+                            saved_records_.begin(), saved_records_.end(),
+                            [&record_id](const nfc_app::SavedRecord &record) {
+                                return record.meta.record_id == record_id;
+                            });
+                        if (saved != saved_records_.end()) {
+                            saved_idx_ = static_cast<int>(
+                                std::distance(saved_records_.begin(), saved));
+                        }
+                        ui_message_ = "UHF saved; reading memory...";
+                        show_toast("UHF saved", 1800);
+                        if (uhf_save_thread_.joinable()) uhf_save_thread_.join();
+                        uhf_save_error_.clear();
+                        uhf_save_complete_ = false;
+                        uhf_save_running_.store(true);
+                        const std::string epc = uhf_selected_epc_;
+                        uhf_save_thread_ = std::thread([this, epc, record_id]() {
+                            std::string read_error;
+                            bool complete = false;
+                            if (!service_.save_uhf_tag_memory(
+                                    epc, record_id, &complete, &read_error)) {
+                                service_.mark_uhf_tag_memory_failed(
+                                    record_id, read_error.empty() ? "Read failed" : read_error);
+                            }
+                            uhf_save_complete_ = complete;
+                            uhf_save_error_ = read_error;
+                            uhf_save_running_.store(false);
+                        });
+                    } else {
+                        ui_message_ = save_error.empty() ? "UHF save failed" : save_error;
+                    }
+                } else {
+                    ui_message_ = save_error;
+                }
             }
             render_all();
             return;
@@ -1165,6 +1285,11 @@ private:
             break;
         case KEY_TAB:
             if (current_tab_ == Tab::Read) {
+                if (read_uses_uhf_table()) {
+                    uhf_show_ascii_ = !uhf_show_ascii_;
+                    render_all();
+                    break;
+                }
                 const auto current_connection = service_.connection_state();
                 if (current_connection.connected) {
                     ui_message_ = "Reader connected";
@@ -1563,7 +1688,7 @@ private:
                 std::string ignored;
                 (void)service_.stop_uhf_continuous_scan(&ignored);
             }
-            if (!keep_usb_nfc_connected) {
+            if (!keep_usb_nfc_connected && !uhf_save_running_.load()) {
                 service_.disconnect();
                 set_ext_usb_power(false);
             }
@@ -2594,7 +2719,7 @@ private:
                         modal_idx_ = 0;
                     } else if (ep.kind == nfc_app::TransportKind::UsbSerial) {
                         const auto conn = service_.connection_state();
-                        if (conn.connected) {
+                        if (conn.connected && is_identified_device_kind(conn.device_kind)) {
                             modal_ = Modal::ReadMenu;
                             modal_idx_ = 0;
                         } else {
@@ -2682,46 +2807,6 @@ private:
         render_all();
     }
 
-    void activate_read_action()
-    {
-        switch (read_action_idx_) {
-        case 0:
-            service_.refresh_endpoints();
-            service_.cycle_endpoint(1);
-            ui_message_ = "Endpoint cycled";
-            break;
-        case 1: {
-            const auto state = service_.connection_state();
-            if (state.connected) {
-                service_.disconnect();
-                ui_message_ = "Device disconnected";
-            } else if (service_.connect_current()) {
-                ui_message_ = "Device connected";
-            } else {
-                ui_message_ = "Connect failed";
-            }
-            break;
-        }
-        case 2:
-            service_.start_scan();
-            ui_message_ = "Scan requested";
-            break;
-        case 3: {
-            std::string error;
-            if (service_.save_last_scan(&error)) {
-                refresh_saved_records();
-                show_toast("Saved");
-                ui_message_ = "Record saved to JSON";
-            } else {
-                ui_message_ = error;
-            }
-            break;
-        }
-        default:
-            break;
-        }
-    }
-
     void activate_saved_action()
     {
         if (saved_records_.empty()) {
@@ -2804,11 +2889,6 @@ private:
             if (k.enabled && !k.key_hex.empty()) key_hex_list.push_back(k.key_hex);
         }
         service_.set_mifare_key_list(key_hex_list);
-    }
-
-    bool tools_focus_mode() const
-    {
-        return current_tab_ == Tab::Tools && modal_ == Modal::ToolPage;
     }
 
     void refresh_key_files_with_counts()
@@ -2968,16 +3048,6 @@ private:
 
     // ── MFC dump helpers ─────────────────────────────────────────────────────
 
-    static bool has_dump_lines(const std::vector<std::string> &lines)
-    {
-        for (const auto &l : lines) {
-            if (l.size() >= 3 && std::isdigit((unsigned char)l[0]) &&
-                std::isdigit((unsigned char)l[1]) && l[2] == ':')
-                return true;
-        }
-        return false;
-    }
-
     static bool is_default_mfc_key(const std::string &hex12)
     {
         static const char *defaults[] = {
@@ -3009,7 +3079,7 @@ private:
         };
 
         if (ep.kind == nfc_app::TransportKind::UsbSerial) {
-            if (!conn.connected) {
+            if (!conn.connected || !is_identified_device_kind(conn.device_kind)) {
                 return {
                     ReadMenuAction::ConnectDevice,
                 };
@@ -3289,20 +3359,35 @@ private:
         }
     }
 
+    // USB probe progress is rendered without querying NfcDeviceService because
+    // its progress callback runs while the service's connection mutex is held.
+    void render_usb_probe_panel(lv_obj_t *parent)
+    {
+        lv_obj_t *panel = create_panel(parent, 0, 0, 320, CONTENT_H, 0x0A0A0A);
+        create_text(panel, 6, 5, "Detecting USB reader", 0x00D2FF, 12);
+        create_text(panel, 6, 21, to_compact(usb_connect_label_, 50).c_str(), 0x8E8E8E, 10);
+        constexpr int first_y = 39;
+        constexpr int line_h = 14;
+        const int visible = std::max(1, (CONTENT_H - first_y - 2) / line_h);
+        const int start = std::max(0, static_cast<int>(usb_probe_lines_.size()) - visible);
+        for (int i = start; i < static_cast<int>(usb_probe_lines_.size()); ++i) {
+            const auto &line = usb_probe_lines_[static_cast<size_t>(i)];
+            const bool ok = line.find("[OK]") != std::string::npos;
+            const bool failed = line.find("[FAIL]") != std::string::npos;
+            std::string display = line;
+            if (display.rfind("Checking ", 0) == 0) display.erase(0, 9);
+            const size_t dots = display.find(" ...");
+            if (dots != std::string::npos) display.erase(dots, 4);
+            create_text_mono(panel, 6, first_y + (i - start) * line_h,
+                             to_compact(display, 39).c_str(),
+                             ok ? 0x00FF88 : (failed ? 0xFF6060 : 0xD8D8D8), 10);
+        }
+    }
+
     void render_read_tab(lv_obj_t *parent)
     {
         if (usb_connect_in_progress_) {
-            lv_obj_t *panel = create_panel(parent, 0, 0, 320, CONTENT_H, 0x0A0A0A);
-            create_text(panel, 6, 5, "Detecting USB reader", 0x00D2FF, 12);
-            create_text(panel, 6, 21, to_compact(usb_connect_label_, 50).c_str(), 0x8E8E8E, 10);
-            int y = 39;
-            for (const auto &line : usb_probe_lines_) {
-                const bool ok = line.size() >= 2 && line.substr(line.size() - 2) == " v";
-                create_text_mono(panel, 6, y, to_compact(line, 50).c_str(),
-                                 ok ? 0x00FF88 : 0xD8D8D8, 10);
-                y += 14;
-                if (y > CONTENT_H - 10) break;
-            }
+            render_usb_probe_panel(parent);
             return;
         }
         const auto scan = service_.scan_state();
@@ -3437,7 +3522,7 @@ private:
             const int epc_x = 34;
             const int cnt_x = 276; // right-aligned 5-char count column near panel edge
             create_text(detail, idx_x, 2, "#", 0x7FBFFF, 7);
-            create_text(detail, epc_x, 2, "EPC", 0x7FBFFF, 7);
+            create_text(detail, epc_x, 2, "EPC/ASCII", 0x7FBFFF, 7);
             char cnt_hdr[8];
             std::snprintf(cnt_hdr, sizeof(cnt_hdr), "%5s", "CNT");
             create_text(detail, cnt_x, 2, cnt_hdr, 0x7FBFFF, 7);
@@ -3462,6 +3547,10 @@ private:
 
                     const int epc_max_chars = std::max(8, (cnt_x - epc_x) / 8 - 1);
                     std::string epc = item.epc;
+                    if (uhf_show_ascii_) {
+                        const std::string ascii = uhf_epc_printable_ascii(item.epc);
+                        if (!ascii.empty()) epc = ascii;
+                    }
                     if (static_cast<int>(epc.size()) > epc_max_chars) {
                         if (epc_max_chars > 14) {
                             const int tail_len = epc_max_chars - 14;
@@ -3574,7 +3663,9 @@ private:
                 lv_obj_set_style_bg_opa(entry, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
                 lv_obj_clear_flag(entry, LV_OBJ_FLAG_SCROLLABLE);
                 create_text(entry, 4, 0, to_compact(record.meta.display_name, 14).c_str(), selected ? 0x000000 : 0xFFFFFF, 11);
-                create_text(entry, 4, 10, nfc_app::to_string(record.tag.protocol), selected ? 0x2F2F2F : 0x9E9E9E, 10);
+                create_text(entry, 4, 10,
+                            record.uhf_memory ? "UHF" : nfc_app::to_string(record.tag.protocol),
+                            selected ? 0x2F2F2F : 0x9E9E9E, 10);
             }
 
             const auto &record = saved_records_[saved_idx_];
@@ -3582,11 +3673,26 @@ private:
                 ? (record.tag.raw_data.empty() ? "(none)" : to_compact(record.tag.raw_data[0], 22))
                 : record.tag.uid;
             create_text(detail, 6,  4, to_compact(record.meta.display_name, 22).c_str(), 0xFFFFFF, 12);
-            create_text(detail, 6, 19, (std::string("UID: ") + uid_str).c_str(), 0x00D2FF, 11);
-            create_text(detail, 6, 33, (std::string("Type: ") + nfc_app::to_string(record.tag.protocol)).c_str(), 0xD8D8D8, 11);
+            create_text(detail, 6, 19, to_compact(
+                std::string(record.uhf_memory ? "EPC: " : "UID: ") + uid_str, 25).c_str(), 0x00D2FF, 11);
+            const std::string type_line = record.uhf_memory
+                ? "Type: UHF EPC Gen2" :
+                  (std::string("Type: ") + nfc_app::to_string(record.tag.protocol));
+            create_text(detail, 6, 33, type_line.c_str(), 0xD8D8D8, 11);
             create_text(detail, 6, 47, (std::string("Src: ") + record.meta.source).c_str(), 0x8DB6FF, 11);
             create_text(detail, 6, 61, to_compact(record.meta.created_at, 22).c_str(), 0x9E9E9E, 10);
-            create_text(detail, 6, 75, "OK: upload / edit / rename / delete", 0xF7A600, 10);
+            if (record.uhf_memory) {
+                std::string banks;
+                for (const auto &bank : record.uhf_memory->banks) {
+                    if (!banks.empty()) banks += " ";
+                    banks += bank.name.substr(0, 1) + ":" +
+                        std::to_string(bank.hex.size() / 2) +
+                        (bank.complete ? "" : "!");
+                }
+                create_text(detail, 6, 75, to_compact(banks, 29).c_str(), 0xF7A600, 10);
+            } else {
+                create_text(detail, 6, 75, "OK: upload / edit / rename / delete", 0xF7A600, 10);
+            }
             create_text(detail, 6, 88, record.meta.mock ? "[mock]" : "[JSON]", 0x555555, 10);
         }
 
@@ -4654,12 +4760,18 @@ private:
             } else {
                 usb_probe_lines_.push_back(line);
             }
-            render_all();
+            lv_obj_t *content = ui_obj_["content"];
+            lv_obj_clean(content);
+            render_usb_probe_panel(content);
             lv_refr_now(NULL);
         });
         usb_connect_in_progress_ = false;
         const auto conn2 = service_.connection_state();
         if (!ok) {
+            uhf_inventory_started_ = false;
+            uhf_table_rows_.clear();
+            uhf_table_selected_idx_ = -1;
+            uhf_selected_epc_.clear();
             scan_log_lines_ = usb_probe_lines_;
             scan_log_lines_.push_back("ERR " + compact_read_connection_detail(conn2));
             ui_message_ = "Connect failed";
@@ -5675,19 +5787,6 @@ private:
         return label;
     }
 
-    void create_action_row(lv_obj_t *parent, int y, const char *label, bool selected)
-    {
-        lv_obj_t *row = lv_obj_create(parent);
-        lv_obj_set_size(row, lv_obj_get_width(parent) - 8, 18);
-        lv_obj_set_pos(row, 4, y);
-        lv_obj_set_style_radius(row, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_set_style_border_width(row, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_set_style_bg_color(row, lv_color_hex(selected ? 0xF7A600 : 0x181818), LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_set_style_bg_opa(row, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-        create_text(row, 4, 3, label, selected ? 0x000000 : 0xFFFFFF, 11);
-    }
-
     void create_footer(lv_obj_t *parent, const std::string &text)
     {
         const int footer_y = std::max(0, static_cast<int>(lv_obj_get_height(parent)) - 14);
@@ -5810,6 +5909,29 @@ private:
 
     // ── Modal rendering ─────────────────────────────────────────────────────
 
+    void render_uhf_saved_view(lv_obj_t *parent)
+    {
+        if (saved_records_.empty() || !saved_records_[saved_idx_].uhf_memory) return;
+        const auto &banks = saved_records_[saved_idx_].uhf_memory->banks;
+        if (banks.empty()) return;
+        const int index = std::max(0, std::min(saved_uhf_bank_idx_, static_cast<int>(banks.size()) - 1));
+        const auto &bank = banks[static_cast<size_t>(index)];
+        lv_obj_t *card = make_modal_card(parent, 300, 100, 0x00D2FF);
+        const std::string title = bank.name + " " + std::to_string(bank.hex.size() / 2) +
+            " B " + (bank.complete ? "complete" : "partial");
+        create_text(card, 6, 3, title.c_str(), 0x00D2FF, 10);
+        create_text(card, 6, 16, to_compact(bank.status, 42).c_str(),
+                    bank.complete ? 0x9E9E9E : 0xFFAA55, 7);
+        constexpr size_t kCharsPerLine = 32;
+        for (int row = 0; row < 5; ++row) {
+            const size_t offset = static_cast<size_t>(saved_uhf_scroll_ + row) * kCharsPerLine;
+            if (offset >= bank.hex.size()) break;
+            const std::string line = bank.hex.substr(offset, kCharsPerLine);
+            create_text_mono(card, 6, 27 + row * 11, line.c_str(), 0xD6F0FF, 7);
+        }
+        create_text(card, 6, 85, "TAB: bank  UP/DOWN: scroll  ESC: back", 0x9E9E9E, 7);
+    }
+
     void render_saved_modal(lv_obj_t *parent)
     {
         // Full-area semi-transparent overlay
@@ -5830,6 +5952,7 @@ private:
         case Modal::EditName:   render_edit_name_modal_card(overlay);  break;
         case Modal::EditHex:    render_edit_hex_modal_card(overlay);   break;
         case Modal::HexExitConfirm: render_hex_exit_confirm_card(overlay); break;
+        case Modal::UhfSavedView: render_uhf_saved_view(overlay); break;
         default: break;
         }
     }
@@ -5858,6 +5981,17 @@ private:
         const bool is_pn532_plain = (emu_kind == nfc_app::DeviceKind::PN532);
         const bool is_nfcunit = (emu_kind == nfc_app::DeviceKind::NFCUnit);
         const auto &rec = saved_records_[saved_idx_];
+        if (rec.uhf_memory) {
+            lv_obj_t *card = make_modal_card(parent, 220, 94, 0xF7A600);
+            create_text(card, 8, 5, to_compact(rec.meta.display_name, 26).c_str(), 0xFFFFFF, 11);
+            const char *options[] = {"View Memory", "Edit Name", "Delete"};
+            for (int i = 0; i < 3; ++i) {
+                lv_obj_t *row = create_panel(card, 8, 24 + i * 20, 204, 18,
+                                             modal_idx_ == i ? 0xF7A600 : 0x2A2A2A);
+                create_text(row, 6, 3, options[i], modal_idx_ == i ? 0x000000 : 0xD0D0D0, 10);
+            }
+            return;
+        }
         const bool record_from_i2c = (rec.meta.transport == nfc_app::TransportKind::I2cBus);
         const bool show_write_to_tag = is_i2c_dev || is_pn532_dev || record_from_i2c;
         const bool has_first_action = is_i2c_dev || is_pn532killer;
@@ -6011,18 +6145,6 @@ private:
             if (std::isxdigit(c)) result += static_cast<char>(std::toupper(c));
         }
         return result;
-    }
-
-    // Group a compact hex string as bytes: "A1B2C3" -> "A1 B2 C3"
-    static std::string hex_with_byte_spaces(const std::string &hex)
-    {
-        std::string out;
-        out.reserve(hex.size() + hex.size() / 2);
-        for (size_t i = 0; i < hex.size(); ++i) {
-            if (i > 0 && (i % 2) == 0) out.push_back(' ');
-            out.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(hex[i]))));
-        }
-        return out;
     }
 
     int uid_changer_uid_hex_len() const
@@ -6230,8 +6352,8 @@ private:
         lv_obj_t *write_label = create_text(write_button, 0, 0, "OK  WRITE", 0x000000, 10);
         lv_obj_center(write_label);
 
-        create_text(card, 8, 77, "TAB: bank", 0x68747D, 7);
-        create_text(card, 194, 77, "ESC: close", 0x68747D, 7);
+        create_text(card, 8, 77, "TAB: bank  Ctrl+S: save all", 0x68747D, 7);
+        create_text(card, 220, 77, "ESC", 0x68747D, 7);
     }
 
     void render_uhf_tag_edit_modal(lv_obj_t *parent)
@@ -6400,13 +6522,72 @@ private:
         case Modal::UhfTagEdit:
             handle_uhf_tag_edit_key(key);
             break;
+        case Modal::UhfSavedView:
+            handle_uhf_saved_view_key(key);
+            break;
         default: break;
         }
         render_all();
     }
 
+    void handle_uhf_saved_view_key(uint32_t key)
+    {
+        if (key == KEY_ESC) {
+            modal_ = Modal::Action;
+            modal_idx_ = 0;
+            return;
+        }
+        if (saved_records_.empty() || !saved_records_[saved_idx_].uhf_memory) return;
+        const auto &banks = saved_records_[saved_idx_].uhf_memory->banks;
+        if (banks.empty()) return;
+        if (key == KEY_TAB || key == KEY_LEFT || key == KEY_RIGHT) {
+            const int delta = key == KEY_LEFT ? -1 : 1;
+            saved_uhf_bank_idx_ = (saved_uhf_bank_idx_ + delta + static_cast<int>(banks.size())) %
+                                  static_cast<int>(banks.size());
+            saved_uhf_scroll_ = 0;
+        } else if (key == KEY_UP || key == KEY_DOWN) {
+            const auto &hex = banks[static_cast<size_t>(saved_uhf_bank_idx_)].hex;
+            const int max_scroll = std::max(0, static_cast<int>((hex.size() + 31) / 32) - 5);
+            saved_uhf_scroll_ = std::max(0, std::min(max_scroll,
+                saved_uhf_scroll_ + (key == KEY_DOWN ? 1 : -1)));
+        }
+    }
+
     void handle_action_key(uint32_t key)
     {
+        if (!saved_records_.empty() && saved_records_[saved_idx_].uhf_memory) {
+            switch (key) {
+            case KEY_UP:
+            case KEY_F: modal_idx_ = (modal_idx_ + 2) % 3; break;
+            case KEY_DOWN:
+            case KEY_X: modal_idx_ = (modal_idx_ + 1) % 3; break;
+            case KEY_ENTER:
+            case KEY_KPENTER:
+                if (modal_idx_ == 0) {
+                    saved_uhf_bank_idx_ = 0;
+                    saved_uhf_scroll_ = 0;
+                    modal_ = Modal::UhfSavedView;
+                } else if (modal_idx_ == 1) {
+                    edit_buf_ = saved_records_[saved_idx_].meta.display_name;
+                    modal_ = Modal::EditName;
+                } else {
+                    std::string err;
+                    if (service_.delete_saved_record(
+                            saved_records_[saved_idx_].meta.record_id, &err)) {
+                        refresh_saved_records();
+                        ui_message_ = "Record deleted";
+                    } else {
+                        ui_message_ = err.empty() ? "Delete failed" : err;
+                    }
+                    modal_ = Modal::None;
+                    modal_idx_ = 0;
+                }
+                break;
+            case KEY_ESC: modal_ = Modal::None; break;
+            default: break;
+            }
+            return;
+        }
         const auto conn2 = service_.connection_state();
         const auto emu_kind2 = effective_emu_device_kind(conn2);
         const bool is_i2c_dev = (emu_kind2 == nfc_app::DeviceKind::GroveNFC ||
