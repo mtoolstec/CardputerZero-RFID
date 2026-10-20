@@ -93,6 +93,9 @@ if [[ ! -f "${MFKEY_DIST}/mfkey32v2" || ! -f "${MFKEY_DIST}/mfkey64" ]]; then
   fi
 fi
 
+# Staticnested shares the existing Crypto1 sources.
+bash "${RFID_DIR}/tools/build_staticnested.sh"
+
 # ── Step 4: Build .deb ──────────────────────────────────────────────────────
 info "Packaging .deb..."
 cd "${RFID_DIR}"

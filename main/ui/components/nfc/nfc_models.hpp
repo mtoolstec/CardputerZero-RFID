@@ -34,7 +34,7 @@ enum class DeviceKind {
     PN532Killer,   // PN532Killer firmware detected (vendor command responded)
     UHFReader,     // UHF RFID reader over serial protocol
     OtherSerial,   // port opened, non-PN532 data received
-    GroveNFC,      // Grove NFC 2 at I2C 0x48 (register-based, emulation supported)
+    GroveNFC,      // GroveNFC at I2C 0x48 (register-based, emulation supported)
     NFCUnit,       // M5Stack NFC Unit at I2C 0x50 (read-only on Linux)
     ST25RNFC,      // M5 NFC CAP (ST25R3916 over SPI)
 };

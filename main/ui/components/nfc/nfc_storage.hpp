@@ -482,6 +482,18 @@ public:
             nlohmann::json document;
             input >> document;
             keys = document.value("keys", std::vector<MifareKeyRecord>{});
+            // Older files stored separate A/B entries. Present one dictionary key.
+            std::vector<MifareKeyRecord> unique;
+            for (auto key : keys) {
+                for (char &ch : key.key_hex) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+                if (key.source == "mfkey" && key.label.rfind("MFKey s", 0) == 0) key.label = "MFKey";
+                auto found = std::find_if(unique.begin(), unique.end(), [&](const MifareKeyRecord &entry) {
+                    return entry.key_hex == key.key_hex;
+                });
+                if (found == unique.end()) unique.push_back(key);
+                else found->enabled = found->enabled || key.enabled;
+            }
+            keys = std::move(unique);
         } catch (...) {
             keys.clear();
         }

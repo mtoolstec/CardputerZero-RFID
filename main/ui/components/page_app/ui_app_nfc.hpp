@@ -293,6 +293,8 @@ private:
     lv_timer_t *uhf_beep_timer_ = nullptr;
     std::string ui_message_ = "Ready";
     Modal modal_          = Modal::None;
+    Modal tool_help_return_ = Modal::None;
+    bool tool_header_active_ = false;
     int   modal_idx_      = 0;
     int   slot_select_idx_= 0;
     std::string edit_buf_;
@@ -501,6 +503,15 @@ private:
             lv_obj_center(label);
             ui_obj_[key] = item;
         }
+
+        lv_obj_t *hierarchy = lv_obj_create(bg);
+        lv_obj_remove_style_all(hierarchy);
+        lv_obj_set_size(hierarchy, 320, TAB_H);
+        lv_obj_set_pos(hierarchy, 0, -TAB_H);
+        lv_obj_set_style_bg_color(hierarchy, lv_color_hex(0x151515), 0);
+        lv_obj_set_style_bg_opa(hierarchy, LV_OPA_COVER, 0);
+        lv_obj_clear_flag(hierarchy, LV_OBJ_FLAG_SCROLLABLE);
+        ui_obj_["tool_header"] = hierarchy;
 
         lv_obj_t *content = lv_obj_create(bg);
         lv_obj_set_size(content, 320, CONTENT_H);
@@ -821,6 +832,7 @@ private:
                     self->mfkey_results_ = self->service_.hw_mfkey_results();
                     self->mfkey_result_idx_ = 0;
                     self->mfkey_step_ = 3;
+                    if (self->active_tool_idx_ == 4) self->ui_message_ = self->service_.staticnested_status();
                     self->show_toast(self->mfkey_results_.empty() ? "No results" : "Cracking done");
                 }
             }
@@ -1035,6 +1047,18 @@ private:
                     static_cast<int>(current_tab_), static_cast<int>(modal_));
        std::fflush(stderr);
 
+       if (service_.staticnested_running()) {
+           const uint32_t key = normalize_main_key(raw_key);
+           if (key == KEY_I) {
+               if (modal_ == Modal::ToolInfo) modal_ = tool_help_return_;
+               else { tool_help_return_ = modal_; modal_ = Modal::ToolInfo; }
+           } else if (key == KEY_ESC) {
+               if (modal_ == Modal::ToolInfo) modal_ = tool_help_return_;
+               else { service_.cancel_staticnested(); ui_message_ = "Stopping; keep card in place..."; }
+           }
+           render_all(); return;
+       }
+
        if (uhf_save_running_.load() &&
            !((mods & KBD_MOD_CTRL) && raw_key == KEY_S)) {
            if (modal_ == Modal::UhfTagAction && raw_key == KEY_ESC) {
@@ -1184,6 +1208,21 @@ private:
                 }
             } else {
                 ui_message_ = save_error.empty() ? "Save failed" : save_error;
+            }
+            render_all();
+            return;
+        }
+
+        // DEL deletes the selected Saved record; Backspace has no delete action.
+        if (modal_ == Modal::None && current_tab_ == Tab::Saved && raw_key == KEY_DELETE) {
+            if (!saved_records_.empty() && saved_idx_ >= 0 && saved_idx_ < static_cast<int>(saved_records_.size())) {
+                const auto record_id = saved_records_[saved_idx_].meta.record_id;
+                std::string error;
+                if (service_.delete_saved_record(record_id, &error)) {
+                    refresh_saved_records();
+                    show_toast("Deleted");
+                    ui_message_ = "Record deleted";
+                } else ui_message_ = error.empty() ? "Delete failed" : error;
             }
             render_all();
             return;
@@ -1407,7 +1446,8 @@ private:
             break;
         case KEY_I:
             if (modal_ == Modal::None) {
-                modal_ = Modal::AppInfo;
+                tool_help_return_ = Modal::None;
+                modal_ = current_tab_ == Tab::Tools ? Modal::ToolInfo : Modal::AppInfo;
                 render_all();
             }
             break;
@@ -2189,6 +2229,25 @@ private:
             return;
         }
 
+        if (verb_upper == "UI_TOOL") {
+            int index = 0; iss >> index;
+            if (index < 0 || index > 4) { emit_err("invalid tool"); return; }
+            current_tab_ = Tab::Tools; tools_idx_ = index; activate_tool_action();
+            emit_ok("tool opened"); return;
+        }
+        if (verb_upper == "STATICNESTED_START") {
+            if (!service_.start_staticnested()) emit_err("Connect idle PN532Killer first");
+            else {
+                current_tab_ = Tab::Tools; tools_idx_ = 4; activate_tool_action();
+                mfkey_step_ = 2; mfkey_display_progress_ = 0;
+                mfkey_progress_tick_ = lv_tick_get(); mfkey_complete_tick_ = 0;
+                emit_ok("Staticnested started");
+            }
+            return;
+        }
+        if (verb_upper == "STATICNESTED_STATUS") {
+            emit_ok(service_.staticnested_status()); return;
+        }
         if (verb_upper == "MFKEY_START") {
             std::string uid; iss >> uid;
             if (!uid.empty() && (uid.size() != 8 || !service_.hw_sniff_set_uid(uid))) {
@@ -2213,6 +2272,7 @@ private:
         }
 
         if (verb_upper == "USB_CONNECT") {
+            if (service_.staticnested_running()) { emit_err("Staticnested running"); return; }
             std::string path;
             std::getline(iss, path);
             path = trim_ascii(path);
@@ -2726,7 +2786,7 @@ private:
             break;
         }
         case Tab::Tools:
-            tools_idx_ = (tools_idx_ + delta + 4) % 4;
+            tools_idx_ = (tools_idx_ + delta + 5) % 5;
             break;
         }
         render_all();
@@ -2882,7 +2942,7 @@ private:
             uid_changer_gen4_pwd_input_ = "00000000";
         }
         // Reset MFKey wizard state when (re-)entering the tool
-        if (active_tool_idx_ == 2 || active_tool_idx_ == 3) {
+        if (active_tool_idx_ == 2 || active_tool_idx_ == 3 || active_tool_idx_ == 4) {
             mfkey_step_           = 0;
             mfkey_uid_input_      = "";
             mfkey_results_.clear();
@@ -2961,6 +3021,44 @@ private:
     {
         lv_obj_t *tab_bar = ui_obj_["tab_bar"];
         lv_obj_clear_flag(tab_bar, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_t *hierarchy = ui_obj_["tool_header"];
+        const bool tool_page = current_tab_ == Tab::Tools &&
+            (modal_ == Modal::ToolPage || (modal_ == Modal::ToolInfo && tool_help_return_ == Modal::ToolPage));
+        if (tool_page != tool_header_active_) {
+            auto slide = [](lv_obj_t *obj, int target) {
+                lv_anim_delete(obj, nullptr);
+                lv_anim_t animation;
+                lv_anim_init(&animation);
+                lv_anim_set_var(&animation, obj);
+                lv_anim_set_exec_cb(&animation, [](void *target_obj, int32_t value) {
+                    lv_obj_set_y(static_cast<lv_obj_t *>(target_obj), value);
+                });
+                lv_anim_set_values(&animation, lv_obj_get_y(obj), target);
+                lv_anim_set_duration(&animation, 180);
+                lv_anim_set_path_cb(&animation, lv_anim_path_ease_out);
+                lv_anim_start(&animation);
+            };
+            slide(tab_bar, tool_page ? -TAB_H : 0);
+            slide(hierarchy, tool_page ? 0 : -TAB_H);
+            tool_header_active_ = tool_page;
+        }
+        if (tool_page) {
+            lv_obj_clean(hierarchy);
+            create_text(hierarchy, 6, 8, "<", 0xF7A600, 12);
+            create_text(hierarchy, 20, 8, tool_name(active_tool_idx_), 0xFFFFFF, 12);
+            if (active_tool_idx_ >= 2) {
+                const bool nested = active_tool_idx_ == 4;
+                const int stage = mfkey_step_ == 0 ? 0 : ((mfkey_step_ == 1 || (nested && mfkey_step_ == 2)) ? 1 : 2);
+                const char *steps[] = {"1 Setup", nested ? "2 Read" : "2 Log", "3 Keys"};
+                for (int i = 0; i < 3; ++i)
+                    create_text(hierarchy, 128 + i * 64, 8, steps[i], i == stage ? 0xF7A600 : (i < stage ? 0x00CC88 : 0x666666), 12);
+            } else if (active_tool_idx_ == 1) {
+                for (int i = 0; i < 3; ++i) {
+                    const std::string step = std::to_string(i + 1);
+                    create_text(hierarchy, 236 + i * 24, 8, step.c_str(), i == uid_changer_step_ ? 0xF7A600 : 0x666666, 12);
+                }
+            }
+        }
 
         for (int index = 0; index < 4; ++index) {
             lv_obj_t *item = ui_obj_[std::string("tab_") + std::to_string(index)];
@@ -3462,7 +3560,7 @@ private:
                 lv_label_set_text(arr, "<");
                 lv_obj_set_pos(arr, 2, 4);
                 lv_obj_set_style_text_color(arr, lv_color_hex(0x707070), LV_PART_MAIN | LV_STATE_DEFAULT);
-                lv_obj_set_style_text_font(arr, &lv_font_montserrat_10, LV_PART_MAIN | LV_STATE_DEFAULT);
+                lv_obj_set_style_text_font(arr, &lv_font_unscii_8, LV_PART_MAIN | LV_STATE_DEFAULT);
             }
 
             // Two visible pills
@@ -3483,7 +3581,7 @@ private:
                 lv_obj_t *lbl = lv_label_create(pill);
                 lv_label_set_text(lbl, kModes[mi].label);
                 lv_obj_set_style_text_color(lbl, lv_color_hex(active ? 0x000000 : 0x909090), LV_PART_MAIN | LV_STATE_DEFAULT);
-                lv_obj_set_style_text_font(lbl, &lv_font_montserrat_10, LV_PART_MAIN | LV_STATE_DEFAULT);
+                lv_obj_set_style_text_font(lbl, &lv_font_unscii_8, LV_PART_MAIN | LV_STATE_DEFAULT);
                 lv_obj_center(lbl);
             }
 
@@ -3493,56 +3591,24 @@ private:
                 lv_label_set_text(arr, ">");
                 lv_obj_set_pos(arr, 110, 4);
                 lv_obj_set_style_text_color(arr, lv_color_hex(0x707070), LV_PART_MAIN | LV_STATE_DEFAULT);
-                lv_obj_set_style_text_font(arr, &lv_font_montserrat_10, LV_PART_MAIN | LV_STATE_DEFAULT);
+                lv_obj_set_style_text_font(arr, &lv_font_unscii_8, LV_PART_MAIN | LV_STATE_DEFAULT);
             }
         }
         {
-            std::string disp_label = endpoint.label;
-            if (endpoint.kind == nfc_app::TransportKind::UsbSerial) {
-                const std::string prefix = std::string(nfc_app::to_string(endpoint.kind)) + " ";
-                if (disp_label.size() > prefix.size() && disp_label.substr(0, prefix.size()) == prefix)
-                    disp_label = disp_label.substr(prefix.size());
-            }
-            create_text(summary, 152, 3, to_compact(disp_label, 26).c_str(), 0x00D2FF, 11);
+            std::string disp_label = conn.device_kind == nfc_app::DeviceKind::Unknown
+                ? endpoint.label : nfc_app::to_string(conn.device_kind);
+            const size_t paren = disp_label.find(" (");
+            if (paren != std::string::npos) disp_label.resize(paren);
+            const std::string prefix = std::string(nfc_app::to_string(endpoint.kind)) + " ";
+            if (disp_label.rfind(prefix, 0) == 0) disp_label.erase(0, prefix.size());
+            if (disp_label.size() > 5 && disp_label.substr(disp_label.size() - 5) == "-UART") disp_label.resize(disp_label.size() - 5);
+            create_text(summary, 132, 3, to_compact(disp_label, 23).c_str(), 0x00D2FF, 11);
         }
 
         // ── Card info header (shown when a result exists) ─────────────────
         int log_y = 20;
         // UHF reserves the bottom 14 px for the live inventory-rate footer.
         int log_h = use_uhf_table ? 86 : 100;
-        if (scan.has_result && !use_uhf_table) {
-            const auto &tag = record.tag;
-            auto find_identity_ci = [&](const char *key) -> std::string {
-                std::string key_up;
-                for (const char *p = key; p && *p; ++p)
-                    key_up.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(*p))));
-                for (const auto &kv : tag.identity_fields) {
-                    std::string field_up;
-                    for (char ch : kv.first)
-                        field_up.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(ch))));
-                    if (field_up == key_up) return kv.second;
-                }
-                return "-";
-            };
-
-            std::string uid_clean;
-            uid_clean.reserve(tag.uid.size());
-            for (char c : tag.uid) if (c != ':') uid_clean.push_back(c);
-
-            const std::string type_text = tag.tag_type.empty() ? nfc_app::to_string(tag.protocol) : tag.tag_type;
-            const std::string atqa_str = find_identity_ci("ATQA");
-            const std::string sak_str  = find_identity_ci("SAK");
-
-            lv_obj_t *info = create_panel(parent, 0, 20, 320, 13, 0x0C1810);
-            std::string card_line = type_text + " " + uid_clean;
-            if (tag.protocol != nfc_app::ProtocolKind::Iso15693) {
-                card_line += " SAK:" + sak_str + " ATQA:" + atqa_str;
-            }
-            create_text(info, 4, 2, to_compact(card_line, 52).c_str(), 0x00FF88, 10);
-            log_y = 34;
-            log_h = 100;
-        }
-
         // ── Log area: always full-width ────────────────────────────────────
         constexpr int LOG_LINE_H = 12;
         const int visible_lines  = log_h / LOG_LINE_H;
@@ -3619,16 +3685,13 @@ private:
                         conn.connected ? "Space: start/pause" : "Tab: mode  Space: start/pause",
                         0xD8D8D8, 10);
 
-            if (conn.connected) {
-                create_text_mono(detail, 4, 56, supported_protocols_text().c_str(), 0x8DB6FF, 7);
-            } else {
-                const std::string supported = std::string("Supported: ") + transport_supported_devices_text(endpoint.kind);
-                create_text(detail, 4, 56, to_compact(supported, 52).c_str(), 0x8DB6FF, 10);
-            }
-
-            if (!scan.error.empty())
-                if (conn.connected)
-                    create_text(detail, 4, 68, to_compact(scan.error, 40).c_str(), 0xFF6060, 10);
+            const std::string supported = conn.connected ? supported_protocols_text()
+                : std::string("Supported: ") + transport_supported_devices_text(endpoint.kind);
+            lv_obj_t *support = create_text_mono(detail, 4, 56, supported.c_str(), 0x8DB6FF, 7);
+            lv_obj_set_size(support, 308, 30);
+            lv_label_set_long_mode(support, LV_LABEL_LONG_WRAP);
+            if (conn.connected && !scan.error.empty())
+                create_text(detail, 4, 88, to_compact(scan.error, 38).c_str(), 0xFF6060, 10);
         } else {
             int uid_hex_digits = 0;
             for (char ch : record.tag.uid) {
@@ -3661,7 +3724,7 @@ private:
                     else if (line.size() >= 3 && line[0] == 'E' && line[1] == 'R' && line[2] == 'R') color = 0xFF6060;
                     else if (!line.empty() && line[0] == '>') color = 0xF7A600;
                     else if (line.size() >= 6 && line.substr(0, 6) == "MAGIC:") color = 0xFFD700;
-                    create_text(detail, 4, y, to_compact(line, 42).c_str(), color, 10);
+                    create_text(detail, 4, y, to_compact(line, 39).c_str(), color, 10);
                 }
             }
         }
@@ -3674,61 +3737,54 @@ private:
     {
         lv_obj_t *list = create_panel(parent, 0, 0, 122, 104, 0x101010);
         lv_obj_t *detail = create_panel(parent, 126, 0, 194, 104, 0x101010);
-
+        auto label = [&](lv_obj_t *panel, int x, int y, int width, const std::string &text,
+                         uint32_t color, int size = 10) {
+            lv_obj_t *item = create_text(panel, x, y, text.c_str(), color, size);
+            lv_obj_set_size(item, width, size >= 12 ? 14 : 12);
+            lv_label_set_long_mode(item, LV_LABEL_LONG_DOT);
+            return item;
+        };
         if (saved_records_.empty()) {
-            create_text(list, 6, 8, "No saved records", 0x7A7A7A, 11);
-            create_text(detail, 6, 6, "Save from Read tab first", 0x9E9E9E, 11);
+            label(list, 6, 8, 110, "No records", 0x9E9E9E);
+            label(detail, 6, 6, 182, "Save from Read first", 0xB8B8B8);
         } else {
-            const int visible = saved_records_.size() < 4 ? static_cast<int>(saved_records_.size()) : 4;
-            int offset = saved_idx_ - 1;
-            if (offset < 0) offset = 0;
-            if (offset > static_cast<int>(saved_records_.size()) - visible) offset = static_cast<int>(saved_records_.size()) - visible;
-            if (offset < 0) offset = 0;
+            const int visible = std::min(4, static_cast<int>(saved_records_.size()));
+            const int offset = std::max(0, std::min(saved_idx_ - 1,
+                static_cast<int>(saved_records_.size()) - visible));
             for (int row = 0; row < visible; ++row) {
                 const int index = offset + row;
-                const bool selected = (index == saved_idx_);
+                const bool selected = index == saved_idx_;
                 const auto &record = saved_records_[index];
-                lv_obj_t *entry = lv_obj_create(list);
-                lv_obj_remove_style_all(entry);  // strip theme padding/layout
-                lv_obj_set_size(entry, 114, 20);
-                lv_obj_set_pos(entry, 4, 8 + row * 24);
-                lv_obj_set_style_bg_color(entry, lv_color_hex(selected ? 0xF7A600 : 0x171717), LV_PART_MAIN | LV_STATE_DEFAULT);
-                lv_obj_set_style_bg_opa(entry, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-                lv_obj_clear_flag(entry, LV_OBJ_FLAG_SCROLLABLE);
-                create_text(entry, 4, 0, to_compact(record.meta.display_name, 14).c_str(), selected ? 0x000000 : 0xFFFFFF, 11);
-                create_text(entry, 4, 10,
-                            record.uhf_memory ? "UHF" : nfc_app::to_string(record.tag.protocol),
-                            selected ? 0x2F2F2F : 0x9E9E9E, 10);
+                lv_obj_t *entry = create_panel(list, 4, 2 + row * 26, 114, 24,
+                    selected ? 0xF7A600 : 0x171717);
+                label(entry, 4, 1, 106, record.meta.display_name,
+                    selected ? 0x000000 : 0xFFFFFF);
+                const std::string type = record.uhf_memory ? "UHF" :
+                    record.tag.protocol == nfc_app::ProtocolKind::MifareClassic ? "MIFARE Classic" :
+                    nfc_app::to_string(record.tag.protocol);
+                label(entry, 4, 12, 106, type, selected ? 0x303030 : 0xB8B8B8, 10);
             }
-
             const auto &record = saved_records_[saved_idx_];
-            const std::string uid_str = record.tag.uid.empty()
-                ? (record.tag.raw_data.empty() ? "(none)" : to_compact(record.tag.raw_data[0], 22))
-                : record.tag.uid;
-            create_text(detail, 6,  4, to_compact(record.meta.display_name, 22).c_str(), 0xFFFFFF, 12);
-            create_text(detail, 6, 19, to_compact(
-                std::string(record.uhf_memory ? "EPC: " : "UID: ") + uid_str, 25).c_str(), 0x00D2FF, 11);
-            const std::string type_line = record.uhf_memory
-                ? "Type: UHF EPC Gen2" :
-                  (std::string("Type: ") + nfc_app::to_string(record.tag.protocol));
-            create_text(detail, 6, 33, type_line.c_str(), 0xD8D8D8, 11);
-            create_text(detail, 6, 47, (std::string("Src: ") + record.meta.source).c_str(), 0x8DB6FF, 11);
-            create_text(detail, 6, 61, to_compact(record.meta.created_at, 22).c_str(), 0x9E9E9E, 10);
+            const std::string uid = record.tag.uid.empty() ? "(none)" : record.tag.uid;
+            label(detail, 6, 3, 182, record.meta.display_name, 0xFFFFFF);
+            label(detail, 6, 21, 182, std::string(record.uhf_memory ? "EPC: " : "UID: ") + uid, 0x00D2FF);
+            label(detail, 6, 39, 182, record.uhf_memory ? "UHF EPC Gen2" :
+                nfc_app::to_string(record.tag.protocol), 0xE0E0E0);
+            label(detail, 6, 57, 182, "Src: " + record.meta.source, 0x9DC6FF);
+            std::string date = record.meta.created_at.substr(0, 16);
+            std::replace(date.begin(), date.end(), 'T', ' ');
+            label(detail, 6, 75, 182, date, 0xB8B8B8,
+                10);
             if (record.uhf_memory) {
                 std::string banks;
                 for (const auto &bank : record.uhf_memory->banks) {
                     if (!banks.empty()) banks += " ";
-                    banks += bank.name.substr(0, 1) + ":" +
-                        std::to_string(bank.hex.size() / 2) +
+                    banks += bank.name.substr(0, 1) + ":" + std::to_string(bank.hex.size() / 2) +
                         (bank.complete ? "" : "!");
                 }
-                create_text(detail, 6, 75, to_compact(banks, 29).c_str(), 0xF7A600, 10);
-            } else {
-                create_text(detail, 6, 75, "OK: upload / edit / rename / delete", 0xF7A600, 10);
+                label(detail, 6, 90, 182, banks, 0xF7A600, 10);
             }
-            create_text(detail, 6, 88, record.meta.mock ? "[mock]" : "[JSON]", 0x555555, 10);
         }
-
         create_footer(parent, ui_message_);
     }
 
@@ -3779,7 +3835,7 @@ private:
                 char prog_buf[32];
                 snprintf(prog_buf, sizeof(prog_buf), "Uploading %d/64", prog);
                 create_text(right, 6, 2,  "Upload:", 0xF7A600, 10);
-                create_text(right, 6, 18, prog_buf, 0xFFFFFF, 11);
+                create_text(right, 6, 18, prog_buf, 0xFFFFFF, 12);
                 lv_obj_t *bar_bg = lv_obj_create(right);
                 lv_obj_set_pos(bar_bg, 6, 34);
                 lv_obj_set_size(bar_bg, 300, 10);
@@ -3798,8 +3854,8 @@ private:
                     lv_obj_set_style_pad_all(bar_fill, 0, 0);
                 }
             } else if (service_.emu_dump_running()) {
-                create_text(right, 6, 6,  "Dump:", 0x8E8E8E, 10);
-                create_text(right, 6, 22, "(downloading...)", 0xF7A600, 10);
+                create_text(right, 8, 8, "Slot memory", 0xB8B8B8, 12);
+                create_text(right, 8, 30, "Downloading...", 0xF7A600, 12);
             } else if (showing_dump) {
                 const int total = static_cast<int>(info.dump_lines.size());
                 const int scroll = std::max(0, std::min(emu_dump_scroll_,
@@ -3811,7 +3867,7 @@ private:
                 }
             } else if (service_.emu_probe_running()) {
                 create_text(right, 6, 6,  "Block 0:", 0x8E8E8E, 10);
-                create_text(right, 6, 22, "(probing...)", 0xF7A600, 10);
+                create_text(right, 6, 26, "Reading slot...", 0xF7A600, 12);
             } else if (info.probed && !info.block0_hex.empty()) {
                 const auto &h = info.block0_hex;
                 render_dump_line_colored(right, 6, 4, "00:" + h,
@@ -4219,16 +4275,12 @@ private:
         const bool modal_full_width = tool_page_active ||
                                       modal_ == Modal::DeviceProbe ||
                                       modal_ == Modal::UartConfig;
-        const int panel_h = std::max(80, static_cast<int>(lv_obj_get_height(parent)) - 14);
+        const int panel_h = std::max(80, static_cast<int>(lv_obj_get_height(parent)) - (tool_page_active ? 0 : 14));
 
         lv_obj_t *detail = nullptr;
         if (modal_full_width) {
             if (tool_page_active) {
-                // Box + arrow indicator: box with "<" spanning full height
-                const int sh = panel_h;
-                lv_obj_t *strip = create_panel(parent, 0, 0, 10, sh, 0x1E2D4A);
-                create_text(strip, 2, sh / 2 - 5, "<", 0xAAC4FF, 10);
-                detail = create_panel(parent, 10, 0, 310, sh, 0x101010);
+                detail = create_panel(parent, 0, 0, 320, panel_h, 0x101010);
             } else {
                 detail = create_panel(parent, 0, 0, 320, panel_h, 0x101010);
             }
@@ -4239,11 +4291,11 @@ private:
             create_text(arrow, 2, panel_h / 2 - 5, ">", 0xAAC4FF, 10);
             detail = create_panel(parent, 140, 0, 180, panel_h, 0x101010);
 
-            for (int i = 0; i < 4; ++i) {
+            for (int i = 0; i < 5; ++i) {
                 const bool selected = (modal_ == Modal::None) ? (tools_idx_ == i) : (active_tool_idx_ == i);
                 lv_obj_t *row = lv_obj_create(list);
                 lv_obj_remove_style_all(row);
-                lv_obj_set_size(row, 132, 18);
+                lv_obj_set_size(row, 122, 18);
                 lv_obj_set_pos(row, 4, 6 + i * 19);
                 lv_obj_set_style_bg_color(row, lv_color_hex(selected ? 0xF7A600 : 0x181818), LV_PART_MAIN | LV_STATE_DEFAULT);
                 lv_obj_set_style_bg_opa(row, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -4261,20 +4313,25 @@ private:
             switch (tools_idx_) {
             case 0:
                 create_text(detail, 6, 24, "Manage saved key dict", 0xD8D8D8, 11);
-                create_text(detail, 6, 37, "Add / edit / disable keys", 0xD8D8D8, 11);
+                create_text(detail, 6, 37, "Edit / enable keys", 0xD8D8D8, 11);
                 create_text(detail, 6, 50, "OK to open manager", 0x8DB6FF, 11);
                 break;
             case 1:
-                create_text(detail, 6, 22, "Magic MIFARE Classic Card", 0xD8D8D8, 10);
-                create_text(detail, 6, 34, "Gen1A  Chinese Magic Card", 0x9E9E9E, 10);
+                create_text(detail, 6, 22, "Magic Classic card", 0xD8D8D8, 10);
+                create_text(detail, 6, 34, "Gen1A  Backdoor", 0x9E9E9E, 10);
                 create_text(detail, 6, 48, "Gen2   CUID", 0x9E9E9E, 10);
                 create_text(detail, 6, 60, "Gen3   APDU", 0x9E9E9E, 10);
-                create_text(detail, 6, 72, "Gen3   Ultimate Magic Card", 0x9E9E9E, 10);
+                create_text(detail, 6, 72, "Gen4   Ultimate", 0x9E9E9E, 10);
                 break;
             case 2:
                 create_text(detail, 6, 22, "MIFARE Classic Sniff", 0xD8D8D8, 11);
                 create_text(detail, 6, 35, "without tag present", 0xD8D8D8, 11);
-                create_text(detail, 6, 50, "PN532Killer / NFC Unit", 0x8DB6FF, 11);
+                create_text(detail, 6, 50, "Killer / NFC Unit", 0x8DB6FF, 11);
+                break;
+            case 4:
+                create_text(detail, 6, 24, "Dictionary + nested", 0xD8D8D8, 10);
+                create_text(detail, 6, 44, "Classic sectors A/B", 0xD8D8D8, 10);
+                create_text(detail, 6, 64, "PN532Killer only", 0x8DB6FF, 10);
                 break;
             case 3:
                 create_text(detail, 6, 22, "MIFARE Classic Sniff", 0xD8D8D8, 11);
@@ -4285,7 +4342,7 @@ private:
             }
         }
 
-        create_footer(parent, ui_message_);
+        if (modal_ != Modal::ToolInfo && !tool_page_active) create_footer(parent, ui_message_);
     }
 
     // ── Post-scan action menu (OK after a scan result) ───────────────────────
@@ -4556,13 +4613,10 @@ private:
                         break;
                     }
                     scan_log_lines_.push_back("OK  " + compact_read_connection_detail(conn2));
-                    scan_log_lines_.push_back(supported_protocols_text());
                 if (service_.is_current_device_uhf()) {
                     scan_log_lines_.push_back("Keys: Space=start/pause  Bsp=clear");
                 }
                 } else {
-                    scan_log_lines_.push_back("OK  " + compact_read_connection_detail(conn));
-                    scan_log_lines_.push_back(supported_protocols_text());
                 if (service_.is_current_device_uhf()) {
                     scan_log_lines_.push_back("Keys: Space=start/pause  Bsp=clear");
                 }
@@ -4987,31 +5041,42 @@ private:
     }
 
     // ── Tool info popup ('i' key) ────────────────────────────────────────────
-    void render_tool_info_modal(lv_obj_t *parent)    {
-        lv_obj_t *card = make_modal_card(parent, 300, 100, 0x00D2FF);
-        create_text(card, 8, 5, tool_name(tools_idx_), 0x00D2FF, 12);
-
-        struct ToolDesc {
-            const char *lines[3];
-        };
-        static const ToolDesc descs[4] = {
-            {{"Manage MIFARE key dictionary.",
-              "Keys used by MFKey32/64 attacks",
-              "and sector authentication."}},
-            {{"Write UID to Gen1a magic card.",
-              "Scan target → type UID → write.",
-              "Requires Gen1a/Gen3 card."}},
-                        {{"MFKey32v2: nested-nonce attack.",
-                            "PN532Killer/NFCUnit sniff same",
-              "sector w/o card → recover key."}},
-            {{"MFKey64: hardnested attack.",
-              "PN532Killer sniff read with card",
-              "present → recover key."}},
-        };
-        const auto &d = descs[tools_idx_];
-        for (int i = 0; i < 3; ++i) {
-            create_text(card, 8, 24 + i * 18, d.lines[i], 0xD8D8D8, 11);
+    void render_tool_info_modal(lv_obj_t *parent)
+    {
+        lv_obj_t *card = make_modal_card(parent, 312, 116, 0x00D2FF);
+        const int tool = tool_help_return_ == Modal::ToolPage ? active_tool_idx_ : tools_idx_;
+        create_text(card, 8, 5, tool_name(tool), 0x00D2FF, 12);
+        std::vector<std::string> lines;
+        if (tool == 0) {
+            if (mifare_key_editing_) {
+                lines = {"Edit one saved authentication key.", "Up/Down or Tab: name/key",
+                         "Backspace: erase  Enter: save", "Esc: cancel edit"};
+            } else if (mifare_keys_file_mode_ && !key_file_keys_.empty()) {
+                lines = key_file_editing_
+                    ? std::vector<std::string>{"One 12-digit hex key per line.", "Up/Down: line  Hex: type",
+                        "Backspace: erase  Enter: add line", "S: save all  Esc: back after save"}
+                    : std::vector<std::string>{"Dictionary keys apply to A and B.", "F/X: select  Enter: edit file", "Esc: dictionary list"};
+            } else {
+                lines = {"Saved keys and dictionary files.", "Tab: switch list  F/X: select",
+                         mifare_keys_file_mode_ ? "Enter: open dictionary" : "Enter: edit/add  T: enable/disable",
+                         mifare_keys_file_mode_ ? "Esc: tools list" : "DEL: delete  Esc: tools list"};
+            }
+        } else if (tool == 1) {
+            lines = {"Change supported magic-card UID.", "Up/Down: field  Tab: card type",
+                     "Hex: edit  Backspace: erase", "Enter: next/write  Esc: back"};
+        } else if (tool == 4) {
+            lines = {"Static nonce + one known key needed.", "Defaults and saved keys tried first.",
+                     "Orange: sector  Green: A  Blue: B",
+                     mfkey_step_ >= 3 ? "Up/Down: sector  Enter: import A/B" : "Enter: start  Esc: cancel/back"};
+            if (mfkey_step_ >= 3) lines.push_back("S: save file  R: retry  Esc: back");
+        } else {
+            lines = {tool == 2 ? "Recover key from reader auth logs." : "Recover key from card auth logs.",
+                     tool == 2 ? "Capture without card; UID optional." : "Keep card beside the reader.",
+                     mfkey_step_ >= 3 ? "Up/Down: key  Enter: import" : "Enter: next  Esc: back/cancel"};
+            if (mfkey_step_ >= 3) lines.push_back("S: save file  R: retry");
         }
+        for (size_t i = 0; i < lines.size(); ++i) create_text(card, 8, 23 + static_cast<int>(i) * 14, lines[i].c_str(), 0xD8D8D8, 10);
+        create_text(card, 8, 102, "I / Esc: close help", 0x777777, 10);
     }
 
     // ── Global RFID App intro popup ('i' key, any tab) ───────────────────────
@@ -5203,7 +5268,7 @@ private:
                 render_uid_changer_tool(parent);
                 return;
             }
-            if (active_tool_idx_ == 2 || active_tool_idx_ == 3) {
+            if (active_tool_idx_ == 2 || active_tool_idx_ == 3 || active_tool_idx_ == 4) {
                 render_mfkey_wizard(parent);
                 return;
             }
@@ -5247,13 +5312,7 @@ private:
         {
             const std::string dev_line = std::string("Device: ") + nfc_app::to_string(conn.device_kind);
             create_text(parent, 6, 4, to_compact(dev_line, 28).c_str(), supported ? 0x00FF88 : 0xFF8888, 10);
-            const char *step_ch[3] = {"(1)", "(2)", "(3)"};
-            int sx = 210;
-            for (int si = 0; si < 3; ++si) {
-                const bool cur = (si == uid_changer_step_);
-                create_text(parent, sx, 4, step_ch[si], cur ? 0xF7A600 : 0x444444, cur ? 12 : 10);
-                sx += cur ? 16 : 14;
-            }
+
         }
 
         if (uid_changer_step_ == 0) {
@@ -5334,15 +5393,8 @@ private:
     void render_mfkey_wizard(lv_obj_t *parent)
     {
         const bool with_card = (active_tool_idx_ == 3);
-        const char *title    = with_card ? "MFkey64" : "MFKey32v2";
+        const bool nested = active_tool_idx_ == 4;
 
-        create_text(parent, 8, 3, title, 0xFFFFFF, 12);
-        const int stage = mfkey_step_ == 0 ? 0 : (mfkey_step_ == 1 ? 1 : 2);
-        const char *stages[] = {"1 Setup", "2 Capture", "3 Keys"};
-        for (int i = 0; i < 3; ++i) {
-            create_text(parent, 102 + i * 70, 4, stages[i],
-                        i == stage ? 0xF7A600 : (i < stage ? 0x00CC88 : 0x666666), 12);
-        }
         if (mfkey_step_ >= 3) {
             render_mfkey_results(parent);
             return;
@@ -5351,49 +5403,85 @@ private:
             char progress[32];
             const int pct = static_cast<int>(mfkey_display_progress_);
             std::snprintf(progress, sizeof(progress), "Calculating keys  %d%%", pct);
-            create_text(parent, 12, 32, progress, 0xF7A600, 12);
-            create_panel(parent, 12, 59, 292, 6, 0x303030);
-            if (pct > 0) create_panel(parent, 12, 59, std::max(1, 292 * pct / 100), 6, 0xF7A600);
-            create_text(parent, 12, 78, "Please wait...", 0x888888, 10);
+            create_text(parent, 12, 12, progress, 0xF7A600, 12);
+            create_panel(parent, 12, 39, 292, 6, 0x303030);
+            if (pct > 0) create_panel(parent, 12, 39, std::max(1, 292 * pct / 100), 6, 0xF7A600);
+            create_text(parent, 12, 58, nested ? to_compact(service_.staticnested_status(), 36).c_str() : "Please wait...", 0x888888, 10);
             return;
         }
         if (mfkey_step_ == 0) {
-            if (with_card) {
-                create_text(parent, 12, 29, "Place card near reader", 0xFFFFFF, 12);
-                create_text(parent, 12, 53, "Keep PN532Killer beside the card.", 0x999999, 10);
+            if (nested) {
+                create_text(parent, 12, 9, "Hold Classic card on reader", 0xFFFFFF, 12);
+                create_text(parent, 12, 31, "Enabled MIFARE Keys -> sectors A/B", 0x999999, 10);
+                create_text(parent, 12, 50, "Static nonce card + known key needed", 0x888888, 10);
+            } else if (with_card) {
+                create_text(parent, 12, 9, "Place card near reader", 0xFFFFFF, 12);
+                create_text(parent, 12, 33, "Keep PN532Killer beside the card.", 0x999999, 10);
             } else {
-                create_text(parent, 12, 27, "UID (optional)", 0x999999, 10);
+                create_text(parent, 12, 7, "UID (optional)", 0x999999, 10);
                 const std::string uid = mfkey_uid_input_.empty() ? "Default UID" : mfkey_uid_input_ + "_";
-                create_text_mono(parent, 12, 47, uid.c_str(), 0x00FFAA, 12);
-                create_text(parent, 12, 69, "8 hex digits, or leave empty", 0x888888, 10);
+                create_text_mono(parent, 12, 27, uid.c_str(), 0x00FFAA, 12);
+                create_text(parent, 12, 49, "8 hex digits, or leave empty", 0x888888, 10);
             }
-            create_text(parent, 12, 90, "Enter: Start                 Esc: Back", 0x8DB6FF, 10);
+
             return;
         }
         const bool editing_uid = !with_card && !mfkey_uid_input_.empty();
-        create_text(parent, 12, 27, editing_uid ? "Change capture UID" : "Capturing...",
+        create_text(parent, 12, 7, editing_uid ? "Change capture UID" : "Capturing...",
                     editing_uid ? 0xF7A600 : 0x00FFAA, 12);
         if (editing_uid) {
-            create_text_mono(parent, 12, 49, (mfkey_uid_input_ + "_").c_str(), 0xFFFFFF, 12);
-            create_text(parent, 12, 69, "Enter restarts capture with this UID", 0x999999, 10);
+            create_text_mono(parent, 12, 29, (mfkey_uid_input_ + "_").c_str(), 0xFFFFFF, 12);
+            create_text(parent, 12, 49, "Enter restarts capture with this UID", 0x999999, 10);
         } else {
-            create_text(parent, 12, 49, with_card ? "Let reader authenticate the card." : "Hold PN532Killer near the reader.", 0xD8D8D8, 10);
-            create_text(parent, 12, 69, with_card ? "Keep card in place until finished." : "New UID? Type 8 hex digits.", 0x888888, 10);
+            create_text(parent, 12, 29, with_card ? "Let reader authenticate the card." : "Hold PN532Killer near the reader.", 0xD8D8D8, 10);
+            create_text(parent, 12, 49, with_card ? "Keep card in place until finished." : "New UID? Type 8 hex digits.", 0x888888, 10);
         }
-        create_text(parent, 12, 90, editing_uid ? "Enter: Restart            Esc: Cancel" : "Enter: Calculate          Esc: Cancel", 0x8DB6FF, 10);
+
     }
 
     void render_mfkey_results(lv_obj_t *parent)
     {
         if (mfkey_results_.empty()) {
             create_text(parent, 8, 22, "No keys found", 0xFF6666, 12);
-            create_text(parent, 8, 42, "No usable authentication captured.", 0xD8D8D8, 11);
+            create_text(parent, 8, 42, active_tool_idx_ == 4 ? to_compact(service_.staticnested_status(), 35).c_str() : "No usable authentication captured.", 0xD8D8D8, 11);
             create_text(parent, 8, 56, "R: Set up and capture again", 0xD8D8D8, 11);
-            create_text(parent, 8, 90, "R:retry  ESC:back", 0x7A7A7A, 10);
+
             return;
         }
+        if (active_tool_idx_ == 4) {
+            std::vector<int> sectors;
+            for (const auto &res : mfkey_results_) {
+                if (std::find(sectors.begin(), sectors.end(), res.sector) == sectors.end()) sectors.push_back(res.sector);
+            }
+            std::sort(sectors.begin(), sectors.end());
+            const int selected_sector = mfkey_results_[static_cast<size_t>(mfkey_result_idx_)].sector;
+            const int selected = static_cast<int>(std::find(sectors.begin(), sectors.end(), selected_sector) - sectors.begin());
+            constexpr int visible_sectors = 6;
+            const int offset = std::max(0, std::min(selected - 1, static_cast<int>(sectors.size()) - visible_sectors));
+            for (int r = 0; r < visible_sectors && offset + r < static_cast<int>(sectors.size()); ++r) {
+                const int sector = sectors[static_cast<size_t>(offset + r)];
+                std::string keys[2] = {"------------", "------------"};
+                for (const auto &res : mfkey_results_) {
+                    if (res.sector == sector && res.key_type < 2 && !res.key_hex.empty()) keys[res.key_type] = res.key_hex;
+                }
+                const bool sel = sector == selected_sector;
+                lv_obj_t *row = create_panel(parent, 6, 4 + r * 19, 306, 18, sel ? 0x353535 : 0x1E1E1E);
+                if (sel) {
+                    lv_obj_set_style_border_color(row, lv_color_hex(0xF7A600), 0);
+                    lv_obj_set_style_border_width(row, 1, 0);
+                }
+                char sector_text[12];
+                std::snprintf(sector_text, sizeof(sector_text), "Sec%02d", sector);
+                lv_obj_t *sector_label = create_text_mono(row, 4, 0, sector_text, 0xF7A600, 10);
+                lv_obj_t *key_a = create_text_mono(row, 52, 0, keys[0].c_str(), 0x66DDAA, 10);
+                lv_obj_t *key_b = create_text_mono(row, 156, 0, keys[1].c_str(), 0x8DB6FF, 10);
+                lv_obj_align(sector_label, LV_ALIGN_LEFT_MID, 4, 0);
+                lv_obj_align(key_a, LV_ALIGN_LEFT_MID, 52, 0);
+                lv_obj_align(key_b, LV_ALIGN_LEFT_MID, 156, 0);
+            }
+        } else {
         // Three rows leave room for the step header and action footer.
-        constexpr int visible = 3;
+        constexpr int visible = 6;
         const int total = static_cast<int>(mfkey_results_.size());
         int offset = mfkey_result_idx_ - 1;
         if (offset < 0) offset = 0;
@@ -5407,7 +5495,7 @@ private:
             lv_obj_t *row = lv_obj_create(parent);
             lv_obj_remove_style_all(row);
             lv_obj_set_size(row, 306, 18);
-            lv_obj_set_pos(row, 6, 24 + r * 20);
+            lv_obj_set_pos(row, 6, 4 + r * 19);
             lv_obj_set_style_bg_color(row, lv_color_hex(sel ? 0xF7A600 : 0x1E1E1E), LV_PART_MAIN | LV_STATE_DEFAULT);
             lv_obj_set_style_bg_opa(row, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
             lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
@@ -5416,15 +5504,16 @@ private:
             const std::string kd = res.key_hex.empty() ? "(not found)" : res.key_hex;
             std::snprintf(val, sizeof(val), "%s", kd.c_str());
             lv_obj_t *sector_label = create_text(row, 4, 0, col, sel ? 0x000000 : 0xFFFFFF, 10);
-            lv_obj_t *key_label = create_text_mono(row, 80, 0, val, sel ? 0x2F2F2F : 0x8DB6FF, 10);
+            lv_obj_t *key_label = create_text_mono(row, 96, 0, val, sel ? 0x2F2F2F : 0x8DB6FF, 10);
             lv_obj_align(sector_label, LV_ALIGN_LEFT_MID, 4, 0);
-            lv_obj_align(key_label, LV_ALIGN_LEFT_MID, 80, 0);
+            lv_obj_align(key_label, LV_ALIGN_LEFT_MID, 96, 0);
         }
-        create_text(parent, 6, 92, "Enter:Import  S:Save  R:Retry  Esc:Back", 0x7A7A7A, 10);
+
+        }
         // Save-to-file filename input overlay
         if (mfkey_save_mode_) {
             lv_obj_t *box = create_panel(parent, 16, 26, 288, 62, 0x131320);
-            create_text(box, 6, 4, "Save all keys to file (.dic added):", 0xD0D0D0, 11);
+            create_text(box, 6, 4, "Save keys (.dic added):", 0xD0D0D0, 11);
             const std::string disp = mfkey_save_filename_.empty() ? "_" : mfkey_save_filename_ + "_";
             create_text(box, 6, 20, disp.c_str(), 0xFFFF00, 12);
             create_text(box, 6, 44, "Enter:confirm  ESC:cancel", 0x7A7A7A, 10);
@@ -5433,163 +5522,65 @@ private:
 
     void render_mifare_keys_tool(lv_obj_t *parent)
     {
-        // Tab line: [Built-in] [Files]
-        {
-            const char *tabs[2] = {"Built-in", "Files"};
-            for (int t = 0; t < 2; ++t) {
-                const bool sel = (mifare_keys_file_mode_ == (t == 1));
-                create_text(parent, 6 + t * 86, 4, tabs[t], sel ? 0xF7A600 : 0x6A6A6A, 11);
+        auto row = [&](int y, bool selected, const std::string &text) {
+            lv_obj_t *entry = create_panel(parent, 6, y, 306, 18, selected ? 0x353535 : 0x181818);
+            if (selected) {
+                lv_obj_set_style_border_color(entry, lv_color_hex(0xF7A600), 0);
+                lv_obj_set_style_border_width(entry, 1, 0);
             }
-        }
-        create_text(parent, 168, 4, "Tab:switch", 0x4A4A4A, 10);
-
+            lv_obj_t *label = create_text_mono(entry, 5, 0, text.c_str(), selected ? 0xFFFFFF : 0x8DB6FF, 10);
+            lv_obj_align(label, LV_ALIGN_LEFT_MID, 5, 0);
+        };
         if (mifare_key_editing_) {
-            const uint32_t col_label = (mifare_key_field_idx_ == 0) ? 0xFFFF00 : 0xD8D8D8;
-            const uint32_t col_key = (mifare_key_field_idx_ == 1) ? 0xFFFF00 : 0xD8D8D8;
-            const uint32_t col_type = (mifare_key_field_idx_ == 2) ? 0xFFFF00 : 0x8DB6FF;
-            create_text(parent, 6, 22, (std::string("Label: ") + to_compact(mifare_key_edit_.label.empty() ? "(unnamed)" : mifare_key_edit_.label, 18)).c_str(), col_label, 11);
-            create_text_mono(parent, 6, 38, (std::string("Key: ") + (mifare_key_edit_.key_hex.empty() ? "_" : mifare_key_edit_.key_hex + "_")).c_str(), col_key, 11);
-            create_text(parent, 6, 54, (std::string("Type: Key ") + nfc_app::to_string(mifare_key_edit_.type)).c_str(), col_type, 11);
-            create_text(parent, 6, 70, mifare_key_creating_ ? "New key entry" : "Edit selected key", 0x7A7A7A, 10);
-            create_text(parent, 6, 92, "U/D field  Tab type  Enter save  ESC back", 0x7A7A7A, 10);
+            create_text(parent, 6, 4, mifare_key_creating_ ? "New saved key" : "Edit saved key", 0xF7A600, 12);
+            row(26, mifare_key_field_idx_ == 0, "Name " + to_compact(mifare_key_edit_.label, 29));
+            row(48, mifare_key_field_idx_ == 1, "Key  " + mifare_key_edit_.key_hex + "_");
             return;
         }
-
+        if (mifare_keys_file_mode_ && !key_file_keys_.empty()) {
+            const std::string filename = key_file_idx_ < static_cast<int>(key_files_.size())
+                ? key_files_[static_cast<size_t>(key_file_idx_)] : "Dictionary";
+            create_text(parent, 6, 4, to_compact(filename, 29).c_str(), 0xF7A600, 12);
+            const std::string count = std::to_string(key_file_keys_.size()) + (key_file_dirty_ ? " *" : "");
+            create_text(parent, 254, 4, count.c_str(), 0x999999, 10);
+            const int total = static_cast<int>(key_file_keys_.size());
+            key_file_key_idx_ = std::max(0, std::min(key_file_key_idx_, total - 1));
+            const int offset = std::max(0, std::min(key_file_key_idx_ - 1, total - 5));
+            for (int r = 0; r < 5 && offset + r < total; ++r) {
+                const int idx = offset + r;
+                const bool selected = idx == key_file_key_idx_;
+                char number[12];
+                std::snprintf(number, sizeof(number), "%03d  ", idx + 1);
+                row(24 + r * 19, selected, std::string(number) + key_file_keys_[static_cast<size_t>(idx)] +
+                    (selected && key_file_editing_ ? "_" : ""));
+            }
+            return;
+        }
+        create_text(parent, 6, 4, "Saved keys", mifare_keys_file_mode_ ? 0x777777 : 0xF7A600, 12);
+        create_text(parent, 126, 4, "Dictionaries", mifare_keys_file_mode_ ? 0xF7A600 : 0x777777, 12);
         if (mifare_keys_file_mode_) {
-            // File browser sub-mode
-            if (key_file_keys_.empty()) {
-                // Show file list
-                const int n = static_cast<int>(key_files_.size());
-                if (n == 0) {
-                    create_text(parent, 6, 24, "No .dic/.txt files found", 0xFF6666, 11);
-                    create_text(parent, 6, 38, "/home/pi/rfid/keys/", 0x7A7A7A, 10);
-                } else {
-                    constexpr int visible = 4;
-                    int offset = key_file_idx_ - 1;
-                    if (offset < 0) offset = 0;
-                    if (offset > n - visible) offset = n - visible;
-                    if (offset < 0) offset = 0;
-                    for (int r = 0; r < visible; ++r) {
-                        const int idx = offset + r;
-                        if (idx >= n) break;
-                        const bool sel = (idx == key_file_idx_);
-                        lv_obj_t *row = lv_obj_create(parent);
-                        lv_obj_remove_style_all(row);
-                        lv_obj_set_size(row, 306, 18);
-                        lv_obj_set_pos(row, 6, 20 + r * 18);
-                        lv_obj_set_style_bg_color(row, lv_color_hex(sel ? 0x00D2FF : 0x181818), LV_PART_MAIN | LV_STATE_DEFAULT);
-                        lv_obj_set_style_bg_opa(row, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-                        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-                        const int cnt = (idx < static_cast<int>(key_file_counts_.size())) ? key_file_counts_[static_cast<size_t>(idx)] : 0;
-                        const std::string left = to_compact(key_files_[static_cast<size_t>(idx)], 24);
-                        const std::string right = std::to_string(cnt) + " keys";
-                        create_text(row, 4, 4, left.c_str(), sel ? 0x000000 : 0xD0D0D0, 10);
-                        create_text(row, 210, 4, right.c_str(), sel ? 0x1A1A1A : 0x8DB6FF, 10);
-                    }
-                }
-                create_text(parent, 6, 92, "U/D select  Enter:load file  ESC back", 0x7A7A7A, 10);
-            } else {
-                if (key_file_editing_) {
-                    const int total = std::max(1, static_cast<int>(key_file_keys_.size()));
-                    if (key_file_key_idx_ >= total) key_file_key_idx_ = total - 1;
-                    if (key_file_key_idx_ < 0) key_file_key_idx_ = 0;
-
-                    const std::string fname = key_file_idx_ < static_cast<int>(key_files_.size())
-                        ? key_files_[static_cast<size_t>(key_file_idx_)] : "";
-                    create_text(parent, 6, 16, to_compact(fname, 28).c_str(), 0x00D2FF, 10);
-                    create_text(parent, 190, 16, key_file_dirty_ ? "*dirty" : "saved", key_file_dirty_ ? 0xF7A600 : 0x6A6A6A, 10);
-
-                    constexpr int visible = 4;
-                    int offset = key_file_key_idx_ - 1;
-                    if (offset < 0) offset = 0;
-                    if (offset > total - visible) offset = total - visible;
-                    if (offset < 0) offset = 0;
-                    for (int r = 0; r < visible; ++r) {
-                        const int idx = offset + r;
-                        if (idx >= total) break;
-                        const bool sel = (idx == key_file_key_idx_);
-                        lv_obj_t *row = lv_obj_create(parent);
-                        lv_obj_remove_style_all(row);
-                        lv_obj_set_size(row, 306, 16);
-                        lv_obj_set_pos(row, 6, 28 + r * 16);
-                        lv_obj_set_style_bg_color(row, lv_color_hex(sel ? 0x00D2FF : 0x181818), LV_PART_MAIN | LV_STATE_DEFAULT);
-                        lv_obj_set_style_bg_opa(row, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-                        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-                        const std::string key_hex = idx < static_cast<int>(key_file_keys_.size()) ? key_file_keys_[static_cast<size_t>(idx)] : "";
-                        const std::string disp = key_hex + (sel ? "_" : "");
-                        char idx_buf[8];
-                        std::snprintf(idx_buf, sizeof(idx_buf), "%03d", idx + 1);
-                        create_text(row, 4, 3, idx_buf, sel ? 0x000000 : 0x7A7A7A, 10);
-                        create_text_mono(row, 40, 3, to_compact(disp, 24).c_str(), sel ? 0x000000 : 0x8DB6FF, 10);
-                    }
-                    create_text(parent, 6, 92, "Hex edit  Enter:+line  Del:line  S:save", 0x7A7A7A, 10);
-                    create_text(parent, 6, 104, "U/D line  Bsp:erase  ESC back", 0x7A7A7A, 10);
-                    return;
-                }
-
-                // Show keys from loaded file (browse mode)
-                const int total = static_cast<int>(key_file_keys_.size());
-                constexpr int visible = 4;
-                int offset = key_file_key_idx_ - 1;
-                if (offset < 0) offset = 0;
-                if (offset > total - visible) offset = total - visible;
-                if (offset < 0) offset = 0;
-                // Show file name as subtitle
-                const std::string fname = key_file_idx_ < static_cast<int>(key_files_.size())
-                    ? to_compact(key_files_[static_cast<size_t>(key_file_idx_)], 20) : "";
-                create_text(parent, 6, 16, fname.c_str(), 0x00D2FF, 10);
-                for (int r = 0; r < visible; ++r) {
-                    const int idx = offset + r;
-                    if (idx >= total) break;
-                    const bool sel = (idx == key_file_key_idx_);
-                    lv_obj_t *row = lv_obj_create(parent);
-                    lv_obj_remove_style_all(row);
-                    lv_obj_set_size(row, 306, 16);
-                    lv_obj_set_pos(row, 6, 26 + r * 16);
-                    lv_obj_set_style_bg_color(row, lv_color_hex(sel ? 0x00D2FF : 0x181818), LV_PART_MAIN | LV_STATE_DEFAULT);
-                    lv_obj_set_style_bg_opa(row, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-                    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-                    create_text_mono(row, 4, 3, key_file_keys_[static_cast<size_t>(idx)].c_str(), sel ? 0x000000 : 0x8DB6FF, 10);
-                }
-                char countbuf[32];
-                std::snprintf(countbuf, sizeof(countbuf), "%d keys", total);
-                create_text(parent, 6, 92, countbuf, 0x7A7A7A, 10);
-                create_text(parent, 50, 92, "  Enter:edit file  Bsp:back", 0x7A7A7A, 10);
+            const int total = static_cast<int>(key_files_.size());
+            const int offset = std::max(0, std::min(key_file_idx_ - 1, total - 5));
+            if (!total) create_text(parent, 6, 30, "No dictionary files", 0x999999, 10);
+            for (int r = 0; r < 5 && offset + r < total; ++r) {
+                const int idx = offset + r;
+                const int count = idx < static_cast<int>(key_file_counts_.size()) ? key_file_counts_[static_cast<size_t>(idx)] : 0;
+                row(24 + r * 19, idx == key_file_idx_, to_compact(key_files_[static_cast<size_t>(idx)], 24) + "  " + std::to_string(count));
             }
             return;
         }
-
-        // Built-in key list (original behaviour)
-        const int total_rows = static_cast<int>(mifare_keys_.size()) + 1;
-        constexpr int visible = 4;
-        int offset = mifare_key_idx_ - 1;
-        if (offset < 0) offset = 0;
-        if (offset > total_rows - visible) offset = total_rows - visible;
-        if (offset < 0) offset = 0;
-
-        for (int row = 0; row < visible; ++row) {
-            const int index = offset + row;
-            if (index >= total_rows) break;
-            const bool selected = (index == mifare_key_idx_);
-            lv_obj_t *entry = lv_obj_create(parent);
-            lv_obj_remove_style_all(entry);
-            lv_obj_set_size(entry, 164, 18);
-            lv_obj_set_pos(entry, 6, 20 + row * 18);
-            lv_obj_set_style_bg_color(entry, lv_color_hex(selected ? 0xF7A600 : 0x181818), LV_PART_MAIN | LV_STATE_DEFAULT);
-            lv_obj_set_style_bg_opa(entry, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-            lv_obj_clear_flag(entry, LV_OBJ_FLAG_SCROLLABLE);
-
-            if (index == static_cast<int>(mifare_keys_.size())) {
-                create_text(entry, 4, 4, "+ Add Key", selected ? 0x000000 : 0x8DB6FF, 10);
-            } else {
-                const auto &key = mifare_keys_[index];
-                const std::string head = (key.enabled ? "[on] " : "[off] ") + key.label;
-                const std::string tail = std::string("K") + nfc_app::to_string(key.type) + " " + key.key_hex;
-                create_text(entry, 4, 1, to_compact(head, 18).c_str(), selected ? 0x000000 : 0xFFFFFF, 10);
-                create_text_mono(entry, 4, 9, to_compact(tail, 18).c_str(), selected ? 0x2F2F2F : 0x8DB6FF, 10);
+        const int total = static_cast<int>(mifare_keys_.size()) + 1;
+        const int offset = std::max(0, std::min(mifare_key_idx_ - 1, total - 5));
+        for (int r = 0; r < 5 && offset + r < total; ++r) {
+            const int idx = offset + r;
+            std::string text = "+ Add key";
+            if (idx < static_cast<int>(mifare_keys_.size())) {
+                const auto &key = mifare_keys_[static_cast<size_t>(idx)];
+                text = std::string(key.enabled ? "+ " : "- ") + key.key_hex +
+                    " " + to_compact(key.label, 17);
             }
+            row(24 + r * 19, idx == mifare_key_idx_, text);
         }
-        create_text(parent, 6, 92, "U/D select  Enter edit  T on/off  Bsp del  Tab files  ESC back", 0x7A7A7A, 10);
     }
 
     void render_device_probe_modal(lv_obj_t *parent)
@@ -5765,6 +5756,8 @@ private:
         lv_obj_set_pos(label, x, y);
         lv_obj_set_style_text_color(label, lv_color_hex(color), LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_text_font(label,
+            (current_tab_ == Tab::Tools || current_tab_ == Tab::Read) ? &lv_font_unscii_8 :
+            font_size >= 14 ? &lv_font_montserrat_14 :
             font_size >= 12 ? &lv_font_montserrat_12 :
             font_size >= 10 ? &lv_font_montserrat_10 :
             font_size >= 8  ? &lv_font_montserrat_10 :
@@ -5777,13 +5770,14 @@ private:
     {
         lv_obj_t *label = create_text(parent, x, y, text, color, font_size);
         const lv_font_t *mono_font = &lv_font_unscii_8;
-        if (font_size >= 12 && g_font_mono_12 != nullptr) mono_font = g_font_mono_12;
+        if (current_tab_ != Tab::Tools && font_size >= 12 && g_font_mono_12 != nullptr) mono_font = g_font_mono_12;
         lv_obj_set_style_text_font(label, mono_font, LV_PART_MAIN | LV_STATE_DEFAULT);
         return label;
     }
 
     void create_footer(lv_obj_t *parent, const std::string &text)
     {
+        lv_obj_update_layout(parent);
         const int footer_y = std::max(0, static_cast<int>(lv_obj_get_height(parent)) - 14);
         lv_obj_t *footer = create_panel(parent, 0, footer_y, 320, 14, 0x0A0A0A);
         // Show full text, left-aligned, use smaller font if available
@@ -5897,8 +5891,8 @@ private:
 
     static const char *tool_name(int index)
     {
-        static const char *TOOLS[4] = {"MIFARE Keys", "UID Changer", "MFKey32v2", "MFKey64"};
-        if (index < 0 || index >= 4) return TOOLS[0];
+        static const char *TOOLS[5] = {"MIFARE Keys", "UID Changer", "MFKey32v2", "MFKey64", "Staticnested"};
+        if (index < 0 || index >= 5) return TOOLS[0];
         return TOOLS[index];
     }
 
@@ -6461,6 +6455,41 @@ private:
 
     void handle_modal_key(uint32_t key, uint32_t mods)
     {
+        // Letter navigation is available only where no text/hex input is active.
+        bool letter_navigation = false;
+        switch (modal_) {
+        case Modal::Action:
+        case Modal::SlotSelect:
+        case Modal::FileImport:
+        case Modal::EmulatorAction:
+        case Modal::HexExitConfirm:
+        case Modal::ToolInfo:
+        case Modal::AppInfo:
+        case Modal::PostScan:
+        case Modal::ReadMenu:
+        case Modal::UsbSelect:
+        case Modal::I2cSelect:
+        case Modal::SpiSelect:
+        case Modal::HexLog:
+        case Modal::UhfSavedView:
+            letter_navigation = true;
+            break;
+        case Modal::ToolPage:
+            letter_navigation = active_tool_idx_ == 0 && !mifare_key_editing_ &&
+                !(mifare_keys_file_mode_ && key_file_editing_);
+            break;
+        default: break;
+        }
+        if (letter_navigation) {
+            if (key == KEY_F) key = KEY_UP;
+            else if (key == KEY_X) key = KEY_DOWN;
+        }
+        if (modal_ == Modal::ToolPage && key == KEY_I &&
+            !(active_tool_idx_ == 0 && mifare_key_editing_ && mifare_key_field_idx_ == 0) && !mfkey_save_mode_) {
+            tool_help_return_ = modal_;
+            modal_ = Modal::ToolInfo;
+            return;
+        }
         switch (modal_) {
         case Modal::Action:     handle_action_key(key);      break;
         case Modal::SlotSelect: handle_slot_select_key(key); break;
@@ -6474,11 +6503,11 @@ private:
         case Modal::ToolPage:
             if (active_tool_idx_ == 0) handle_mifare_keys_tool_key(key);
             else if (active_tool_idx_ == 1) handle_uid_changer_tool_key(key);
-            else if (active_tool_idx_ == 2 || active_tool_idx_ == 3) handle_mfkey_tool_key(key);
+            else if (active_tool_idx_ == 2 || active_tool_idx_ == 3 || active_tool_idx_ == 4) handle_mfkey_tool_key(key);
             else if (key == KEY_ESC) modal_ = Modal::None;
             break;
         case Modal::ToolInfo:
-            if (key == KEY_ESC) modal_ = Modal::None;
+            if (key == KEY_ESC || key == KEY_I) modal_ = tool_help_return_;
             break;
        case Modal::AppInfo:
            if (key == KEY_ESC || key == KEY_I) {
@@ -7394,19 +7423,15 @@ private:
                 return;
             }
             if (key == KEY_UP) {
-                mifare_key_field_idx_ = (mifare_key_field_idx_ + 2) % 3;
+                mifare_key_field_idx_ = 1 - mifare_key_field_idx_;
                 return;
             }
             if (key == KEY_DOWN) {
-                mifare_key_field_idx_ = (mifare_key_field_idx_ + 1) % 3;
+                mifare_key_field_idx_ = 1 - mifare_key_field_idx_;
                 return;
             }
             if (key == KEY_TAB || key == KEY_LEFT || key == KEY_RIGHT) {
-                if (mifare_key_field_idx_ == 2) {
-                    mifare_key_edit_.type = (mifare_key_edit_.type == nfc_app::MifareKeyType::KeyA)
-                        ? nfc_app::MifareKeyType::KeyB
-                        : nfc_app::MifareKeyType::KeyA;
-                }
+                mifare_key_field_idx_ = 1 - mifare_key_field_idx_;
                 return;
             }
             if (key == KEY_BACKSPACE) {
@@ -7443,6 +7468,11 @@ private:
         }
 
         const int total_rows = static_cast<int>(mifare_keys_.size()) + 1;
+        if ((key == KEY_ESC || key == KEY_TAB) && key_file_dirty_) {
+            show_toast("Save changes with S first");
+            return;
+        }
+        if (key == KEY_TAB && mifare_keys_file_mode_ && !key_file_keys_.empty()) return;
         if (key == KEY_ESC) {
             if (mifare_keys_file_mode_) {
                 if (key_file_editing_) {
@@ -7491,7 +7521,7 @@ private:
                 } else if (key == KEY_ENTER && fn > 0 && key_file_idx_ < fn) {
                     key_file_keys_ = service_.load_key_file(key_files_[static_cast<size_t>(key_file_idx_)]);
                     key_file_key_idx_ = 0;
-                    key_file_editing_ = !key_file_keys_.empty(); // enter edit directly
+                    key_file_editing_ = false; // browse first; Enter edits
                     key_file_dirty_ = false;
                     if (key_file_keys_.empty()) ui_message_ = "File is empty";
                 }
@@ -7532,16 +7562,13 @@ private:
                         line.pop_back();
                         key_file_dirty_ = true;
                     }
-                } else if (key == KEY_DELETE) {
-                    if (!key_file_keys_.empty()) {
-                        key_file_keys_.erase(key_file_keys_.begin() + key_file_key_idx_);
-                        if (key_file_key_idx_ >= static_cast<int>(key_file_keys_.size())) {
-                            key_file_key_idx_ = std::max(0, static_cast<int>(key_file_keys_.size()) - 1);
-                        }
-                        if (key_file_keys_.empty()) key_file_keys_.push_back("");
-                        key_file_dirty_ = true;
-                    }
                 } else if (key == KEY_S) {
+                    for (const auto &line : key_file_keys_) {
+                        if (!nfc_app::NfcStorage::parse_12hex_line(line, nullptr)) {
+                            show_toast("Each key needs 12 hex digits");
+                            return;
+                        }
+                    }
                     std::string err;
                     const std::string fname = (key_file_idx_ < fn) ? key_files_[static_cast<size_t>(key_file_idx_)] : "";
                     if (fname.empty()) {
@@ -7576,23 +7603,25 @@ private:
             mifare_key_idx_ = (mifare_key_idx_ + 1) % total_rows;
             return;
         }
+        if (key == KEY_DELETE) {
+            if (mifare_key_idx_ < static_cast<int>(mifare_keys_.size())) {
+                std::string err;
+                if (service_.delete_mifare_key(mifare_key_idx_, &err)) {
+                    refresh_mifare_keys();
+                    mifare_key_idx_ = std::min(mifare_key_idx_,
+                        std::max(0, static_cast<int>(mifare_keys_.size()) - 1));
+                    show_toast("Key deleted");
+                    ui_message_ = "Key deleted";
+                } else ui_message_ = err.empty() ? "Delete failed" : err;
+            }
+            return;
+        }
         if (key == KEY_T && mifare_key_idx_ < static_cast<int>(mifare_keys_.size())) {
             // 'T' key for toggle (TAB is now mode-switch)
             std::string err;
             if (service_.toggle_mifare_key_enabled(mifare_key_idx_, &err)) {
                 refresh_mifare_keys();
                 ui_message_ = "Key toggled";
-            } else {
-                ui_message_ = err;
-            }
-            return;
-        }
-        if (key == KEY_BACKSPACE && mifare_key_idx_ < static_cast<int>(mifare_keys_.size())) {
-            std::string err;
-            if (service_.delete_mifare_key(mifare_key_idx_, &err)) {
-                refresh_mifare_keys();
-                if (mifare_key_idx_ > static_cast<int>(mifare_keys_.size())) mifare_key_idx_ = static_cast<int>(mifare_keys_.size());
-                ui_message_ = "Key deleted";
             } else {
                 ui_message_ = err;
             }
@@ -7615,6 +7644,20 @@ private:
     void handle_mfkey_tool_key(uint32_t key)
     {
         const bool with_card = (active_tool_idx_ == 3);
+        if (active_tool_idx_ == 4) {
+            if (mfkey_step_ >= 3) { handle_mfkey_results_key(key); return; }
+            if (key == KEY_ESC) {
+                if (mfkey_step_ == 2) { service_.cancel_staticnested(); ui_message_ = "Stopping..."; }
+                else modal_ = Modal::None;
+                return;
+            }
+            if (mfkey_step_ == 0 && key == KEY_ENTER) {
+                if (!service_.start_staticnested()) { ui_message_ = "Connect idle PN532Killer first"; return; }
+                mfkey_display_progress_ = 0; mfkey_progress_tick_ = lv_tick_get(); mfkey_complete_tick_ = 0;
+                mfkey_step_ = 2;
+            }
+            return;
+        }
 
         // Cancel UID editing without interrupting the current capture.
         if (key == KEY_ESC && !with_card && mfkey_step_ == 1 && !mfkey_uid_input_.empty()) {
@@ -7814,6 +7857,47 @@ private:
             }
             return;
         }
+        if (key == KEY_ESC) {
+            modal_ = Modal::None;
+            return;
+        }
+        if (active_tool_idx_ == 4 && !mfkey_results_.empty()) {
+            const int sector = mfkey_results_[static_cast<size_t>(mfkey_result_idx_)].sector;
+            if (key == KEY_UP || key == KEY_F || key == KEY_DOWN || key == KEY_X) {
+                std::vector<int> sectors;
+                for (const auto &res : mfkey_results_) {
+                    if (std::find(sectors.begin(), sectors.end(), res.sector) == sectors.end()) sectors.push_back(res.sector);
+                }
+                std::sort(sectors.begin(), sectors.end());
+                const int current = static_cast<int>(std::find(sectors.begin(), sectors.end(), sector) - sectors.begin());
+                const int count = static_cast<int>(sectors.size());
+                const int next = sectors[static_cast<size_t>((current + ((key == KEY_UP || key == KEY_F) ? count - 1 : 1)) % count)];
+                for (size_t i = 0; i < mfkey_results_.size(); ++i) {
+                    if (mfkey_results_[i].sector == next) { mfkey_result_idx_ = static_cast<int>(i); break; }
+                }
+                return;
+            }
+            if (key == KEY_ENTER) {
+                int imported = 0;
+                int skipped = 0;
+                std::string error;
+                for (const auto &res : mfkey_results_) {
+                    if (res.sector == sector && !res.key_hex.empty()) {
+                        bool added = false;
+                        if (!service_.import_mfkey_result(res, &error, &added)) break;
+                        if (added) ++imported;
+                        else ++skipped;
+                    }
+                }
+                refresh_mifare_keys();
+                if (!error.empty()) ui_message_ = error;
+                else {
+                    ui_message_ = std::to_string(imported) + " added, " + std::to_string(skipped) + " existing";
+                    show_toast(ui_message_);
+                }
+                return;
+            }
+        }
         switch (key) {
         case KEY_ENTER: {
             if (!mfkey_results_.empty() &&
@@ -7821,10 +7905,11 @@ private:
                 const auto &res = mfkey_results_[static_cast<size_t>(mfkey_result_idx_)];
                 if (!res.key_hex.empty()) {
                     std::string err;
-                    if (service_.import_mfkey_result(res, &err)) {
+                    bool added = false;
+                    if (service_.import_mfkey_result(res, &err, &added)) {
                         refresh_mifare_keys();
-                        show_toast("Saved");
-                        ui_message_ = "Key imported to MIFARE Keys";
+                        show_toast(added ? "Saved" : "Key already exists");
+                        ui_message_ = added ? "Key imported to MIFARE Keys" : "Key already exists";
                     } else {
                         ui_message_ = err;
                     }

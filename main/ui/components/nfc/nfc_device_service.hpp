@@ -158,6 +158,7 @@ public:
         stop_uhf_continuous_scan();
         cancel_hw_upload_.store(true);
         cancel_hw_mfkey_.store(true);
+        if (staticnested_thread_.joinable()) staticnested_thread_.join();
         if (nfc_unit_emu_start_thread_.joinable()) nfc_unit_emu_start_thread_.join();
         stop_nfcunit_emulation_worker(false);
         stop_spi_emulation_worker(false);
@@ -3124,6 +3125,12 @@ public:
         if (normalized.created_at.empty()) normalized.created_at = iso8601_now();
         if (normalized.source.empty()) normalized.source = "manual";
 
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (static_cast<int>(i) != index && normalize_mifare_key_hex(keys[i].key_hex) == normalized.key_hex) {
+                if (err) *err = "Key already exists";
+                return false;
+            }
+        }
         if (index < 0 || index >= static_cast<int>(keys.size())) keys.push_back(normalized);
         else keys[index] = normalized;
 
@@ -3482,6 +3489,178 @@ public:
         return client.sniff_enter_mode(with_card);
     }
 
+    std::thread staticnested_thread_;
+    std::atomic<bool> staticnested_running_{false};
+    bool staticnested_running() const { return staticnested_running_.load(); }
+    std::string staticnested_status_;
+
+    std::string staticnested_status() const {
+        std::lock_guard<std::mutex> lock(pending_log_mutex_);
+        return staticnested_status_;
+    }
+    void cancel_staticnested() { cancel_hw_mfkey_.store(true); }
+
+    bool start_staticnested() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!connection_.connected || connection_.device_kind != DeviceKind::PN532Killer ||
+                scan_.running || emu_dump_running_) return false;
+        }
+        {
+            std::lock_guard<std::mutex> lock(pending_log_mutex_);
+            if (hw_mfkey_running_ || hw_upload_running_) return false;
+        }
+        if (staticnested_thread_.joinable()) staticnested_thread_.join();
+        {
+            std::lock_guard<std::mutex> lock(pending_log_mutex_);
+            hw_mfkey_running_ = true; hw_mfkey_progress_ = 0;
+            hw_mfkey_results_.clear(); staticnested_status_ = "Scanning card";
+        }
+        cancel_hw_mfkey_.store(false);
+        staticnested_running_.store(true);
+        staticnested_thread_ = std::thread([this]() { perform_staticnested(); });
+        return true;
+    }
+
+    void perform_staticnested() {
+        std::vector<MfkeyResult> results;
+        std::string status;
+        std::string verified_uid;
+        auto update = [&](const std::string &text, int progress) {
+            std::lock_guard<std::mutex> lock(pending_log_mutex_);
+            staticnested_status_ = text; hw_mfkey_progress_ = progress;
+        };
+        auto work = [&]() {
+            std::lock_guard<std::mutex> op(transport_op_mutex_);
+            if (!transport_ || !transport_->is_open()) { status = "Reader disconnected"; return; }
+            const auto helper = std::string(hal_path_mfkey_bin_dir()) + "/staticnested";
+            if (::access(helper.c_str(), X_OK) != 0) { status = "Staticnested helper missing"; return; }
+            Pn532KillerClient client(transport_.get());
+            if (!client.set_work_mode(1, 1, 0, &status)) return;
+            TagInfo tag;
+            if (!client.in_list_passive_target_iso14443a(&tag, &status)) return;
+            verified_uid = tag.uid;
+            const auto sak = tag.identity_fields["SAK"];
+            const int sectors = sak == "18" ? 40 : (sak == "19" ? 32 : (sak == "08" ? 16 : (sak == "09" ? 5 : 0)));
+            if (!sectors) { status = "Not a supported Classic card"; return; }
+            std::vector<uint8_t> uid;
+            if (!parse_hex_bytes(tag.uid, &uid) || uid.size() < 4) { status = "Invalid card UID"; return; }
+            const uint8_t *uid4 = uid.data() + uid.size() - 4;
+            const uint32_t authuid = (uint32_t(uid4[0])<<24)|(uint32_t(uid4[1])<<16)|(uint32_t(uid4[2])<<8)|uid4[3];
+            auto trailer = [](int sector) { return uint8_t(sector < 32 ? sector*4+3 : 128+(sector-32)*16+15); };
+            bool card_available = true;
+            auto verify = [&](int sector, bool key_b, const std::vector<uint8_t> &key) {
+                card_available = false;
+                // Cards can briefly disappear after a failed authentication.
+                // Retry selection before reporting removal, but never accept a different UID.
+                for (int attempt=0; attempt<3 && !cancel_hw_mfkey_.load(); ++attempt) {
+                    TagInfo current;
+                    if (client.in_list_passive_target_iso14443a(&current, nullptr)) {
+                        if (current.uid != tag.uid) return false;
+                        card_available = true;
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+                }
+                return card_available && client.mf_authenticate(trailer(sector), key_b, key.data(), uid4, nullptr);
+            };
+            auto dictionary = storage_.load_mifare_keys();
+            // The saved result list and the default .dic are separate sources.
+            // Dictionary lines have no key type, so try both A and B.
+            storage_.ensure_default_key_file();
+            auto defaults = NfcStorage::default_mifare_keys();
+            for (const auto &key : storage_.load_key_file("mfc_default.dic")) {
+                for (const auto type : {MifareKeyType::KeyA, MifareKeyType::KeyB}) {
+                    defaults.push_back({"Default dictionary", key, type, true, "default", ""});
+                }
+            }
+            // Preserve saved entries, including explicit disables.
+            for (const auto &entry : defaults) {
+                const auto existing = std::find_if(dictionary.begin(),dictionary.end(),[&](const MifareKeyRecord &r) {
+                    return keep_hex_chars_upper(r.key_hex)==entry.key_hex;
+                });
+                if (existing==dictionary.end()) dictionary.push_back(entry);
+            }
+            std::vector<MfkeyResult> known;
+            // Try every enabled dictionary key for both authentication roles.
+            for (int sector=0; sector<sectors && !cancel_hw_mfkey_.load(); ++sector) {
+                for (int kb=0; kb<2 && !cancel_hw_mfkey_.load(); ++kb) {
+                    update("Dictionary S" + std::to_string(sector) + (kb ? " B" : " A"), sector*40/sectors);
+                    for (const auto &entry : dictionary) {
+                        if (cancel_hw_mfkey_.load()) break;
+                        if (!entry.enabled) continue;
+                        std::vector<uint8_t> key;
+                        if (!parse_hex_bytes(entry.key_hex, &key) || key.size()!=6) continue;
+                        if (verify(sector, kb, key)) { known.push_back({authuid,uint8_t(sector),uint8_t(kb),entry.key_hex}); results.push_back(known.back()); break; }
+                        if (!card_available) { status=cancel_hw_mfkey_.load() ? "Cancelled; partial results" : "Card removed or changed; partial results"; return; }
+                    }
+                }
+            }
+            if (known.empty()) { status = "No dictionary key authenticated"; return; }
+            bool unsupported = false, probe_ok = false, probe_failed = false;
+            for (int sector=0; sector<sectors && !cancel_hw_mfkey_.load(); ++sector) {
+                for (int kb=0; kb<2 && !cancel_hw_mfkey_.load(); ++kb) {
+                    auto found = std::find_if(known.begin(), known.end(), [&](const MfkeyResult &r) { return r.sector==sector && r.key_type==kb; });
+                    if (found != known.end()) continue;
+                    MfkeyResult recovered{authuid,uint8_t(sector),uint8_t(kb),{}};
+                    update("Staticnested S" + std::to_string(sector) + (kb ? " B" : " A"), 40+(sector*2+kb)*60/(sectors*2));
+                    std::set<std::string> attempted_seeds;
+                    if (!unsupported) for (const auto &seed : known) {
+                        if (!attempted_seeds.insert(seed.key_hex + std::to_string(seed.key_type)).second) continue;
+                        if (cancel_hw_mfkey_.load()) break;
+                        std::vector<uint8_t> key, session;
+                        parse_hex_bytes(seed.key_hex, &key);
+                        if (!verify(seed.sector, seed.key_type, key)) {
+                            if (!card_available) { status=cancel_hw_mfkey_.load() ? "Cancelled; partial results" : "Card removed or changed; partial results"; return; }
+                            continue;
+                        }
+                        if (!client.staticnested_probe(key,trailer(seed.sector),seed.key_type?0x61:0x60,trailer(sector),kb?0x61:0x60,&session,nullptr)) { probe_failed=true; continue; }
+                        auto be = [&](int i) { return (uint32_t(session[i])<<24)|(uint32_t(session[i+1])<<16)|(uint32_t(session[i+2])<<8)|session[i+3]; };
+                        if (be(0)!=authuid || session[4]!=(kb?0x61:0x60)) { probe_failed=true; continue; }
+                        probe_ok=true;
+                        if (be(5)!=0x01200145 && be(5)!=0x009080A2) { unsupported=true; break; }
+                        char args[160];
+                        std::snprintf(args,sizeof(args)," 0x%08x 0x%02x 0x%08x 0x%08x 0x%08x 0x%08x 2>&1",authuid,kb?0x61:0x60,be(5),be(9),be(13),be(17));
+                        const std::string output = run_cmd_capture(("timeout 25s \""+helper+"\""+args).c_str());
+                        std::istringstream lines(output); std::string line;
+                        while (std::getline(lines,line)) {
+                            const auto pos=line.find("... "); if(pos==std::string::npos) continue;
+                            std::istringstream value(line.substr(pos+4)); std::string candidate; value>>candidate;
+                            if(candidate.empty() || candidate.size()>12 || !std::all_of(candidate.begin(),candidate.end(),[](unsigned char c){return std::isxdigit(c);})) continue;
+                            candidate=std::string(12-candidate.size(),'0')+candidate;
+                            std::vector<uint8_t> bytes; parse_hex_bytes(candidate,&bytes);
+                            if(verify(sector,kb,bytes)) { recovered.key_hex=keep_hex_chars_upper(candidate); break; }
+                        }
+                        if(!recovered.key_hex.empty()) break;
+                    }
+                    if(!recovered.key_hex.empty()) known.push_back(recovered);
+                    results.push_back(recovered);
+                }
+            }
+            // Preserve dictionary results even when the user cancels.
+            for (const auto &r : known) if (std::none_of(results.begin(),results.end(),[&](const MfkeyResult &v){return r.sector==v.sector && r.key_type==v.key_type;})) results.push_back(r);
+            status = cancel_hw_mfkey_.load() ? "Cancelled; partial results" : (unsupported ? "Non-static nonce; dictionary only" : ((!probe_ok && probe_failed) ? "Probe failed; check card/firmware" : "Verified " + std::to_string(known.size()) + "/" + std::to_string(sectors*2) + " keys"));
+        };
+        try { work(); } catch (const std::exception &e) { status=e.what(); }
+        if (!verified_uid.empty()) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto &key_map = mifare_read_key_maps_[verified_uid];
+            for (const auto &result : results) {
+                std::vector<uint8_t> key;
+                if (!parse_hex_bytes(result.key_hex, &key) || key.size() != 6) continue;
+                auto found = std::find_if(key_map.begin(), key_map.end(), [&](const MifareSectorKey &entry) {
+                    return entry.sector == result.sector && entry.key_b == bool(result.key_type);
+                });
+                if (found == key_map.end()) key_map.push_back({result.sector, bool(result.key_type), key});
+                else found->key = key;
+            }
+        }
+        std::sort(results.begin(),results.end(),[](const MfkeyResult &a,const MfkeyResult &b) { return std::tie(a.sector,a.key_type)<std::tie(b.sector,b.key_type); });
+        std::lock_guard<std::mutex> lock(pending_log_mutex_);
+        hw_mfkey_results_=std::move(results); staticnested_status_=status;
+        hw_mfkey_progress_=100; hw_mfkey_running_=false; staticnested_running_.store(false);
+    }
+
     bool hw_start_mfkey_async(bool with_card)
     {
         std::lock_guard<std::mutex> lk(pending_log_mutex_);
@@ -3516,19 +3695,23 @@ public:
     }
 
     // Import a cracked MFKey result into the internal MIFARE keys JSON.
-    bool import_mfkey_result(const MfkeyResult &res, std::string *err = nullptr)
+    bool import_mfkey_result(const MfkeyResult &res, std::string *err = nullptr, bool *imported = nullptr)
     {
+        if (imported) *imported = false;
         if (res.key_hex.size() != 12) { if (err) *err = "No key"; return false; }
+        const std::string normalized = normalize_mifare_key_hex(res.key_hex);
+        for (const auto &existing : storage_.load_mifare_keys()) {
+            // Saved keys are a dictionary: identity is only the key value.
+            if (normalize_mifare_key_hex(existing.key_hex) == normalized) return true;
+        }
         MifareKeyRecord rec;
-        char buf[64];
-        std::snprintf(buf, sizeof(buf), "MFKey s%02u%c",
-                      static_cast<unsigned>(res.sector), res.key_type == 0 ? 'A' : 'B');
-        rec.label    = buf;
+        rec.label    = "MFKey";
         rec.key_hex  = res.key_hex;
-        rec.type     = (res.key_type == 0) ? MifareKeyType::KeyA : MifareKeyType::KeyB;
         rec.enabled  = true;
         rec.source   = "mfkey";
-        return upsert_mifare_key(-1, rec, err);
+        if (!upsert_mifare_key(-1, rec, err)) return false;
+        if (imported) *imported = true;
+        return true;
     }
 
     std::vector<SavedRecord> list_saved_records() const
@@ -6460,10 +6643,8 @@ private:
             const std::string protocol = to_string(tag.protocol);
             const std::string uid = tag.uid;
             const std::string type = tag.tag_type;
-            push_log("Result: Tag Found");
-            push_log(std::string("Protocol: ") + protocol);
+            push_log(std::string("Type: ") + (type.empty() ? protocol : type));
             push_log("UID: " + uid);
-            if (!type.empty()) push_log("Type: " + type);
 
             if (tag.protocol == ProtocolKind::Iso15693) {
                 const std::string afi = normalize_identity_hex(find_identity(tag, "AFI"));
@@ -7260,10 +7441,12 @@ private:
                         } else if (!handled && record.tag.protocol == ProtocolKind::MifareClassic) {
                             std::vector<std::string> mfc_blocks;
                             bool mfc_read_ok = false;
-                            const int sc = (record.tag.tag_type.find("4K") != std::string::npos) ? 40 : 16;
+                            const int sc = record.tag.tag_type.find("Mini") != std::string::npos ? 5 :
+                                (record.tag.tag_type.find("2K") != std::string::npos ? 32 :
+                                (record.tag.tag_type.find("4K") != std::string::npos ? 40 : 16));
 
-                            if (device_kind == DeviceKind::PN532 ||
-                                device_kind == DeviceKind::PN532Killer) {
+                            if ((device_kind == DeviceKind::PN532 || device_kind == DeviceKind::PN532Killer) &&
+                                (base_record.tag.magic_type.empty() || base_record.tag.magic_type == "Gen1A")) {
                                 std::string magic_err;
                                 // Keep the same probe order as scan path to reduce duplicate HALT logs.
                                 if (client.is_gen3(&magic_err, &live_tag)) {
@@ -7282,17 +7465,33 @@ private:
                                 }
                             }
 
-                            if (record.tag.magic_type.empty() || record.tag.magic_type == "Gen3" ||
-                                record.tag.magic_type == "Gen4") {
-                                push_log("> Reading MFC blocks (default keys)...");
+                            if (record.tag.magic_type != "Gen1A") {
+                                push_log("> Reading MFC blocks (saved + dictionary keys)...");
                                 std::vector<uint8_t> uid_bytes;
                                 for (size_t i = 0; i + 1 < live_tag.uid.size(); i += 2) {
                                     uid_bytes.push_back(static_cast<uint8_t>(
                                         std::stoi(live_tag.uid.substr(i, 2), nullptr, 16)));
                                 }
+                                std::vector<std::string> dictionary;
+                                for (const auto &entry : storage_.load_mifare_keys()) {
+                                    if (entry.enabled) dictionary.push_back(entry.key_hex);
+                                }
+                                for (const auto &filename : storage_.list_key_files()) {
+                                    const auto keys = storage_.load_key_file(filename);
+                                    dictionary.insert(dictionary.end(), keys.begin(), keys.end());
+                                }
+                                std::vector<MifareSectorKey> key_map;
+                                {
+                                    std::lock_guard<std::mutex> lock(mutex_);
+                                    key_map = mifare_read_key_maps_[live_tag.uid];
+                                }
                                 std::string mfc_err;
                                 mfc_read_ok = client.read_mifare_standard(uid_bytes, sc, &mfc_blocks, &mfc_err,
-                                    [this](const std::string &line) { push_log(line); });
+                                    [this](const std::string &line) { push_log(line); }, dictionary, &key_map);
+                                {
+                                    std::lock_guard<std::mutex> lock(mutex_);
+                                    mifare_read_key_maps_[live_tag.uid] = std::move(key_map);
+                                }
                                 if (!mfc_read_ok && !mfc_err.empty()) error = mfc_err;
                             }
 
@@ -7307,7 +7506,7 @@ private:
                                 record.mifare_dump->attack.dump_obtained = true;
                                 record.tag.raw_data = mfc_blocks;
                                 success = true;
-                            } else if (!record.tag.block_log.empty()) {
+                            } else if (record.tag.magic_type == "Gen1A" && !record.tag.block_log.empty()) {
                                 record.mifare_dump->blocks_hex.assign(record.mifare_dump->block_count, "");
                                 for (const auto &line : record.tag.block_log) {
                                     if (line.size() >= 4 && line[2] == ':') {
@@ -7803,6 +8002,7 @@ private:
     std::vector<uint8_t> nfc_unit_ntag_mem_;
     mutable std::mutex nfc_unit_mfkey_mutex_;
     std::vector<NfcUnitMfkeyEntry> nfc_unit_mfkey_entries_;
+    std::map<std::string, std::vector<MifareSectorKey>> mifare_read_key_maps_; // guarded by mutex_
     std::vector<std::string> mifare_keys_hex_list_;  // MFC key list for auth (dump + write)
     std::string mfkey_sniff_uid_hex_ = "11223344";
     static constexpr uint32_t kNfcUnitMfc1kUid = 0x11223344;

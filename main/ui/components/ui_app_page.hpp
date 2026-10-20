@@ -82,7 +82,8 @@ private:
 class app_base : public app_
 {
 private:
-    lv_obj_t *ui_TOP_logo;
+    lv_obj_t *ui_TOP_app_name_bold;
+    lv_obj_t *ui_TOP_app_name;
     lv_obj_t *ui_TOP_time;
     lv_obj_t *ui_TOP_time_Label;
     lv_obj_t *ui_TOP_SignalStrength;
@@ -167,7 +168,10 @@ public:
 
     void set_page_title(const std::string &title)
     {
-        (void)title;
+        const auto separator = title.find(" >");
+        const std::string name = title.substr(0, separator);
+        lv_label_set_text(ui_TOP_app_name, name.c_str());
+        lv_label_set_text(ui_TOP_app_name_bold, name.c_str());
     }
 
 private:
@@ -176,15 +180,17 @@ private:
     /* ================================================================== */
     void creat_Top_UI()
     {
-        ui_TOP_logo = lv_image_create(ui_root);
-        lv_image_set_src(ui_TOP_logo, "A:share/images/launcher_brand_logo.png");
-        lv_obj_set_width(ui_TOP_logo, LV_SIZE_CONTENT);
-        lv_obj_set_height(ui_TOP_logo, LV_SIZE_CONTENT);
-        lv_obj_set_x(ui_TOP_logo, 5);
-        lv_obj_set_y(ui_TOP_logo, 5);
-        lv_obj_add_flag(ui_TOP_logo, LV_OBJ_FLAG_ADV_HITTEST);
-        lv_obj_clear_flag(ui_TOP_logo, LV_OBJ_FLAG_SCROLLABLE);
-
+        ui_TOP_app_name = lv_label_create(ui_root);
+        lv_obj_set_pos(ui_TOP_app_name, 5, 4);
+        lv_obj_set_style_text_font(ui_TOP_app_name, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(ui_TOP_app_name, lv_color_hex(0xF7A600), 0);
+        lv_label_set_text(ui_TOP_app_name, "RFID");
+        // One-pixel horizontal overprint gives the small bitmap title a heavier weight.
+        ui_TOP_app_name_bold = lv_label_create(ui_root);
+        lv_obj_set_pos(ui_TOP_app_name_bold, 6, 4);
+        lv_obj_set_style_text_font(ui_TOP_app_name_bold, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(ui_TOP_app_name_bold, lv_color_hex(0xF7A600), 0);
+        lv_label_set_text(ui_TOP_app_name_bold, "RFID");
 
         ui_TOP_time = lv_obj_create(ui_root);
         lv_obj_set_width(ui_TOP_time, 40);

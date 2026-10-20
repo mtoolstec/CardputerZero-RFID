@@ -24,6 +24,12 @@ struct Pn532FirmwareInfo {
     uint8_t     day   = 0;    // PN532Killer: day byte from GetFirmwareVersion response
 };
 
+struct MifareSectorKey {
+    int sector;
+    bool key_b;
+    std::vector<uint8_t> key;
+};
+
 class Pn532FrameCodec {
 public:
     static std::vector<uint8_t> build_command(uint8_t command, const std::vector<uint8_t> &payload = {})
@@ -332,6 +338,37 @@ public:
             result.push_back(e);
         }
         return result;
+    }
+
+    // PN532Killer ReadUserDefData (0x24), matching pn532-python.
+    // Output is UID, target key type, then two big-endian nonce/keystream pairs.
+    bool staticnested_probe(const std::vector<uint8_t> &key, uint8_t known_block,
+                            uint8_t known_type, uint8_t target_block, uint8_t target_type,
+                            std::vector<uint8_t> *session, std::string *error)
+    {
+        if (key.size() != 6) return false;
+        std::vector<uint8_t> payload = {1, 0, 0};
+        payload.insert(payload.end(), key.begin(), key.end());
+        payload.insert(payload.end(), {known_block, known_type, target_block, target_type});
+        const auto frame = Pn532FrameCodec::build_command(0x24, payload);
+        if (transport_->write_bytes(frame.data(), frame.size(), error) != static_cast<ssize_t>(frame.size())) return false;
+        std::vector<uint8_t> rx, data;
+        if (!collect_response(&rx, error, 0x25) || !Pn532FrameCodec::parse_first_frame(rx, &data) || data.size() < 23) {
+            if (error) *error = "Staticnested unsupported or probe failed";
+            return false;
+        }
+        // Firmware variants return either 21 session bytes or a status byte
+        // followed by those bytes. The current device uses the status prefix.
+        size_t offset = 2;
+        if (data.size() == 24) {
+            if (data[2] != 0) { if (error) *error = "Staticnested probe rejected"; return false; }
+            offset = 3;
+        } else if (data.size() != 23) {
+            if (error) *error = "Invalid Staticnested session length";
+            return false;
+        }
+        session->assign(data.begin() + offset, data.begin() + offset + 21);
+        return true;
     }
 
     // ── PN532 target emulation commands (Type 4 Tag style) ─────────────────
@@ -1432,14 +1469,14 @@ public:
     // data: command bytes for the target (e.g. auth or read).
     // resp_data: output — response bytes AFTER the status byte (empty on error).
     bool in_data_exchange(uint8_t tg, const std::vector<uint8_t> &data,
-                          std::vector<uint8_t> *resp_data, std::string *error)
+                          std::vector<uint8_t> *resp_data, std::string *error, int response_polls = 25)
     {
         std::vector<uint8_t> payload = {tg};
         payload.insert(payload.end(), data.begin(), data.end());
         const std::vector<uint8_t> frame = Pn532FrameCodec::build_command(0x40, payload);
         if (transport_->write_bytes(frame.data(), frame.size(), error) < 0) return false;
         std::vector<uint8_t> rx;
-        if (!collect_response(&rx, error)) return false;
+        if (!collect_response(&rx, error, 0x41, response_polls)) return false;
         std::vector<uint8_t> fd;
         if (!Pn532FrameCodec::parse_first_frame(rx, &fd) ||
             fd.size() < 3 || fd[0] != 0xD5 || fd[1] != 0x41) {
@@ -1479,7 +1516,7 @@ public:
     bool mf_read_block_auth(uint8_t block, std::vector<uint8_t> *block_data, std::string *error)
     {
         std::vector<uint8_t> resp;
-        if (!in_data_exchange(0x01, {0x30, block}, &resp, error)) return false;
+        if (!in_data_exchange(0x01, {0x30, block}, &resp, error, 5)) return false;
         if (resp.size() < 16) {
             if (error) *error = "short block response";
             return false;
@@ -1588,17 +1625,20 @@ public:
 
     // Read all sectors of a standard (non-magic) Mifare Classic card
     // using a set of well-known default keys.
-    // uid4: first 4 bytes of UID as raw bytes.
+    // uid4: full UID bytes; authentication uses the last four bytes.
     // sector_count: 16 for 1K, 40 for 4K (sectors 32-39 each have 16 blocks).
     // blocks_hex: output vector (one hex string per block, empty string for failed reads).
     // on_line: optional progress callback.
-    // Returns true if at least one block was read successfully.
+    // Returns true only when every block was read successfully.
     bool read_mifare_standard(const std::vector<uint8_t> &uid4,
                               int sector_count,
                               std::vector<std::string> *blocks_hex,
                               std::string *error,
-                              std::function<void(const std::string &)> on_line = nullptr)
+                              std::function<void(const std::string &)> on_line = nullptr,
+                              const std::vector<std::string> &dictionary = {},
+                              std::vector<MifareSectorKey> *key_map = nullptr)
     {
+        const auto started = std::chrono::steady_clock::now();
         // Common default keys to try (Key A then Key B)
         static const uint8_t DEFAULT_KEYS[][6] = {
             {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},
@@ -1606,11 +1646,24 @@ public:
             {0xD3, 0xF7, 0xD3, 0xF7, 0xD3, 0xF7},
             {0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
         };
-        static const int NUM_KEYS = 4;
+        std::vector<std::vector<uint8_t>> keys = {{255,255,255,255,255,255}};
+        for (const auto &hex : dictionary) {
+            if (hex.size() != 12) continue;
+            std::vector<uint8_t> key;
+            for (size_t i = 0; i < hex.size(); i += 2) {
+                if (!std::isxdigit(static_cast<unsigned char>(hex[i])) || !std::isxdigit(static_cast<unsigned char>(hex[i+1]))) break;
+                key.push_back(static_cast<uint8_t>(std::strtoul(hex.substr(i, 2).c_str(), nullptr, 16)));
+            }
+            if (key.size() == 6 && std::find(keys.begin(), keys.end(), key) == keys.end()) keys.push_back(key);
+        }
+        for (const auto &fallback : DEFAULT_KEYS) {
+            std::vector<uint8_t> key(fallback, fallback + 6);
+            if (std::find(keys.begin(), keys.end(), key) == keys.end()) keys.push_back(key);
+        }
 
         uint8_t uid4_arr[4] = {0};
         for (int i = 0; i < 4 && i < static_cast<int>(uid4.size()); ++i)
-            uid4_arr[i] = uid4[i];
+            uid4_arr[i] = uid4[(uid4.size() > 4 ? uid4.size() - 4 : 0) + i];
 
         // Mifare Classic 4K: sectors 0-31 have 4 blocks, sectors 32-39 have 16 blocks.
         // For 1K: 16 sectors × 4 blocks = 64 total.
@@ -1620,6 +1673,13 @@ public:
 
         auto emit = [&](const std::string &s) { if (on_line) on_line(s); };
         int ok_count = 0;
+        auto select_card = [&]() {
+            for (int attempt = 0; attempt < 3; ++attempt) {
+                if (reselect_card_lightweight(nullptr)) return true;
+                std::this_thread::sleep_for(std::chrono::milliseconds(60));
+            }
+            return false;
+        };
 
         for (int s = 0; s < sector_count; ++s) {
             const uint8_t first_block = (s < 32) ? static_cast<uint8_t>(s * 4)
@@ -1627,18 +1687,39 @@ public:
             const int blocks_in_sector = (s < 32) ? 4 : 16;
             bool auth_ok = false;
             std::string auth_err;
+            std::vector<uint8_t> sector_key;
+            bool sector_key_b = false;
 
-            // Try Key A then Key B for each default key
-            for (int kb = 0; kb < 2 && !auth_ok; ++kb) {
-                for (int ki = 0; ki < NUM_KEYS && !auth_ok; ++ki) {
-                    if (mf_authenticate(first_block, kb != 0,
-                                        DEFAULT_KEYS[ki], uid4_arr, &auth_err)) {
+            // First use this UID's previously verified sector key, then the dictionary.
+            std::vector<MifareSectorKey> candidates;
+            if (key_map) for (const auto &entry : *key_map) {
+                if (entry.sector == s && entry.key.size() == 6) candidates.push_back(entry);
+            }
+            for (int kb = 0; kb < 2; ++kb) for (const auto &key : keys) {
+                if (std::none_of(candidates.begin(), candidates.end(), [&](const MifareSectorKey &entry) {
+                    return entry.key_b == bool(kb) && entry.key == key;
+                })) candidates.push_back({s, bool(kb), key});
+            }
+            for (const auto &candidate : candidates) {
+                // A transient RF failure must not discard a verified/default key
+                // and trigger an entire dictionary traversal.
+                const int attempts = (&candidate == &candidates.front()) ? 3 : 1;
+                for (int retry = 0; retry < attempts && !auth_ok; ++retry) {
+                    if (!select_card()) continue;
+                    if (mf_authenticate(first_block, candidate.key_b, candidate.key.data(), uid4_arr, &auth_err)) {
                         auth_ok = true;
-                    } else {
-                        // Failed auth: re-select the card before trying next key
-                        if (!reselect_card_lightweight(nullptr)) break;
+                        sector_key = candidate.key;
+                        sector_key_b = candidate.key_b;
                     }
                 }
+                if (auth_ok) break;
+            }
+            if (auth_ok && key_map) {
+                auto entry = std::find_if(key_map->begin(), key_map->end(), [&](const MifareSectorKey &entry) {
+                    return entry.sector == s && entry.key_b == sector_key_b;
+                });
+                if (entry == key_map->end()) key_map->push_back({s, sector_key_b, sector_key});
+                else entry->key = sector_key;
             }
 
             if (!auth_ok) {
@@ -1648,42 +1729,71 @@ public:
                 continue;
             }
 
-            // Read all blocks of this sector
-            for (int b = 0; b < blocks_in_sector; ++b) {
-                const uint8_t blk = static_cast<uint8_t>(first_block + b);
-                std::vector<uint8_t> bdata;
-                std::string berr;
-                if (mf_read_block_auth(blk, &bdata, &berr)) {
-                    std::string hex;
-                    hex.reserve(32);
-                    for (uint8_t byte : bdata) {
-                        char hb[3];
-                        std::snprintf(hb, sizeof(hb), "%02X", byte);
-                        hex += hb;
+            // Retry only missing blocks after the first pass, preserving good data.
+            std::vector<bool> completed(blocks_in_sector, false);
+            for (int pass = 0; pass < 2; ++pass) {
+                if (pass > 0) {
+                    if (std::all_of(completed.begin(), completed.end(), [](bool done) { return done; })) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+                for (int b = 0; b < blocks_in_sector; ++b) {
+                    if (completed[b]) continue;
+                    const uint8_t blk = static_cast<uint8_t>(first_block + b);
+                    std::vector<uint8_t> bdata;
+                    std::string berr;
+                    bool read_ok = false;
+                    for (int attempt = 0; attempt < 3 && !read_ok; ++attempt) {
+                        if (attempt > 0 || pass > 0) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+                            if (!select_card() ||
+                                !mf_authenticate(first_block, sector_key_b, sector_key.data(), uid4_arr, &berr)) continue;
+                        }
+                        // Leave a small firmware turnaround gap; silent block reads
+                        // use a bounded 500ms timeout rather than the generic 2.5s.
+                        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                        read_ok = mf_read_block_auth(blk, &bdata, &berr);
                     }
-                    if (blocks_hex && blk < static_cast<uint8_t>(blocks_hex->size()))
-                        (*blocks_hex)[blk] = hex;
-                    ++ok_count;
-                    char buf[48];
-                    std::snprintf(buf, sizeof(buf), "%02d:%s", blk, hex.c_str());
-                    emit(buf);
-                } else {
-                    char buf[40];
-                    std::snprintf(buf, sizeof(buf), "ERR blk%02d: %s", blk, berr.c_str());
-                    emit(buf);
-                    // Re-authenticate for next block attempt
-                    reselect_card_lightweight(nullptr);
-                    for (int kb = 0; kb < 2 && !mf_authenticate(first_block, kb != 0,
-                             DEFAULT_KEYS[0], uid4_arr, nullptr); ++kb) {}
+                    if (read_ok) {
+                        // Trailer key fields can be masked by the card. Substitute only
+                        // the field whose key actually authenticated this sector.
+                        if (b == blocks_in_sector - 1 && bdata.size() == 16) {
+                            const size_t offset = sector_key_b ? 10 : 0;
+                            if (std::all_of(bdata.begin() + offset, bdata.begin() + offset + 6,
+                                            [](uint8_t value) { return value == 0; }))
+                                std::copy(sector_key.begin(), sector_key.end(), bdata.begin() + offset);
+                        }
+                        std::string hex;
+                        hex.reserve(32);
+                        for (uint8_t byte : bdata) {
+                            char hb[3];
+                            std::snprintf(hb, sizeof(hb), "%02X", byte);
+                            hex += hb;
+                        }
+                        if (blocks_hex && static_cast<size_t>(blk) < blocks_hex->size())
+                            (*blocks_hex)[blk] = hex;
+                        completed[b] = true;
+                        ++ok_count;
+                        char buf[48];
+                        std::snprintf(buf, sizeof(buf), "%02d:%s", blk, hex.c_str());
+                        emit(buf);
+                    } else {
+                        char buf[40];
+                        std::snprintf(buf, sizeof(buf), "ERR blk%02d: %s", blk, berr.c_str());
+                        if (pass > 0) emit(buf);
+                        // Re-authenticate for next block attempt
+                        reselect_card_lightweight(nullptr);
+                        mf_authenticate(first_block, sector_key_b, sector_key.data(), uid4_arr, nullptr);
+                    }
                 }
             }
         }
-
-        char result[48];
-        std::snprintf(result, sizeof(result), "OK %d/%d blocks", ok_count, total_blocks);
+        char result[64];
+        std::snprintf(result, sizeof(result), "%s %d/%d blocks %.1fs",
+            ok_count == total_blocks ? "OK" : "ERR incomplete", ok_count, total_blocks,
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
         emit(result);
-        if (error && ok_count == 0) *error = "all sectors locked";
-        return ok_count > 0;
+        if (error && ok_count != total_blocks) *error = "Incomplete dump: " + std::to_string(ok_count) + "/" + std::to_string(total_blocks) + " blocks";
+        return ok_count == total_blocks;
     }
 
     // InListPassiveTarget for ISO15693 (brTy=0x05): scan for ISO 15693 tags.
@@ -2039,13 +2149,13 @@ private:
         }
     }
 
-    bool collect_response(std::vector<uint8_t> *rx, std::string *error, uint8_t expected_command = 0)
+    bool collect_response(std::vector<uint8_t> *rx, std::string *error, uint8_t expected_command = 0, int response_polls = 25)
     {
         rx->clear();
         uint8_t buffer[128];
         // 25 attempts × 100ms = 2500ms maximum, matching Python's read_until(max_sec=2.0).
         // macOS WCH CH340 driver needs continuous select() polling to deliver USB IN data.
-        for (int attempt = 0; attempt < 25; ++attempt) {
+        for (int attempt = 0; attempt < response_polls; ++attempt) {
             ssize_t got = transport_->read_bytes(buffer, sizeof(buffer), 100, error);
             if (got < 0) return false;
             if (got == 0) continue;

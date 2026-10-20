@@ -7,7 +7,7 @@ NFC tags across multiple hardware devices.
 
 ## Device Feature Matrix
 
-完整中文横向功能列表见 [外接设备功能对比](FEATURE_MATRIX.md)。以下旧版概览仅供参考，以该列表和实际代码限制为准。
+按 LF / HF / UHF 分类的中文功能列表见 [外接设备功能对比](FEATURE_MATRIX.md)。以下旧版概览仅供参考，以该列表和实际代码限制为准。
 
 | Device | Interface | Scan | Read / Dump | Write (UID) | Emulate | Sniff | UHF | NDEF | Key Mgmt |
 |--------|-----------|:----:|:-----------:|:-----------:|:-------:|:-----:|:---:|:----:|:--------:|
@@ -15,7 +15,7 @@ NFC tags across multiple hardware devices.
 | **PN532 (standard)** | USB / UART | ✅ | ✅ MFC/NTAG/15693 | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ |
 | **PN532 Module** | UART | ✅ | ✅ MFC/NTAG/15693 | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
 | **M5 NFC Unit** | I²C (0x50) | ✅ | ✅ MFC/NTAG/15693 | ✅ Gen1A/3 | ✅ ISO14443A/B/15693/MFC | ❌ | ❌ | ❌ | ✅ |
-| **Grove NFC** | I²C (0x48) | ✅ | ✅ MFC/NTAG/15693/FeliCa | ❌ | ✅ NTAG/MFC1K/15693 | ❌ | ❌ | ❌ | ✅ |
+| **GroveNFC** | I²C (0x48) | ✅ | ✅ MFC/NTAG/15693/FeliCa | ❌ | ✅ NTAG/MFC1K/15693 | ❌ | ❌ | ❌ | ✅ |
 | **M5 NFC CAP** | SPI (spidev) | ✅ | ✅ MFC/NTAG | ✅ Gen1A | ✅ ISO14443A | ❌ | ❌ | ❌ | ✅ |
 | **UHF Reader** | USB (1A86:FE1C / 1A86:55D3 FZUHF) | ✅ | ✅ Continuous scan | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ |
 
@@ -27,7 +27,7 @@ NFC tags across multiple hardware devices.
 | **NTAG213 / 215 / 216** | ✅ | ✅ | ✅ | ❌ | NDEF read/write, emulation |
 | **MIFARE Ultralight** | ✅ | ✅ | ❌ | ❌ | Read/write full memory pages |
 | **ISO 15693** | ✅ | ✅ | ✅ | ❌ | Tag-it, I-Code SLI, ST LRI |
-| **FeliCa** | ✅ (GroveNFC) | ❌ | ❌ | ❌ | Limited to Grove NFC reader |
+| **FeliCa** | ✅ (GroveNFC) | ❌ | ❌ | ❌ | Limited to GroveNFC reader |
 | **DESFire** | ❌ | ❌ | ❌ | ❌ | Detected but not read |
 | **UHF RFID (EPC C1G2)** | ✅ | ✅ Memory banks | ❌ | ❌ | Inventory, CSV export, per-tag Reserved/EPC/TID/User capture |
 
@@ -54,8 +54,8 @@ NFC tags across multiple hardware devices.
 
 ### Emulator Tab
 - **PN532Killer HW Emulation** — up to 8 slots, ISO14443A / ISO15693 / MIFARE Classic
-- **Grove NFC Tag Emulation** — NTAG213/215/216, MFC1K, China2, ISO15693 via I²C register protocol
-- **NFC Unit (ST25R3916B) Emulation** — NFC-A / NTAG listener emulation (ISO15693 tag emulation requires Grove NFC)
+- **GroveNFC Tag Emulation** — NTAG213/215/216, MFC1K, China2, ISO15693 via I²C register protocol
+- **NFC Unit (ST25R3916B) Emulation** — NFC-A / NTAG listener emulation (ISO15693 tag emulation requires GroveNFC)
 - **M5 NFC CAP (ST25R3916) Emulation** — ISO14443A listener (REQA → anticollision → UID response)
 - **NDEF URL Emulation** — PN532-only: broadcast a custom NDEF URI/URL
 - **UID Changer** — rewrite block 0 of Gen1A / Gen2 (CUID) / Gen3 / Gen4 magic cards
@@ -69,12 +69,13 @@ NFC tags across multiple hardware devices.
 | **UID Changer** | Change UID on magic cards: detect Gen1A/Gen2(CUID)/Gen3/Gen4, write block 0 with custom UID |
 | **MFKey32v2** | Sniff MIFARE Classic authentication + crack keys via PN532Killer (no tag required) |
 | **MFKey64** | Sniff MIFARE Classic authentication + crack keys via PN532Killer (tag required for non-UID) |
+| **Staticnested** | PN532Killer: authenticate sectors A/B using built-in defaults plus enabled MIFARE Keys, then recover unknown static-nonce keys from a known seed and verify candidates |
 
 ## Attack / Cracking Methods
 
 | Method | Description | Supported On |
 |--------|-------------|--------------|
-| **Default Keys** | Try known default keys from key dictionary to authenticate sectors | PN532, PN532Killer, NFC Unit, Grove NFC, NFC CAP |
+| **Default Keys** | Try known default keys from key dictionary to authenticate sectors | PN532, PN532Killer, NFC Unit, GroveNFC, NFC CAP |
 | **Basic Auth Read** | Least-privilege: try keys only from selected dumps | PN532, PN532Killer |
 | **Darkside** | MFC authentication attack (for unknown keys) | PN532Killer |
 | **Hardnested** | Brute-force nested authentication attack | PN532Killer |
@@ -108,7 +109,7 @@ main/
 │   │   ├── nfc_models.hpp              # Enums (Protocol, Transport, DeviceKind, AttackMethod)
 │   │   ├── nfc_transport.hpp           # Serial / I²C / SPI transport abstraction
 │   │   ├── nfc_protocol.hpp            # PN532 frame codec, Pn532KillerClient, detect_device()
-│   │   ├── nfc_i2c_device.hpp          # Grove NFC / NFC Unit I²C driver (ST25R3916B)
+│   │   ├── nfc_i2c_device.hpp          # GroveNFC / NFC Unit I²C driver (ST25R3916B)
 │   │   ├── nfc_spi_device.hpp          # M5 NFC CAP SPI driver (ST25R3916)
 │   │   ├── nfc_device_service.hpp      # Main service: connect/scan/dump/emulate/crack/UHF
 │   │   ├── nfc_storage.hpp             # JSON dump/key/emulator config persistence
