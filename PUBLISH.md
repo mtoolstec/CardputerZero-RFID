@@ -70,3 +70,16 @@
 - Recovery executes successfully under the stock `pi` account. Intermittent panel-mode trigger remains unproven; no claim that the SPI root cause has been established.
 - Reported CAP zero-Key-A issue was not reproduced on the available card. Do not substitute guessed keys or advertise this separate issue as fixed.
 - SPI encrypted MFC 1K emulation remains experimental and disabled by default; kernel helper and development utilities are excluded from the store package.
+
+## 1.0.3 submission result
+
+- Source implementation commit: `d7906b8`, pushed to `origin/main`.
+- Package: `build/rfid_1.0.3-1_arm64.deb`; SHA-256 `29663d9f675543fe7b4a2046db3484d13e9d795231ff1bcdcd598906f7371a2e`.
+- Installed on device; launched from APPLaunch, clean double-Esc exit and relaunch passed. Stock-user journal confirms firmware mode 0x21 restored at startup, CAP operation completion and exit.
+- Current build physical Gen1A Saved write: `OK 64/64 blocks 2s`; independent 64-block comparison against the original backup passed.
+- NTAG antenna retest for this build awaits removal of the physical card; earlier successful NTAG tests are historical, not a new result for this build.
+- Web submission processing: https://github.com/CardputerZero/packages/actions/runs/39623014032 — success.
+- Release PR: https://github.com/CardputerZero/packages/pull/203 — merged `2026-10-21T15:08:57Z`, merge `05cee96aa2e7098951338390044afd5f93e74eb2`.
+- Published release descriptor's version, architecture and SHA-256 match the local package. Four existing store screenshots and the explicit icon are retained; uploader email hidden.
+- Separate PR validator https://github.com/CardputerZero/packages/actions/runs/39623067326 failed before jobs started, reported by GitHub CLI as a workflow-file issue; the web submission's package validation passed.
+- APT index deployment: https://github.com/CardputerZero/packages/actions/runs/39623080956 — success.
