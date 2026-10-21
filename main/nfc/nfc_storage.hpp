@@ -13,6 +13,7 @@
 #include <set>
 #include <string>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <vector>
 
 namespace nfc_app {
@@ -173,6 +174,11 @@ public:
         // Reorder blocks keys numerically (nlohmann::json sorts alphabetically by default)
         reorder_blocks_keys(document);
         output << document.dump(2);
+        output.close();
+        if (!output.good()) {
+            if (error) *error = "Failed to write record JSON";
+            return false;
+        }
         return true;
     }
 
@@ -476,6 +482,18 @@ public:
             nlohmann::json document;
             input >> document;
             keys = document.value("keys", std::vector<MifareKeyRecord>{});
+            // Older files stored separate A/B entries. Present one dictionary key.
+            std::vector<MifareKeyRecord> unique;
+            for (auto key : keys) {
+                for (char &ch : key.key_hex) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+                if (key.source == "mfkey" && key.label.rfind("MFKey s", 0) == 0) key.label = "MFKey";
+                auto found = std::find_if(unique.begin(), unique.end(), [&](const MifareKeyRecord &entry) {
+                    return entry.key_hex == key.key_hex;
+                });
+                if (found == unique.end()) unique.push_back(key);
+                else found->enabled = found->enabled || key.enabled;
+            }
+            keys = std::move(unique);
         } catch (...) {
             keys.clear();
         }
@@ -604,34 +622,6 @@ public:
         return true;
     }
 
-    static std::vector<std::string> default_key_dict_lines()
-    {
-        return {
-            "FFFFFFFFFFFF",
-            "000000000000",
-            "A0A1A2A3A4A5",
-            "A5A4A3A2A1A0",
-            "89ECA97F8C2A",
-            "5C8FF9990DA2",
-            "75CCB59C9BED",
-            "D01AFEEB890A",
-            "4B791BEA7BCC",
-            "2612C6DE84CA",
-            "707B11FC1481",
-            "03F9067646AE",
-            "2352C5B56D85",
-            "B0B1B2B3B4B5",
-            "C0C1C2C3C4C5",
-            "D0D1D2D3D4D5",
-            "AABBCCDDEEFF",
-            "4D3A99C351DD",
-            "1A982C7E459A",
-            "FAFAFAFAFAFA",
-            "FBFBFBFBFBFB",
-            "D3F7D3F7D3F7",
-        };
-    }
-
     bool ensure_default_key_file() const
     {
         if (!ensure_keys_dir()) return false;
@@ -640,13 +630,12 @@ public:
             std::ifstream in(path.c_str());
             if (in.is_open()) return true;
         }
-        std::ofstream out(path.c_str(), std::ios::out | std::ios::trunc);
+        const std::string bundled = std::string(hal_path_data_dir()) + "/config/keys/mfc_default.dic";
+        std::ifstream in_bundle(bundled.c_str(), std::ios::binary);
+        if (!in_bundle.is_open()) return false;
+        std::ofstream out(path.c_str(), std::ios::out | std::ios::trunc | std::ios::binary);
         if (!out.is_open()) return false;
-        out << "# Auto-generated default MIFARE keys\n";
-        for (const auto &line : default_key_dict_lines()) {
-            std::string key;
-            if (parse_12hex_line(line, &key)) out << key << "\n";
-        }
+        out << in_bundle.rdbuf();
         return out.good();
     }
 
@@ -732,15 +721,13 @@ public:
         ensure_keys_dir();
         std::set<std::string> seen;
         std::vector<std::string> keys;
-        const int num_sectors = static_cast<int>(raw_lines.size()) / 4;
-        for (int sec = 0; sec < num_sectors; ++sec) {
-            const int trailer_idx = sec * 4 + 3;
-            if (trailer_idx >= static_cast<int>(raw_lines.size())) break;
-            // raw_lines[trailer_idx] should be 32 hex chars = 16 bytes
+        // 4K sectors 32..39 contain 16 blocks, unlike the first 32 sectors.
+        for (size_t trailer_idx = 3; trailer_idx < raw_lines.size();
+             trailer_idx += trailer_idx < 127 ? 4 : 16) {
             std::string hex;
-            for (char c : raw_lines[static_cast<size_t>(trailer_idx)])
-                if (std::isxdigit(static_cast<unsigned char>(c))) hex += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-            if (hex.size() < 32) continue;
+            // CAP lines include a decimal block prefix ("03:"). It is metadata,
+            // not key bytes; use the same strict parser as JSON export.
+            if (!normalize_emulator_block_hex(raw_lines[trailer_idx], 32, &hex)) continue;
             // key A: bytes 0-5 (chars 0-11), key B: bytes 10-15 (chars 20-31)
             const std::string keyA = hex.substr(0, 12);
             const std::string keyB = hex.substr(20, 12);
@@ -852,8 +839,7 @@ public:
 
     // Write record hex data as structured JSON to emulator file.
     // Used by the "Emulate" flow: Saved record → write to {p}_0.json.
-    void save_emulator_json_from_record(ProtocolKind protocol, const SavedRecord &record) const
-    {
+    void save_emulator_json_from_record(ProtocolKind protocol, const SavedRecord &record) const    {
         const std::string path = emulator_json_path(protocol);
         ensure_dir(emulator_json_dir());
 
@@ -898,14 +884,50 @@ public:
         for (size_t i = 0; i < source->size(); ++i) {
             std::string pure;
             if (!normalize_emulator_block_hex((*source)[i], expected_hex_chars, &pure)) continue;
-            j["blocks"][std::to_string(i)] = pure;
+            // Zero-padded key for correct numeric sort order
+            char key_buf[4];
+            std::snprintf(key_buf, sizeof(key_buf), "%02d", static_cast<int>(i));
+            j["blocks"][std::string(key_buf)] = pure;
             ++valid_blocks;
         }
 
+        // Never replace a valid emulator dump with descriptive UI text such as
+        // "Sector0:" or "KeyA:" rows from legacy slot metadata.
         if (valid_blocks == 0) return;
 
         std::ofstream out(path.c_str(), std::ios::out | std::ios::trunc);
-        if (out.is_open()) out << j.dump(2);
+        if (out.is_open()) {
+            reorder_blocks_keys(j);
+            out << j.dump(2);
+        }
+    }
+
+    // Write raw NTAG page bytes (4 bytes per page) directly as the NTAG emulator JSON.
+    // Used by GroveNFC "Set URL": generate NTAG213 pages from a URI and save.
+    bool save_emulator_json_from_ntag_pages(const std::vector<uint8_t> &mem) const
+    {
+        if (mem.size() < 16) return false;
+        const std::string path = emulator_json_path(ProtocolKind::Iso14443A);
+        ensure_dir(emulator_json_dir());
+        nlohmann::json j;
+        j["filetype"] = "ntag";
+        j["card"]["uid"] = "04123456789ABC";
+        j["card"]["version"] = "";
+        j["card"]["protocol"] = "iso14443a";
+        const size_t pages = mem.size() / 4;
+        for (size_t i = 0; i < pages; ++i) {
+            char hex[9];
+            std::snprintf(hex, sizeof(hex), "%02X%02X%02X%02X",
+                          mem[i * 4], mem[i * 4 + 1], mem[i * 4 + 2], mem[i * 4 + 3]);
+            char key_buf[4];
+            std::snprintf(key_buf, sizeof(key_buf), "%02d", static_cast<int>(i));
+            j["blocks"][std::string(key_buf)] = std::string(hex);
+        }
+        std::ofstream out(path.c_str(), std::ios::out | std::ios::trunc);
+        if (!out.is_open()) return false;
+        reorder_blocks_keys(j);
+        out << j.dump(2);
+        return true;
     }
 
     // Reset user JSON to default: always copy from app-bundled config/defaults/
@@ -1174,37 +1196,51 @@ public:
                     auto chunk = hex_string_to_bytes(entry.second);
                     out.insert(out.end(), chunk.begin(), chunk.end());
                 }
+
+                // ISO15693 JSON commonly stores identity in card.uid/dsfid/afi while
+                // blocks may be mostly zero. Merge metadata so device emulation doesn't
+                // lose UID and fall back to all-zero payload.
+                if (protocol == ProtocolKind::Iso15693 && j.contains("card") && j["card"].is_object()) {
+                    const auto &card = j["card"];
+                    std::vector<uint8_t> uid;
+                    if (card.contains("uid") && card["uid"].is_string()) {
+                        uid = hex_string_to_bytes(card["uid"].get<std::string>());
+                    }
+                    if (!uid.empty()) {
+                        if (uid.size() > 8) uid.resize(8);
+                        while (uid.size() < 8) uid.push_back(0x00);
+                        if (out.size() < 8) out.resize(8, 0x00);
+                        const bool zero_prefix =
+                            out.size() < 8 || std::all_of(out.begin(), out.begin() + 8, [](uint8_t b) { return b == 0x00; });
+                        if (zero_prefix) {
+                            std::copy(uid.begin(), uid.end(), out.begin());
+                        }
+                    }
+
+                    const uint8_t dsfid = parse_hex_byte_or_default(card, "dsfid", 0x00);
+                    const uint8_t afi = parse_hex_byte_or_default(card, "afi", 0x00);
+                    if (out.size() < 10) out.resize(10, 0x00);
+                    out[8] = dsfid;
+                    out[9] = afi;
+                }
                 return out;
             }
         } catch (...) {}
         return {};
     }
 
-    // Load NTAG emulator memory from JSON (PM3 blocks format) as linear bytes.
-    // Tries: user JSON → default JSON → app-bundled config.
+    std::vector<uint8_t> load_emulator_memory(ProtocolKind protocol) const
+    {
+        for (const auto &path : {emulator_json_path(protocol), emulator_json_default_path(protocol),
+             std::string(hal_path_data_dir()) + "/config/defaults/" + emulator_file_stem(protocol) + ".json"}) {
+            if (::access(path.c_str(), F_OK) == 0) return ntag_blocks_to_bytes(path);
+        }
+        return {};
+    }
+
     std::vector<uint8_t> load_ntag_emulator_memory() const
     {
-        // Try user emulator JSON first (ntag213_0.json)
-        const std::string user_path = emulator_json_path(ProtocolKind::Iso14443A);
-        std::string src_path;
-        if (::access(user_path.c_str(), F_OK) == 0) {
-            src_path = user_path;
-        } else {
-            // Try default/
-            const std::string default_path = emulator_json_default_path(ProtocolKind::Iso14443A);
-            if (::access(default_path.c_str(), F_OK) == 0) {
-                src_path = default_path;
-            } else {
-                // Fallback: app-bundled config/defaults/
-                std::string app_path = std::string(hal_path_data_dir()) + "/config/defaults/ntag213.json";
-                if (::access(app_path.c_str(), F_OK) == 0) {
-                    src_path = app_path;
-                }
-            }
-        }
-        return src_path.empty()
-            ? std::vector<uint8_t>{}
-            : ntag_blocks_to_bytes(src_path);
+        return load_emulator_memory(ProtocolKind::Iso14443A);
     }
 
     // Read a PM3-format JSON file and convert blocks → linear byte vector.
@@ -1239,7 +1275,11 @@ public:
                               return a.first < b.first;
                           });
                 std::vector<uint8_t> out;
+                size_t expected_index = 0;
+                const size_t block_chars = blocks.empty() ? 0 : blocks.front().second.size();
                 for (const auto &entry : blocks) {
+                    if (entry.first != static_cast<int>(expected_index++) || entry.second.size() != block_chars)
+                        return {};  // Never silently shift sparse or malformed dump blocks.
                     auto chunk = hex_string_to_bytes(entry.second);
                     out.insert(out.end(), chunk.begin(), chunk.end());
                 }
@@ -1295,6 +1335,24 @@ public:
                 out.push_back(static_cast<uint8_t>(val));
         }
         return out;
+    }
+
+    static uint8_t parse_hex_byte_or_default(const nlohmann::json &node,
+                                             const char *key,
+                                             uint8_t fallback = 0x00)
+    {
+        if (!key || !node.contains(key) || !node[key].is_string()) return fallback;
+        std::string pure;
+        for (char c : node[key].get<std::string>()) {
+            if (std::isxdigit(static_cast<unsigned char>(c))) {
+                pure.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+            }
+        }
+        if (pure.size() < 2) return fallback;
+        char *end = nullptr;
+        const unsigned long v = std::strtoul(pure.substr(0, 2).c_str(), &end, 16);
+        if (!end || *end != '\0') return fallback;
+        return static_cast<uint8_t>(v & 0xFF);
     }
 };
 

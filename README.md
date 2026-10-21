@@ -5,33 +5,14 @@ NFC tags across multiple hardware devices.
 
 ---
 
-## Device Feature Matrix
+## Hardware and release scope
 
-按 LF / HF / UHF 分类的中文功能列表见 [外接设备功能对比](FEATURE_MATRIX.md)。以下旧版概览仅供参考，以该列表和实际代码限制为准。
+- **M5 NFC CAP (SPI):** Gen1A dump and Saved writes; Gen1A checks command/data ACKs and skips read-back verification. NTAG JSON emulation and MFKey32 capture are supported. Encrypted MFC 1K emulation is experimental and disabled by default.
+- **M5 NFC Unit / GroveNFC (IIC):** reader, dump, writer and listener support depends on the detected chip and card protocol.
+- **PN532 / PN532Killer (USB/UART):** authenticated reads and protocol tools; Killer adds firmware-backed slots and capture capabilities.
+- **UHF reader (USB):** inventory and bank capture with explicit partial/error status.
 
-| Device | Interface | Scan | Read / Dump | Write (UID) | Emulate | Sniff | UHF | NDEF | Key Mgmt |
-|--------|-----------|:----:|:-----------:|:-----------:|:-------:|:-----:|:---:|:----:|:--------:|
-| **PN532Killer** | USB / UART | ✅ | ✅ MFC/NTAG/15693 | ✅ Gen1A/2/3/4 | ✅ HW slot 0-7 | ✅ Both modes | ❌ | ✅ | ✅ |
-| **PN532 (standard)** | USB / UART | ✅ | ✅ MFC/NTAG/15693 | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ |
-| **PN532 Module** | UART | ✅ | ✅ MFC/NTAG/15693 | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
-| **M5 NFC Unit** | I²C (0x50) | ✅ | ✅ MFC/NTAG/15693 | ✅ Gen1A/3 | ✅ ISO14443A/B/15693/MFC | ❌ | ❌ | ❌ | ✅ |
-| **GroveNFC** | I²C (0x48) | ✅ | ✅ MFC/NTAG/15693/FeliCa | ❌ | ✅ NTAG/MFC1K/15693 | ❌ | ❌ | ❌ | ✅ |
-| **M5 NFC CAP** | SPI (spidev) | ✅ | ✅ MFC/NTAG | ✅ Gen1A | ✅ ISO14443A | ❌ | ❌ | ❌ | ✅ |
-| **UHF Reader** | USB (1A86:FE1C / 1A86:55D3 FZUHF) | ✅ | ✅ Continuous scan | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ |
-
-## Supported Protocols & Operations
-
-| Protocol | R/W | Dump | Emulate | UID Change | Notes |
-|----------|:---:|:----:|:-------:|:----------:|-------|
-| **MIFARE Classic 1K / 4K** | ✅ | ✅ | ✅ | ✅ (Gen1A/2/3/4) | Full sector read with key auth, emulation, magic card UID change |
-| **NTAG213 / 215 / 216** | ✅ | ✅ | ✅ | ❌ | NDEF read/write, emulation |
-| **MIFARE Ultralight** | ✅ | ✅ | ❌ | ❌ | Read/write full memory pages |
-| **ISO 15693** | ✅ | ✅ | ✅ | ❌ | Tag-it, I-Code SLI, ST LRI |
-| **FeliCa** | ✅ (GroveNFC) | ❌ | ❌ | ❌ | Limited to GroveNFC reader |
-| **DESFire** | ❌ | ❌ | ❌ | ❌ | Detected but not read |
-| **UHF RFID (EPC C1G2)** | ✅ | ✅ Memory banks | ❌ | ❌ | Inventory, CSV export, per-tag Reserved/EPC/TID/User capture |
-
----
+See [FEATURE_MATRIX.md](FEATURE_MATRIX.md) for per-device details. A visible UID does not establish successful encrypted MFC authentication. Experimental SPI MFC support is not part of the stable release claim.
 
 ## UI — 4-Tab Workflow
 
@@ -101,42 +82,35 @@ NFC tags across multiple hardware devices.
 
 ## Project Layout
 
-```
-main/
-├── src/main.cpp                       # App entry, LVGL init, evdev keyboard
-├── ui/components/
-│   ├── nfc/
-│   │   ├── nfc_models.hpp              # Enums (Protocol, Transport, DeviceKind, AttackMethod)
-│   │   ├── nfc_transport.hpp           # Serial / I²C / SPI transport abstraction
-│   │   ├── nfc_protocol.hpp            # PN532 frame codec, Pn532KillerClient, detect_device()
-│   │   ├── nfc_i2c_device.hpp          # GroveNFC / NFC Unit I²C driver (ST25R3916B)
-│   │   ├── nfc_spi_device.hpp          # M5 NFC CAP SPI driver (ST25R3916)
-│   │   ├── nfc_device_service.hpp      # Main service: connect/scan/dump/emulate/crack/UHF
-│   │   ├── nfc_storage.hpp             # JSON dump/key/emulator config persistence
-│   │   └── nfc_hex_logger.hpp          # Ring-buffer hex TX/RX logger + daily file writer
-│   ├── page_app/ui_app_nfc.hpp         # LVGL UI: 4-tab layout, modals, event handlers
-│   └── ui_app_page.hpp                 # Base page class (menu integration)
-├── hal/
-│   ├── hal_paths.h / hal_paths_rfid.c  # APPLaunch data directory resolution
-│   └── hal_settings.h / hal_settings_rfid.c  # Runtime settings persistence
-├── tools/
-│   ├── mfkey/                          # crapto1 + mfkey32v2 / mfkey64 source
-│   └── nfc_device_service.hpp          # Standalone copy for mfkey cross-build
-applications/rfid.desktop               # APPLaunch launcher entry
-tools/package_deb.py                     # Debian package builder
-```
+| Directory | Purpose |
+|---|---|
+| `main/src/` | Application entry, LVGL and keyboard setup |
+| `main/nfc/` | Device drivers, transport, protocol, service and storage |
+| `main/ui/` | LVGL screens and input handling |
+| `main/hal/` | Board paths, settings, screenshot and panel recovery |
+| `main/tools/mfkey/` | MFKey32v2, MFKey64, Staticnested and Crypto1 sources |
+| `tests/` | Protocol regression tests and optional hardware test scripts |
+| `tools/` | Packaging, regression runner and development utilities |
+| `tools/rfid_mfc_tx/` | Experimental kernel helper, excluded from the package |
+| `config/` | Bundled emulator defaults and key dictionary |
+| `applications/`, `share/`, `screenshots/` | Launcher and store assets |
+
+Local captures in `tests/results/` and generated build output are excluded from Git.
+Panel recovery reads the inversion mode from the board firmware and restores it
+at startup, after CAP operations, and on clean exit. The original intermittent
+mode change remains under investigation; recovery is not evidence of its cause.
 
 ## Build
 
 ```bash
 cd projects/RFID
-scons -j4
+CardputerZero=y scons -j4
 ```
 
 Output:
 
 - `dist/M5CardputerZero-RFID` — main app binary
-- `dist_mfkey/mfkey32v2`, `dist_mfkey/mfkey64` — helper tools
+- `dist_mfkey/mfkey32v2`, `dist_mfkey/mfkey64`, `dist_mfkey/staticnested` — helper tools
 
 ## Package as .deb
 
@@ -145,13 +119,13 @@ cd projects/RFID
 python3 tools/package_deb.py --maintainer "yourname <you@example.com>"
 ```
 
-Output: `build/rfid_0.3-m5stack1_arm64.deb`
+Output: `build/rfid_1.0.3-1_arm64.deb`
 
 Install:
 
 ```bash
-scp build/rfid_0.3-m5stack1_arm64.deb pi@<device-ip>:/tmp/
-ssh pi@<device-ip> "echo pi | sudo -S dpkg -i /tmp/rfid_0.3-m5stack1_arm64.deb"
+scp build/rfid_1.0.3-1_arm64.deb pi@<device-ip>:/tmp/
+ssh pi@<device-ip> "sudo dpkg -i /tmp/rfid_1.0.3-1_arm64.deb"
 ```
 
 ## APPLaunch Integration
@@ -163,5 +137,16 @@ ssh pi@<device-ip> "echo pi | sudo -S dpkg -i /tmp/rfid_0.3-m5stack1_arm64.deb"
 ## Notes
 
 - NFC storage and key files are persisted under `~/rfid/` (or `hal_path_data_dir()`).
-- For deployment from APPLaunch, compose binary with mfkey tools via SKIP_BUILD=1.
+- For deployment from APPLaunch, package the binary and helpers with `./build_package.sh --skip-build`.
 - Hex logging auto-rotates daily under `~/rfid/nfc_data/logs/`.
+
+## Regression and release
+
+```bash
+SSHPASS='<device password>' python3 tools/run_tests.py --device pi@192.168.0.120
+./build_package.sh
+```
+
+The regression runner uses fake transports and temporary files, without tag writes.
+Physical antenna tests are separate; see [tests/README.md](tests/README.md).
+Store submission records and remaining limitations are in [PUBLISH.md](PUBLISH.md).

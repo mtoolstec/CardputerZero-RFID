@@ -6,6 +6,7 @@
 
 #include "nfc_models.hpp"
 #include "nfc_hex_logger.hpp"
+#include "nfc_crypto1.hpp"
 
 #include <cerrno>
 #include <cctype>
@@ -148,6 +149,19 @@ struct I2cCardInfo {
 // ─────────────────────────────────────────────────────────────────────────────
 class I2cGroveNfcDevice {
 public:
+    // Share the ST25R protocol engine with SPI without duplicating Crypto1/parity.
+    struct St25rBackend {
+        std::function<bool(uint8_t,uint8_t)> write_reg;
+        std::function<bool(uint8_t,uint8_t&)> read_reg;
+        std::function<bool(uint8_t)> command;
+        std::function<bool(const uint8_t*,uint8_t)> fifo_write;
+        std::function<bool(uint8_t*,uint8_t)> fifo_read;
+        std::function<bool(std::vector<uint8_t>&,uint8_t&)> select;
+        std::function<bool(const std::string&)> unlock;
+        std::function<bool(uint8_t,uint8_t*)> read_plain;
+    };
+    void set_st25r_backend(St25rBackend backend) { st25r_backend_ = std::move(backend); }
+
     I2cGroveNfcDevice() = default;
     ~I2cGroveNfcDevice() { close(); }
 
@@ -1119,6 +1133,7 @@ public:
     {
         if (!is_open() || !is_nfc_unit()) return false;
         nfcunit_listener_running_ = false;
+        nfcunit_listener_mfclassic_raw_rx_ = false;
         nfcunit_listener_target_active_ = false;
         nfcunit_listener_wakeup_ = false;
         nfcunit_listener_data_flag_ = false;
@@ -1195,8 +1210,8 @@ public:
         return false;
     }
 
-    // Send one listener response frame with CRC auto-appended by ST25R3916.
-    bool nfcunit_send_listener_frame(const uint8_t *tx, uint8_t tx_len)
+    // Send a listener response; authentication frames omit CRC.
+    bool nfcunit_send_listener_frame(const uint8_t *tx, uint8_t tx_len, bool with_crc = true)
     {
         if (!is_open() || !is_nfc_unit() || !nfcunit_listener_running_) return false;
         if (nfcunit_listener_state_ != NfcUnitListenerState::Active) return false;
@@ -1209,8 +1224,25 @@ public:
             uint8_t dummy = 0;
             st25r_read_reg(0x1A, dummy);
         }
-        if (!st25r_cmd(0xC4)) return false;  // TRANSMIT_WITH_CRC
-        (void)st25r_wait_irq(0x08, 25);      // TXE best effort
+        if (!st25r_cmd(with_crc ? 0xC4 : 0xC5)) return false;
+        // Preserve RXE/field events that arrive together with TXE.
+        for (int i = 0; i < 40; ++i) {
+            const uint32_t irq = st25r_read_irq32();
+            nfcunit_listener_irq_latch_ |= irq & ~uint32_t(0x08000000u);
+            if (irq & 0x08000000u) break;
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+        (void)st25r_cmd(0xD1);
+        return true;
+    }
+
+    bool nfcunit_listener_set_mfclassic_auth_rx(bool enabled)
+    {
+        uint8_t aux = 0;
+        if (!st25r_read_reg(0x0A, aux) ||
+            !st25r_write_reg(0x0A, enabled ? (aux | 0x80) : (aux & 0x7F)) ||
+            !st25r_write_reg(0x05, enabled ? 0x40 : 0x00)) return false;
+        nfcunit_listener_mfclassic_raw_rx_ = enabled;
         return true;
     }
 
@@ -1326,6 +1358,7 @@ private:
         Halt,
     };
 
+    St25rBackend st25r_backend_;
     int      fd_   = -1;
     uint8_t  addr_ = 0;
     std::string bus_path_;
@@ -1334,6 +1367,7 @@ private:
     bool nfcunit_listener_wakeup_ = false;
     bool nfcunit_listener_data_flag_ = false;
     bool nfcunit_listener_mode_f_ = false;
+    bool nfcunit_listener_mfclassic_raw_rx_ = false;
     bool nfcunit_listener_keep_auto_collision_ = false;
     uint16_t nfcunit_listener_active_idle_ticks_ = 0;
     uint8_t nfcunit_listener_bitrate_ = 0xFF;  // 0:106, 1:212, 2:424, 0xFF:invalid
@@ -1361,12 +1395,14 @@ private:
 
     bool st25r_write_reg(uint8_t reg, uint8_t val)
     {
+        if (st25r_backend_.write_reg) return st25r_backend_.write_reg(reg, val);
         uint8_t buf[2] = {(uint8_t)(reg & 0x3F), val};
         return ::write(fd_, buf, 2) == 2;
     }
 
     bool st25r_read_reg(uint8_t reg, uint8_t &val)
     {
+        if (st25r_backend_.read_reg) return st25r_backend_.read_reg(reg, val);
         uint8_t rb = (reg & 0x3F) | 0x40;  // bit6=1 indicates register read in ST25R3916B I2C protocol
         uint8_t data = 0;
         struct i2c_msg msgs[2] = {
@@ -1381,11 +1417,13 @@ private:
 
     bool st25r_cmd(uint8_t cmd)
     {
+        if (st25r_backend_.command) return st25r_backend_.command(cmd);
         return ::write(fd_, &cmd, 1) == 1;
     }
 
     bool st25r_fifo_write(const uint8_t *data, uint8_t len)
     {
+        if (st25r_backend_.fifo_write) return st25r_backend_.fifo_write(data, len);
         std::vector<uint8_t> buf;
         buf.push_back(0x80);
         buf.insert(buf.end(), data, data + len);
@@ -1394,6 +1432,7 @@ private:
 
     bool st25r_fifo_read(uint8_t *data, uint8_t len)
     {
+        if (st25r_backend_.fifo_read) return st25r_backend_.fifo_read(data, len);
         // OP_READ_FIFO = 0x9F (NOT 0x80! 0x80 = OP_LOAD_FIFO, 0xC0 = OP_DIRECT_COMMAND)
         uint8_t op = 0x9F;
         struct i2c_msg msgs[2] = {
@@ -1599,6 +1638,7 @@ private:
     {
         if (!is_open() || !is_nfc_unit()) return false;
 
+        if (nfcunit_listener_mfclassic_raw_rx_) (void)nfcunit_listener_set_mfclassic_auth_rx(false);
         nfcunit_listener_trace("state -> OFF");
 
         nfcunit_listener_state_ = NfcUnitListenerState::Off;
@@ -1919,7 +1959,7 @@ private:
                 return false;
             }
 
-            const bool bad_frame = nfcunit_listener_mode_f_
+            const bool bad_frame = nfcunit_listener_mfclassic_raw_rx_ ? false : nfcunit_listener_mode_f_
                 ? (irq32 & (ST25R_I_CRC32 | ST25R_I_ERR132 | ST25R_I_ERR232))
                 : ((irq32 & (ST25R_I_PAR32 | ST25R_I_CRC32 | ST25R_I_ERR132 | ST25R_I_ERR232)) || fifo_cnt <= 2);
             if (bad_frame) {
@@ -1937,7 +1977,7 @@ private:
                 return false;
             }
 
-            const uint16_t payload_len = nfcunit_listener_mode_f_ ? fifo_cnt : static_cast<uint16_t>(fifo_cnt - 2);
+            const uint16_t payload_len = (nfcunit_listener_mode_f_ || nfcunit_listener_mfclassic_raw_rx_) ? fifo_cnt : static_cast<uint16_t>(fifo_cnt - 2);
             const uint16_t to_read = std::min<uint16_t>(payload_len, 96);
             uint8_t raw[96] = {0};
             if (st25r_fifo_read(raw, static_cast<uint8_t>(to_read))) {
@@ -1950,6 +1990,7 @@ private:
 
         if (irq32 & ST25R_I_EOF32) {
             nfcunit_listener_trace("active eof -> off");
+            if (nfcunit_listener_mfclassic_raw_rx_) (void)nfcunit_listener_set_mfclassic_auth_rx(false);
             (void)nfcunit_listener_enter_off();
             return false;
         }
@@ -2098,6 +2139,7 @@ private:
         uint8_t fifo_hi = 0;
         if (!st25r_read_reg(0x1E, fifo_lo)) return false;
         if (!st25r_read_reg(0x1F, fifo_hi)) return false;
+        if (fifo_lo == 0xFF && fifo_hi == 0xFF) return false; // invalid bus read
         fifo_cnt = static_cast<uint16_t>((static_cast<uint16_t>((fifo_hi >> 6) & 0x03) << 8) | fifo_lo);
         return true;
     }
@@ -2378,123 +2420,6 @@ private:
         return out;
     }
 
-    class Crypto1Local {
-    public:
-        void init(uint64_t key48)
-        {
-            odd_ = 0U;
-            even_ = 0U;
-
-            for (int bit = 47; bit > 0; bit -= 2) {
-                odd_ = (odd_ << 1) | static_cast<uint32_t>((key48 >> (((bit - 1) ^ 7))) & 0x01ULL);
-                even_ = (even_ << 1) | static_cast<uint32_t>((key48 >> ((bit ^ 7))) & 0x01ULL);
-            }
-        }
-
-        uint32_t inject(uint32_t uid, uint32_t nt, bool encrypted = false)
-        {
-            return step32(uid ^ nt, encrypted);
-        }
-
-        bool step_with(bool in, bool enc = false)
-        {
-            const uint8_t out_bit = filter();
-            uint32_t feedback = enc ? static_cast<uint32_t>(out_bit) : 0U;
-
-            feedback ^= in ? 1U : 0U;
-            feedback ^= (odd_ & 0x0029CE5CU);
-            feedback ^= (even_ & 0x00870804U);
-
-            even_ = ((even_ << 1) & 0x00FFFFFFU) | evenparity32(feedback);
-
-            const uint32_t previous_odd = odd_;
-            odd_ = even_;
-            even_ = previous_odd;
-
-            return out_bit != 0;
-        }
-
-        uint8_t step8(uint8_t in, bool enc = false, uint8_t *last_ks_bit = nullptr)
-        {
-            uint8_t v = 0U;
-            for (uint8_t bit = 0U; bit < 8U; ++bit) {
-                v |= static_cast<uint8_t>(step_with(((in >> bit) & 0x01U) != 0U, enc)) << bit;
-            }
-            if (last_ks_bit) *last_ks_bit = parity_keystream_bit();
-            return v;
-        }
-
-        uint8_t parity_keystream_bit() const
-        {
-            return filter();
-        }
-
-        uint32_t step32(uint32_t in, bool enc = false)
-        {
-            uint32_t out = 0U;
-            for (uint8_t bit = 0U; bit < 32U; ++bit) {
-                out |= static_cast<uint32_t>(step_with(crypto_big_endian_bit(in, bit) != 0U, enc)) << (bit ^ 24U);
-            }
-            return out;
-        }
-
-        static uint8_t oddparity8(uint8_t x)
-        {
-            return static_cast<uint8_t>(!__builtin_parity(static_cast<unsigned int>(x)));
-        }
-
-        uint8_t encrypt_nr_ar(uint8_t out[8], uint32_t nr, uint32_t ar)
-        {
-            uint8_t parity = 0;
-            for (uint_fast8_t i = 0; i < 4; ++i) {
-                const uint8_t v = static_cast<uint8_t>((nr >> ((i ^ 0x03U) << 3)) & 0xFFU);
-                out[i] = static_cast<uint8_t>(step8(v, false) ^ v);
-                parity |= static_cast<uint8_t>((parity_keystream_bit() ^ oddparity8(v)) & 0x01U) << i;
-            }
-            for (uint_fast8_t pos = 4; pos < 8; ++pos) {
-                const uint8_t i = static_cast<uint8_t>(pos - 4);
-                const uint8_t v = static_cast<uint8_t>((ar >> (i << 3)) & 0xFFU);
-                out[pos] = static_cast<uint8_t>(step8(v, false) ^ v);
-                parity |= static_cast<uint8_t>((parity_keystream_bit() ^ oddparity8(v)) & 0x01U) << pos;
-            }
-            return parity;
-        }
-
-        uint32_t encrypt_stream(uint8_t *out, const uint8_t *in, uint8_t len)
-        {
-            uint32_t parity = 0;
-            for (uint_fast8_t i = 0; i < len; ++i) {
-                out[i] = static_cast<uint8_t>(in[i] ^ step8(0x00, false));
-                parity |= static_cast<uint32_t>((parity_keystream_bit() ^ oddparity8(in[i])) & 1U) << i;
-            }
-            return parity;
-        }
-
-    private:
-        static uint8_t evenparity32(uint32_t value)
-        {
-            return static_cast<uint8_t>(__builtin_parity(value));
-        }
-
-        static uint8_t crypto_big_endian_bit(uint32_t value, uint8_t bit)
-        {
-            return static_cast<uint8_t>((value >> (bit ^ 24U)) & 0x01U);
-        }
-
-        uint8_t filter() const
-        {
-            uint32_t f = 0U;
-            f |= (0x000F22C0U >> (odd_ & 0x0FU)) & 0x10U;
-            f |= (0x0006C9C0U >> ((odd_ >> 4U) & 0x0FU)) & 0x08U;
-            f |= (0x0003C8B0U >> ((odd_ >> 8U) & 0x0FU)) & 0x04U;
-            f |= (0x0001E458U >> ((odd_ >> 12U) & 0x0FU)) & 0x02U;
-            f |= (0x0000D938U >> ((odd_ >> 16U) & 0x0FU)) & 0x01U;
-            return static_cast<uint8_t>((0xEC57E80AU >> f) & 0x01U);
-        }
-
-        uint32_t odd_ = 0U;
-        uint32_t even_ = 0U;
-    };
 
     static uint32_t bswap32_local(uint32_t v)
     {
@@ -2710,6 +2635,20 @@ private:
         if (!st25r_set_aux_crc_mode(include_crc)) return false;
         if (!st25r_mfc_send_encrypted(crypto, tx, tx_len)) return false;
 
+        if (rx_len == 1 && !include_crc) {
+            St25rIrqStatus first, last;
+            uint16_t count = 0;
+            if (!st25r_wait_for_nfca_rx(first, last, timeout_ms) &&
+                !st25r_wait_fifo_after_missed_rxe(count)) return false;
+            if (!st25r_read_fifo_count(count) || count != 1) return false;
+            uint8_t ack = 0;
+            if (!st25r_fifo_read(&ack, 1)) return false;
+            uint8_t plain = 0;
+            for (unsigned bit = 0; bit < 4; ++bit)
+                plain |= ((ack >> bit & 1U) ^ crypto.step_with(0)) << bit;
+            rx[0] = plain;
+            return plain == 0x0A;
+        }
         const uint8_t expect_plain = static_cast<uint8_t>(rx_len + (include_crc ? 2 : 0));
         const uint16_t expect_bits = static_cast<uint16_t>(expect_plain * 9U);
         const uint8_t expect_encoded = static_cast<uint8_t>((expect_bits + 7U) >> 3);
@@ -3202,6 +3141,7 @@ private:
 
     bool st25r_is_gen1a_magic(const std::string &selected_uid)
     {
+        if (st25r_backend_.unlock) return st25r_backend_.unlock(selected_uid);
         auto run_unlock_probe = [&](bool send_halt) -> bool {
             std::vector<uint8_t> uid;
             uint8_t sak = 0;
@@ -3509,6 +3449,7 @@ private:
                                            uint8_t &sak,
                                            bool send_halt_pre_step = false)
     {
+        if (st25r_backend_.select) return st25r_backend_.select(uid, sak);
         if (send_halt_pre_step) {
             const uint8_t halt_no_crc[2] = {0x50, 0x00};
             (void)st25r_nfca_transmit_only(halt_no_crc, 2, false, 0x00, 0, 25);
@@ -3521,6 +3462,7 @@ private:
                                uint8_t &sak,
                                bool send_halt_pre_step = false)
     {
+        if (st25r_backend_.select) return st25r_backend_.select(uid, sak);
         if (!st25r_init_nfca_reader()) return false;
         return st25r_nfca_reselect_current_field(uid, sak, send_halt_pre_step);
     }
@@ -4257,6 +4199,205 @@ private:
     // ── NFC Unit write helpers ────────────────────────────────────────────────
 
     // Write MIFARE Classic (1K/4K) data to NFC Unit.
+public:
+    // mode: 0 auto, 1 Gen1A full, 2 authenticated data, 3 Gen3 data+UID, 4 Gen4 full.
+    // Ordinary/Gen3 writes preserve sector trailers and ordinary manufacturer block.
+    bool write_mfc_dump(const std::vector<std::string> &lines, int mode,
+                        const std::string &password,
+                        const std::vector<std::string> *keys,
+                        const std::function<void(const std::string &)> &emit,
+                        std::string *error)
+    {
+        const auto started = std::chrono::steady_clock::now();
+        struct FieldOff { I2cGroveNfcDevice *d; ~FieldOff() { d->st25r_write_reg(2, 0x80); } } off{this};
+        auto fail = [&](const std::string &msg) { if (error) *error = msg; return false; };
+        if (mode < 0 || mode > 4) return fail("Invalid write mode");
+        std::vector<std::vector<uint8_t>> blocks(256);
+        int count = 0;
+        for (const auto &line : lines) {
+            const auto colon = line.find(':');
+            if (colon == std::string::npos) return fail("Invalid dump block line");
+            const auto prefix = line.substr(0, colon);
+            if (prefix.empty() || prefix.find_first_not_of("0123456789") != std::string::npos)
+                return fail("Invalid block number");
+            if (prefix.size() > 3) return fail("Block number out of range");
+            const int block = std::atoi(prefix.c_str());
+            if (block >= 256 || !blocks[block].empty()) return fail("Duplicate/out-of-range block");
+            std::string hex;
+            for (char c : line.substr(colon + 1)) {
+                if (std::isspace(static_cast<unsigned char>(c))) continue;
+                if (!std::isxdigit(static_cast<unsigned char>(c))) return fail("Invalid dump hex");
+                hex += c;
+            }
+            if (hex.size() != 32) return fail("Dump block must contain 16 bytes");
+            for (size_t i = 0; i < 32; i += 2)
+                blocks[block].push_back(std::strtoul(hex.substr(i, 2).c_str(), nullptr, 16));
+            count = std::max(count, block + 1);
+        }
+        if (count != 20 && count != 64 && count != 256) return fail("Need complete Mini/1K/4K dump");
+        for (int b = 0; b < count; ++b) if (blocks[b].size() != 16) return fail("Incomplete dump");
+        // Validate access-bit complements before any full-clone write.
+        for (int b = 3; b < count; b += b < 127 ? 4 : 16) {
+            const auto &d = blocks[b];
+            if ((((d[6] >> 4) ^ (d[8] & 15)) != 15) ||
+                (((d[6] & 15) ^ (d[7] >> 4)) != 15) ||
+                (((d[7] & 15) ^ (d[8] >> 4)) != 15)) return fail("Invalid trailer access bits");
+        }
+        std::vector<uint8_t> uid;
+        uint8_t sak = 0;
+        if (!st25r_nfca_select_uid(uid, sak)) return fail("No target card");
+        const std::string original = hex_compact(uid.data(), uid.size());
+        if (!is_mifare_classic_family_sak(sak)) return fail("Target is not MFC");
+        const int capacity = normalize_mifare_classic_sak(sak) == 0x18 ? 256 : sak == 9 ? 20 : 64;
+        if (capacity != count) return fail("Target capacity differs from dump");
+        emit("Found " + original);
+        std::string expected_uid = original;
+        auto select_same = [&]() {
+            return st25r_nfca_select_uid(uid, sak) && hex_compact(uid.data(), uid.size()) == expected_uid;
+        };
+        std::array<uint8_t,4> pw{};
+        if (password.size() != 8 || password.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos)
+            return fail("Gen4 password must be 8 hex");
+        for (int i = 0; i < 4; ++i) pw[i] = std::strtoul(password.substr(i*2,2).c_str(), nullptr,16);
+        bool unlocked = false;
+        if (mode == 0 || mode == 1) {
+            unlocked = st25r_is_gen1a_magic(original);
+            if (mode == 1 && !unlocked) return fail("Target is not Gen1A");
+            if (unlocked) mode = 1;
+        }
+        if (mode == 0) mode = st25r_is_gen4_magic(original, pw) ? 4 : 2;
+        if (mode == 4 && !st25r_is_gen4_magic(original, pw)) return fail("Gen4 password/probe failed");
+        if (mode == 3) {
+            if (!st25r_is_gen3_magic(original)) return fail("Target is not Gen3");
+            delay_ms(1000); // Gen3 resets EEPROM/card state after proprietary commands.
+        }
+        if ((mode == 1 || mode == 3 || mode == 4) && uid.size() != 4)
+            return fail("Full UID write currently requires a 4-byte UID target");
+        if ((mode == 1 || mode == 3 || mode == 4) &&
+            (blocks[0][0] ^ blocks[0][1] ^ blocks[0][2] ^ blocks[0][3]) != blocks[0][4])
+            return fail("Invalid dump UID BCC");
+        auto raw = [&](const std::vector<uint8_t> &cmd, uint8_t *rx, uint8_t &n) {
+            return st25r_nfca_transceive(cmd.data(), cmd.size(), true, rx,n,120,0,false);
+        };
+        auto gen4_read = [&](int block, uint8_t *out) {
+            uint8_t rx[20]{}; uint8_t n = sizeof(rx);
+            if (!raw({0xCF,pw[0],pw[1],pw[2],pw[3],0xCE,static_cast<uint8_t>(block)},rx,n) || n != 16) return false;
+            std::copy(rx,rx+16,out); return true;
+        };
+        auto plain_write = [&](int block) {
+            uint8_t rx[4]{}; uint8_t n = sizeof(rx);
+            if (!raw({0xA0,static_cast<uint8_t>(block)},rx,n) || n != 1 || (rx[0]&15) != 10) return false;
+            n = sizeof(rx);
+            if (!raw(blocks[block],rx,n) || n != 1 || (rx[0]&15) != 10) return false;
+            delay_ms(8); return true;
+        };
+        std::vector<std::array<uint8_t,6>> candidates = {{{255,255,255,255,255,255}},{{0,0,0,0,0,0}},{{0xA0,0xA1,0xA2,0xA3,0xA4,0xA5}}};
+        append_external_mfc_keys(candidates, keys);
+        for (int b = 3; b < count; b += b < 127 ? 4 : 16) {
+            for (int offset : {0,10}) {
+                std::array<uint8_t,6> key{};
+                std::copy_n(blocks[b].begin()+offset,6,key.begin());
+                if (std::find(candidates.begin(),candidates.end(),key)==candidates.end()) candidates.push_back(key);
+            }
+        }
+        struct SectorKey { std::array<uint8_t,6> key{}; uint8_t cmd=0; };
+        std::array<SectorKey,40> sector_keys{};
+        auto authenticate = [&](int block, Crypto1Local &crypto) {
+            const int sector = block < 128 ? block/4 : 32+(block-128)/16;
+            auto &found = sector_keys[sector];
+            if (found.cmd) {
+                for (int retry=0;retry<5;++retry)
+                    if(select_same() && st25r_mfc_authenticate(found.cmd,block,found.key,uid,crypto)) return true;
+                return false;
+            }
+            for (const auto &key : candidates) for (uint8_t cmd : {0x60,0x61}) {
+                if (!select_same()) return false;
+                if (st25r_mfc_authenticate(cmd,block,key,uid,crypto)) { found.key=key; found.cmd=cmd; return true; }
+            }
+            return false;
+        };
+        const bool full = mode == 1 || mode == 4;
+        emit(std::string("Magic: ") + (mode==1?"Gen1A full":mode==4?"Gen4 full":mode==3?"Gen3 data + UID":"Normal data (preserve UID/keys)"));
+        std::vector<int> order;
+        // Data first, then trailers, manufacturer block last (UID changes invalidate selection).
+        for (int b=1;b<count;++b) {
+            const bool trailer = b<128 ? b%4==3 : b%16==15;
+            if (!trailer) order.push_back(b);
+        }
+        if (full) for (int b=3;b<count;b+=b<127?4:16) order.push_back(b);
+        if (full || mode==3) order.push_back(0);
+        int written=0, verified=0;
+        for (int block : order) {
+            bool ok=false;
+            for (int attempt=0;attempt<3 && !ok;++attempt) {
+                if (mode==1) {
+                    // A Gen1A backdoor session survives successful block writes.
+                    // Reset/reselect only after failure, not for each EEPROM block.
+                    if (!unlocked) unlocked = st25r_is_gen1a_magic(expected_uid);
+                    ok = unlocked && plain_write(block);
+                    if (!ok) unlocked = false;
+                } else if (mode==4) {
+                    if (!select_same()) return fail("Target changed before block " + std::to_string(block));
+                    std::vector<uint8_t> cmd={0xCF,pw[0],pw[1],pw[2],pw[3],0xCD,static_cast<uint8_t>(block)};
+                    cmd.insert(cmd.end(),blocks[block].begin(),blocks[block].end());
+                    uint8_t rx[8]{};uint8_t n=sizeof(rx);
+                    ok=raw(cmd,rx,n); delay_ms(8);
+                } else if (block==0) {
+                    if (!select_same()) return fail("Target changed before UID write");
+                    std::vector<uint8_t> cmd={0x90,0xF0,0xCC,0xCC,0x10};
+                    cmd.insert(cmd.end(),blocks[0].begin(),blocks[0].end());
+                    uint8_t rx[8]{};uint8_t n=sizeof(rx);
+                    ok=st25r_nfca_transceive(cmd.data(),cmd.size(),true,rx,n,2000,0,false) && n==2 && rx[0]==0x90 && rx[1]==0;
+                    delay_ms(1000);
+                } else {
+                    Crypto1Local crypto;
+                    if (authenticate(block,crypto)) {
+                        uint8_t rx[1]{};uint8_t n=1;
+                        const uint8_t cmd[2]={0xA0,static_cast<uint8_t>(block)};
+                        ok=st25r_mfc_transceive_encrypted(crypto,rx,n,cmd,2,80,false,true);
+                        n=1;
+                        ok=ok && st25r_mfc_transceive_encrypted(crypto,rx,n,blocks[block].data(),16,80,false,true);
+                        delay_ms(8);
+                    }
+                }
+            }
+            if (!ok) return fail("Write block " + std::to_string(block) + " failed (" + std::to_string(written) + "/" + std::to_string(order.size()) + ")");
+            if (block==0) expected_uid=hex_compact(blocks[0].data(),4);
+            emit("Write " + std::to_string(++written)+"/"+std::to_string(order.size()));
+        }
+        if (mode == 1) {
+            // Both WRITE command and data ACKs were checked for every block.
+            // Gen1A intentionally finishes here without a read-back pass.
+            const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - started).count();
+            emit("OK " + std::to_string(written) + "/" + std::to_string(order.size()) +
+                 " blocks " + std::to_string(seconds) + "s");
+            if (error) error->clear();
+            return true;
+        }
+        emit("Verify 0/" + std::to_string(order.size()));
+        for (int block : order) {
+            bool ok=false;
+            for (int attempt=0;attempt<3 && !ok;++attempt) {
+                uint8_t check[16]{};
+                if (mode==4) ok=select_same() && gen4_read(block,check);
+                else {
+                    Crypto1Local crypto; std::array<uint8_t,16> readback{};
+                    ok=authenticate(block,crypto) && st25r_mfc_read_block(crypto,block,readback);
+                    std::copy(readback.begin(),readback.end(),check);
+                }
+                ok=ok && std::equal(check,check+16,blocks[block].begin());
+            }
+            if (!ok) return fail("Verify block " + std::to_string(block) + " failed (" + std::to_string(verified) + "/" + std::to_string(order.size()) + ")");
+            emit("Verify " + std::to_string(++verified)+"/"+std::to_string(order.size()));
+        }
+        const auto seconds=std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now()-started).count();
+        emit("OK " + std::to_string(verified)+"/"+std::to_string(order.size())+" blocks "+std::to_string(seconds)+"s");
+        if(error) error->clear();
+        return true;
+    }
+
+private:
     // Handles Gen1A magic cards (plain write), Gen3/Gen4 and standard MFC
     // (authenticated write). lines format: "NN: HEXHEX...", 16 bytes per line.
     bool writeNFCUnitMFC(const std::string &tag_type,

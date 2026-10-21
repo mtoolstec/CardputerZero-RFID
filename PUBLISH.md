@@ -1,58 +1,72 @@
-# Application Store Publish Record
+# RFID 1.0 publication record
 
-Portal: <https://dev.cardputer.cc/#/upload>
+- Package: `rfid`, version `1.0`, architecture `arm64`
+- Debian package: `build/rfid_1.0-1_arm64.deb`
+- SHA-256: `87de4c2b31607f835794b34a1f90492ff99aaadd729d6e2b15ba401677455d4d`
+- Maintainer: `whywilson <15230131+whywilson@users.noreply.github.com>`
+- Source: https://github.com/mtoolstec/CardputerZero-RFID
+- Uploader: `whywilson`; email hidden
+- Title: RFID; share code: `RFID`; license: MIT
+- Categories: Hardware & IoT, Security
+- Permissions: additional hardware required; other six store permissions false
+- Icon: `share/images/ic_rfid.png` (explicitly uploaded)
+- Screenshots: `screenshots/01.png` through `04.png`, four actual 320×170 captures
+- Demo: `build/release-1.0/rfid-1.0-review-complete.mp4`, real device framebuffer captured over SSH; includes connection recovery attempts
 
-## Package
+## Result
 
-- Debian package path: `build/rfid_0.4-m5stack1_arm64.deb`
-- Package: `rfid`
-- Version: `0.4`
-- Architecture: `arm64`
-- Maintainer: `m5stack <m5stack@m5stack.com>`
-- SHA-256: `c4921a458cc45d1c39f3d5b4af4dacf6aabd1f57959c3e03ef7b54726b40332e`
-- APPLaunch desktop path: `/usr/share/APPLaunch/applications/rfid.desktop`
-- Executable path: `/usr/share/APPLaunch/apps/rfid/M5CardputerZero-RFID`
+- User requested 1.0 publication on 2026-10-21 (Asia/Shanghai).
+- Portal: https://dev.cardputer.cc/#/upload
+- Accepted processing run: https://github.com/CardputerZero/packages/actions/runs/39574121090
+- Review PR: https://github.com/CardputerZero/packages/pull/201
+- Demo comment: https://github.com/CardputerZero/packages/pull/201#issuecomment-6312308314
+- Final package installed on the device after metadata corrections; executable unchanged from tested 1.0 build.
+- State: automated submission validation passed; waiting for first-release maintainer review and merge. Not yet listed as released.
+- Initial rejected submission: https://github.com/CardputerZero/packages/issues/200 (template Maintainer and missing explicit store icon; both corrected).
 
-## Source and Ownership
+## Validation and limitations
 
-- Public source repository: <https://github.com/CardputerZero/RFID>
-- Expected GitHub uploader/owner: `CardputerZero`
-- Hide uploader email: `true`
+- AArch64 build and Debian install passed; binary SHA-256 `da0756aae6d5e9e66c6a9d9bd17673e48a6f0b7d200eaff4331e214815287938`.
+- PN532 NTAG213 original/reloaded JSON and NTAG215 complete readback passed; original source restored.
+- Real launcher startup, READ/SAVED/EMU/TOOLS navigation and double-Esc exit checked.
+- SPI MFC 1K encrypted emulation FAILED restart authentication regression. Disabled by default in 1.0, including on a device with the helper installed. Explicit development opt-in: `NFC_SPI_MFC_EXPERIMENTAL=1`.
+- The 1.0 package does not install the experimental kernel helper. Android MFC compatibility is not claimed.
+- CAP external power was found off during one subsequent launch and required restoring the rail during debug. Recorded video includes recovery; repeat-launch power behavior needs further investigation.
+- Pre-existing changes remain in the workspace; no blanket source commit was made as part of publishing.
 
-## Listing
+## Local display hotfix (1.0.1, not submitted)
 
-- Application name: RFID
-- One-line summary: Scan, dump, emulate and manage NFC/UHF tags
-- Description: RFID standalone app for CardputerZero. Supports READ/SAVED/EMU/TOOLS workflows, NFC Unit, PN532, PN532Killer, and UHF readers.
-- Categories: Utilities, Development
+- Removed application-level panel inversion commands from display initialization.
+- Package: `build/rfid_1.0.1-1_arm64.deb`; built and installed on the device.
+- Hardware state restored to the board firmware setting (DCS 0x21); the attempted 0x20 recovery was incorrect for this panel.
+- Physical colour confirmation remains necessary: framebuffer captures do not show panel inversion. The original dark UI palette was not changed.
 
-## Assets
+## Gen1A Key A investigation (2026-10-21)
 
-- 256 x 256 source icon: `share/images/ic_rfid.png`
-- Icon packaged in `.deb`: `/usr/share/APPLaunch/share/images/ic_rfid.png`
-- Screenshot 1 (320 x 170): `screenshots/01.png`
-- Screenshot 2 (320 x 170): `screenshots/02.png`
-- Screenshot 3 (320 x 170): `screenshots/03.png`
-- Screenshot 4 (320 x 170): `screenshots/04.png`
-- Optional screenshot 5: `screenshots/05.png`
-- Optional screenshot 6: `screenshots/06.png`
+- User confirmed the launcher physical colours were restored after the factory panel setting was restored.
+- Current CAP card UID `4BD0C913`: three complete reads, each `OK 64/64 blocks 1s`; all 16 Key A fields were `FFFFFFFFFFFF`. Report: `tests/results/gen1a-key-a-2026-10-21.json`.
+- Historical `A3FC3EFC` zero-Key-A dump identifies its source as PN532Killer/default-key authenticated reading. This does not establish the cause of the user's current CAP report.
+- Fixed a separate confirmed key-export defect: CAP decimal block prefixes were included in key bytes. Export now uses the strict block parser and correct 4K trailer spacing. Device-side regression passed.
+- Candidate package: `build/rfid_1.0.2-1_arm64.deb`, package `rfid`, version `1.0.2`, architecture `arm64`. Build/package passed. Not installed or submitted; reported CAP zero-Key-A case remains unverified pending the affected card/result.
+- Physical-device demo supplied by user: https://youtube.com/shorts/LJY0yvFnH0k
+- Posted replacement video link: https://github.com/CardputerZero/packages/pull/201#issuecomment-6314923965
+- PR #201 remains open. Do not close it until a replacement submission is ready. A comment alone does not update the Debian artifact.
 
-## Preflight
+## Gen1A Saved write speed (2026-10-21)
 
-- [x] `.deb` exists and can be parsed.
-- [x] Control fields contain Package, Version, Architecture, and Maintainer.
-- [x] Architecture is `arm64`.
-- [x] APPLaunch `.desktop`, executable, and PNG icon exist inside the package.
-- [ ] Package name ownership and update version are valid.
-- [x] Listing copy and categories have been reviewed.
-- [x] Four clean 320 x 170 baseline screenshots exist.
-- [x] No credentials, tokens, or private server details are embedded.
-- [ ] The user explicitly approved external submission.
+- Gen1A now reuses the unlocked backdoor session across successful block writes. Failures trigger reselect/unlock before retry; command/data ACKs are still required.
+- Removed Gen1A's read-back verification pass at user request. Other modes retain write-then-verify.
+- Device fake-backend regression passed: one Gen1A unlock, zero read-back calls, write NAK failures, Gen4 verify and mismatch rejection.
+- Installed updated local `rfid` 1.0.2 package. SHA-256: `da26a299dbc923d631d360499ca0253e18eaa027b95dc113bdfa73ab4d06cb3e`.
+- Physical CAP/card `4BD0C913`: rewrote its backed-up contents through Saved Gen1A; result `OK 64/64 blocks 2s`. Independent developer read-back matched all 64 original blocks. Report: `tests/results/gen1a-fast-write-2026-10-21.json`.
+- Returned to launcher after debug. Store submission remains pending the separate reported zero-Key-A investigation.
 
-## Submission Result
+## 1.0.3 preparation
 
-- Status: `not submitted`
-- Submitted at: TODO
-- Portal message: TODO
-- Actions URL: TODO
-- Tracking or pull-request URL: TODO
+- PR #201 is now merged (2026-10-21T11:46:48Z). Preserve it as release history; submit a newer package normally.
+- Version: `1.0.3`, package `rfid`, architecture `arm64`.
+- Changes: firmware-derived panel-mode recovery at app start, CAP operation boundaries and clean exit; fast Gen1A ACK-only Saved write; correct prefixed dump key export; separate `main/nfc` service/driver directory; remove unused legacy copies and consolidate test/build entry points.
+- Six fake-transport/storage/parser regression suites passed on the device via `tools/run_tests.py`. Python, shell, metadata and four screenshot checks passed.
+- Recovery executes successfully under the stock `pi` account. Intermittent panel-mode trigger remains unproven; no claim that the SPI root cause has been established.
+- Reported CAP zero-Key-A issue was not reproduced on the available card. Do not substitute guessed keys or advertise this separate issue as fixed.
+- SPI encrypted MFC 1K emulation remains experimental and disabled by default; kernel helper and development utilities are excluded from the store package.

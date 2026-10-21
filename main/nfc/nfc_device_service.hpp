@@ -3,6 +3,7 @@
 #include "nfc_hex_logger.hpp"
 #include "nfc_i2c_device.hpp"
 #include "nfc_spi_device.hpp"
+#include "nfc_mfc_emulator.hpp"
 #include "nfc_protocol.hpp"
 #include "nfc_storage.hpp"
 
@@ -23,6 +24,10 @@
 #include <thread>
 #include <tuple>
 #include <unordered_map>
+#if defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#endif
 
 namespace nfc_app {
 
@@ -106,7 +111,12 @@ public:
         }
         // Restore last-used transport kind + path so the UI starts on the right mode
         const TransportKind saved_kind = storage_.load_last_transport_kind();
-        const std::string saved_path   = storage_.load_last_endpoint_path();
+        std::string saved_path = storage_.load_last_endpoint_path();
+#if defined(__linux__)
+        // Migrate the earlier CAP software-CS selection to its dedicated node.
+        if (saved_kind == TransportKind::SpiBus && saved_path == "/dev/spidev0.1" &&
+            ::access("/dev/spidev0.2", F_OK) == 0) saved_path = "/dev/spidev0.2";
+#endif
         if (saved_kind != TransportKind::Mock) {
             intended_kind_ = saved_kind;
             bool restored = false;
@@ -2223,6 +2233,26 @@ public:
                                   progress, error);
     }
 
+    bool spi_write_saved(const SavedRecord &record, int mode, const std::string &password,
+                         const std::function<void(const std::string&)> &progress, std::string *error)
+    {
+        stop_nfcunit_mfkey_sniffer(true);
+        std::lock_guard<std::mutex> op(transport_op_mutex_);
+        NfcSpiDevice *dev = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (scan_.running || !spi_device_ || !spi_device_->is_open()) {
+                if (error) *error="M5 NFC CAP busy or disconnected";
+                return false;
+            }
+            dev=spi_device_.get();
+        }
+        if (record.tag.protocol != ProtocolKind::MifareClassic) {
+            if(error) *error="SPI write supports MFC dumps only";return false;
+        }
+        return dev->write_mfc_dump(record.tag.raw_data,mode,password,&mifare_keys_hex_list_,progress,error);
+    }
+
     // Write tag data via PN532 / PN532Killer (UART/USB transport).
     // First scans for a tag, detects its type, then routes to the appropriate
     // write path based on the LIVE CARD (not the saved record's protocol).
@@ -2741,6 +2771,9 @@ public:
 
     bool spi_start_current_profile(std::string *error = nullptr)
     {
+        // MFKey and EMU must never consume frames from the same listener.
+        stop_nfcunit_mfkey_sniffer(true);
+        stop_nfcunit_emulation_worker(false);
         int profile = 0;
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -2760,30 +2793,31 @@ public:
             return false;
         }
 
-        // Load NTAG memory for NTAG profiles
+        // Re-read the current JSON on every start, after stopping the old worker.
+        // A running session owns a stable snapshot until explicitly restarted.
+        stop_spi_emulation_worker(true);
         const ProtocolKind proto = spi_profile_protocol_for_index(profile);
-        if (proto == ProtocolKind::Iso14443A) {
-            // Try loading from emulator JSON first, then fall back to default
-            std::vector<uint8_t> mem = storage_.load_ntag_emulator_memory();
-            if (mem.empty()) {
-                // Generate default NTAG memory with URI
-                const size_t pages = (profile == 1) ? kNfcUnitNtag213Pages : 135; // NTAG213=45, NTAG215=135
-                std::string uri = "https://m5stack.com";
-                mem = default_nfcunit_ntag_memory(pages, uri);
-                // Override UID bytes with profile UID
-                for (size_t i = 0; i < uid.size() && i < 9; ++i) mem[i] = uid[i];
-                // Fix BCC for the new UID
-                const uint8_t bcc0 = static_cast<uint8_t>(0x88 ^ uid[0] ^ uid[1] ^ uid[2]);
-                mem[3] = bcc0;
-                if (uid.size() == 7) {
-                    const uint8_t bcc1 = static_cast<uint8_t>(uid[3] ^ uid[4] ^ uid[5] ^ uid[6]);
-                    mem[8] = bcc1;
-                }
+        auto mem = storage_.load_emulator_memory(proto);
+        if (proto == ProtocolKind::MifareClassic) {
+            if (mem.size() != 1024) {
+                if (error) *error = "MFC 1K JSON must contain 64 blocks of 16 bytes";
+                return false;
             }
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                spi_ntag_mem_ = std::move(mem);
+            uid.assign(mem.begin(), mem.begin()+4);
+            atqa = 0x0004; sak = 0x08;
+        } else {
+            const size_t pages = profile == 1 ? 45 : 135;
+            if (mem.empty() || mem.size()%4 || mem.size()<16 || mem.size()>pages*4) {
+                if (error) *error = "Invalid NTAG JSON memory size for profile";
+                return false;
             }
+            mem.resize(pages*4, 0);
+            uid = {mem[0],mem[1],mem[2],mem[4],mem[5],mem[6],mem[7]};
+            atqa=0x0044; sak=0x00;
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            spi_ntag_mem_=std::move(mem);
         }
 
         return spi_start_listener_a(uid, atqa, sak, error);
@@ -2821,9 +2855,10 @@ public:
         std::ostringstream oss;
         oss << "spi_caps"
             << " nfca_emu=1"
-            << " mfc1k=1"
+            << " mfc1k=" << (spi_device_ && spi_device_->mfc_tx_driver_available()?1:0)
+            << " mfc1k_read_only=1"
+            << " ntag213=1"
             << " ntag215=1"
-            << " ntag216=1"
             << " iso15693_emu=" << (spi_supports_iso15693_emulation() ? 1 : 0)
             << " iso15693_reason=" << spi_iso15693_emulation_reason();
         return oss.str();
@@ -2843,12 +2878,17 @@ public:
             if (!spi_device_->start_listener_a(uid, atqa, sak, error)) {
                 return false;
             }
+            if (sak==0x08 && !spi_device_->prepare_mfc_tx(error)) {
+                spi_device_->stop_listener();
+                return false;
+            }
             spi_emu_uid_ = uid;
             spi_emu_atqa_ = atqa;
             spi_emu_sak_ = sak;
         }
 
         spi_emu_cancel_.store(false);
+        spi_mfc_emulation_running_.store(sak==0x08);
         spi_emu_thread_ = std::thread([this]() { spi_listener_worker(); });
         return true;
     }
@@ -2857,6 +2897,8 @@ public:
     {
         stop_spi_emulation_worker(true);
     }
+
+    bool spi_mfc_emulation_active() const { return spi_mfc_emulation_running_.load(); }
 
     bool spi_listener_active() const
     {
@@ -2877,9 +2919,8 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         if (!spi_ntag_mem_.empty()) return;
         const ProtocolKind proto = spi_profile_protocol_for_index(spi_emu_profile_);
-        if (proto != ProtocolKind::Iso14443A) return;
-        std::vector<uint8_t> mem = storage_.load_ntag_emulator_memory();
-        if (mem.empty()) {
+        std::vector<uint8_t> mem = storage_.load_emulator_memory(proto);
+        if (mem.empty() && proto == ProtocolKind::Iso14443A) {
             const size_t pages = (spi_emu_profile_ == 1) ? kNfcUnitNtag213Pages : 135;
             mem = default_nfcunit_ntag_memory(pages, "https://m5stack.com");
         }
@@ -3276,6 +3317,7 @@ public:
         }
 
         std::lock_guard<std::mutex> lock(mutex_);
+        if (reset_reader_mode && spi_device_ && connection_.device_kind == DeviceKind::ST25RNFC) spi_device_->stop_listener();
         if (reset_reader_mode && i2c_device_ && i2c_device_->is_open()) {
             if (i2c_device_->is_nfc_unit()) {
                 i2c_device_->nfcunit_stop_listener();
@@ -3297,26 +3339,49 @@ public:
         uint8_t pending_sector = 0;
         uint8_t pending_key_type = 0;
         uint32_t pending_nt = 0;
+        auto auth_deadline = std::chrono::steady_clock::now();
 
         while (!nfc_unit_mfkey_sniff_cancel_.load()) {
             I2cGroveNfcDevice *dev = nullptr;
+            NfcSpiDevice *spi = nullptr;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 dev = i2c_device_.get();
+                if (connection_.device_kind == DeviceKind::ST25RNFC) spi = spi_device_.get();
             }
 
-            if (!dev || !dev->is_open() || !dev->is_nfc_unit()) break;
+            if (!spi && (!dev || !dev->is_open() || !dev->is_nfc_unit())) break;
 
+            if (pending_auth && std::chrono::steady_clock::now() >= auth_deadline) pending_auth = false;
             std::vector<uint8_t> frame;
-            if (!dev->nfcunit_poll_listener_frame(frame, 25)) {
+            if (!(spi ? spi->poll_listener_frame(frame, 25) : dev->nfcunit_poll_listener_frame(frame, 25))) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
                 continue;
             }
 
-            NfcHexLog::get().log_rx("MFKEY-I2C", frame.data(), frame.size());
+            // Logging AUTH before replying adds filesystem latency to its deadline.
+            if (!((frame.size()==2 || frame.size()==4) && (frame[0]==0x60 || frame[0]==0x61)))
+                NfcHexLog::get().log_rx(spi ? "MFKEY-SPI" : "MFKEY-I2C", frame.data(), frame.size());
+            if (spi && !pending_auth) {
+                const uint8_t u[] = {uint8_t(uid >> 24), uint8_t(uid >> 16), uint8_t(uid >> 8), uint8_t(uid)};
+                if (frame.size() == 1 && (frame[0] == 0x26 || frame[0] == 0x52)) {
+                    const uint8_t atqa[] = {0x04, 0x00};
+                    spi->send_listener_frame(atqa, 2, false); continue;
+                }
+                if (frame.size() == 2 && frame[0] == 0x93 && frame[1] == 0x20) {
+                    const uint8_t cl[] = {u[0], u[1], u[2], u[3], uint8_t(u[0]^u[1]^u[2]^u[3])};
+                    spi->send_listener_frame(cl, 5, false); continue;
+                }
+                if (frame.size() >= 7 && frame[0] == 0x93 && frame[1] == 0x70) {
+                    const uint8_t sak[] = {0x08};
+                    spi->send_listener_frame(sak, 1, true); continue;
+                }
+            }
 
-            if (frame.size() >= 2 && (frame[0] == 0x60 || frame[0] == 0x61)) {
+
+            if ((frame.size() == 2 || frame.size() == 4) && (frame[0] == 0x60 || frame[0] == 0x61)) {
                 pending_auth = true;
+                auth_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
                 pending_sector = mfc_block_to_sector(frame[1]);
                 pending_key_type = (frame[0] == 0x61) ? 1 : 0;
                 pending_nt = mfclassic_make_weak_nonce(&weak_nonce_state);
@@ -3335,17 +3400,36 @@ public:
                     static_cast<uint8_t>((pending_nt >> 16) & 0xFF),
                     static_cast<uint8_t>((pending_nt >> 24) & 0xFF),
                 };
-                dev->nfcunit_send_listener_frame(nt_resp, sizeof(nt_resp));
-                NfcHexLog::get().log_tx("MFKEY-I2C", nt_resp, sizeof(nt_resp));
+                std::reverse(nt_resp, nt_resp + 4);
+                if (spi && !spi->listener_set_mfclassic_auth_rx(true)) { pending_auth=false; continue; }
+                if (!spi && !dev->nfcunit_listener_set_mfclassic_auth_rx(true)) { pending_auth=false; continue; }
+                const bool sent = spi ? spi->send_listener_frame(nt_resp, sizeof(nt_resp), false)
+                                     : dev->nfcunit_send_listener_frame(nt_resp, sizeof(nt_resp), false);
+                if (!sent) pending_auth = false;
+                nfc_unit_mfkey_auth_requests_.fetch_add(1);
+                NfcHexLog::get().log_rx(spi ? "MFKEY-SPI" : "MFKEY-I2C", frame.data(), frame.size());
+                NfcHexLog::get().log_tx(spi ? "MFKEY-SPI" : "MFKEY-I2C", nt_resp, sizeof(nt_resp));
                 continue;
             }
 
-            if (pending_auth && frame.size() >= 8) {
+            if (pending_auth && frame.size() == 9) {
+                std::vector<uint8_t> data(8,0);
+                for (size_t b=0;b<8;++b) for (size_t bit=0;bit<8;++bit) {
+                    const size_t pos=b*9+bit;
+                    data[b] |= ((frame[pos/8] >> (pos%8)) & 1) << bit;
+                }
+                frame = std::move(data);
+            }
+            if (pending_auth && frame.size() == 8) {
                 NfcUnitMfkeyEntry e;
                 e.uid = uid;
                 e.nt = pending_nt;
                 e.nr = read_le_u32(frame.data());
                 e.ar = read_le_u32(frame.data() + 4);
+                {
+                    auto be32 = [](const uint8_t *p) { return (uint32_t(p[0])<<24)|(uint32_t(p[1])<<16)|(uint32_t(p[2])<<8)|p[3]; };
+                    e.nr = be32(frame.data()); e.ar = be32(frame.data()+4);
+                }
                 e.sector = pending_sector;
                 e.key_type = pending_key_type;
 
@@ -3361,8 +3445,9 @@ public:
                 NfcHexLog::get().log_event("mfkey32v2", line);
 
                 uint8_t at_resp[4] = {0, 0, 0, 0};
-                dev->nfcunit_send_listener_frame(at_resp, sizeof(at_resp));
-                NfcHexLog::get().log_tx("MFKEY-I2C", at_resp, sizeof(at_resp));
+                if (spi) spi->send_listener_frame(at_resp, sizeof(at_resp), false);
+                else dev->nfcunit_send_listener_frame(at_resp, sizeof(at_resp), false);
+                NfcHexLog::get().log_tx(spi ? "MFKEY-SPI" : "MFKEY-I2C", at_resp, sizeof(at_resp));
 
                 pending_auth = false;
             }
@@ -3372,7 +3457,7 @@ public:
         NfcHexLog::get().log_event("mfkey32v2", "NFCUnit sniff worker stopped");
     }
 
-    bool start_nfcunit_mfkey_sniffer(std::string *error = nullptr)
+    bool start_nfcunit_mfkey_sniffer(std::string *error = nullptr, bool preserve_entries = false)
     {
         // Best-effort stop stale worker before a new sniff session.
         nfc_unit_mfkey_sniff_cancel_.store(true);
@@ -3381,7 +3466,9 @@ public:
         }
 
         std::lock_guard<std::mutex> lock(mutex_);
-        if (!i2c_device_ || !i2c_device_->is_open() || !i2c_device_->is_nfc_unit()) {
+        const bool use_spi = connection_.device_kind == DeviceKind::ST25RNFC;
+        if (use_spi ? (!spi_device_ || !spi_device_->is_open()) :
+            (!i2c_device_ || !i2c_device_->is_open() || !i2c_device_->is_nfc_unit())) {
             if (error) *error = "NFC Unit not connected";
             return false;
         }
@@ -3399,7 +3486,9 @@ public:
         const uint32_t uid_u32 = static_cast<uint32_t>(std::stoul(uid_hex, nullptr, 16));
 
         const std::vector<uint8_t> uid_vec = {uid[0], uid[1], uid[2], uid[3]};
-        const bool emu_ok = i2c_device_->nfcunit_start_listener_a(uid_vec, kNfcUnitMfc1kAtqa, kNfcUnitMfc1kSak);
+        const bool emu_ok = use_spi
+            ? spi_device_->start_listener_a(uid_vec, kNfcUnitMfc1kAtqa, kNfcUnitMfc1kSak, error)
+            : i2c_device_->nfcunit_start_listener_a(uid_vec, kNfcUnitMfc1kAtqa, kNfcUnitMfc1kSak);
         if (!emu_ok) {
             if (error) *error = "NFC Unit listener init failed";
             return false;
@@ -3407,7 +3496,10 @@ public:
 
         {
             std::lock_guard<std::mutex> lk(nfc_unit_mfkey_mutex_);
-            nfc_unit_mfkey_entries_.clear();
+            if (!preserve_entries || uid_u32 != nfc_unit_mfkey_uid_) {
+                nfc_unit_mfkey_entries_.clear();
+                nfc_unit_mfkey_auth_requests_.store(0);
+            }
         }
         nfc_unit_mfkey_uid_ = uid_u32;
         nfc_unit_mfkey_sniff_cancel_.store(false);
@@ -3450,7 +3542,7 @@ public:
             mfkey_sniff_uid_hex_ = keep_hex_chars_upper(uid_hex.substr(0, 8));
         }
 
-        if (kind == DeviceKind::NFCUnit) {
+        if ((kind == DeviceKind::NFCUnit || kind == DeviceKind::ST25RNFC)) {
             return true;
         }
 
@@ -3461,7 +3553,7 @@ public:
 
     // Synchronously enter sniffer mode on the device.
     // with_card=false → mfkey32v2 (no-card), with_card=true → mfkey64 (card-present)
-    bool hw_sniff_enter_mode(bool with_card)
+    bool hw_sniff_enter_mode(bool with_card, bool resume = false)
     {
         NfcHexLog::get().log_event(with_card ? "mfkey64" : "mfkey32v2",
                                    with_card ? "enter card-present sniffer mode" : "enter no-card sniffer mode");
@@ -3473,13 +3565,13 @@ public:
             kind = connection_.device_kind;
         }
 
-        if (kind == DeviceKind::NFCUnit) {
+        if ((kind == DeviceKind::NFCUnit || kind == DeviceKind::ST25RNFC)) {
             if (with_card) {
                 NfcHexLog::get().log_event("mfkey64", "NFCUnit does not support card-present mfkey64 flow");
                 return false;
             }
             std::string err;
-            const bool ok = start_nfcunit_mfkey_sniffer(&err);
+            const bool ok = start_nfcunit_mfkey_sniffer(&err, resume);
             if (!ok && !err.empty()) NfcHexLog::get().log_event("mfkey32v2", err.c_str());
             return ok;
         }
@@ -3668,6 +3760,8 @@ public:
         cancel_hw_mfkey_.store(false);
         hw_mfkey_running_  = true;
         hw_mfkey_progress_ = 0;
+        hw_mfkey_elapsed_ms_ = 0;
+        hw_mfkey_started_at_ = std::chrono::steady_clock::now();
         hw_mfkey_results_.clear();
         hw_mfkey_thread_ = std::thread([this, with_card]() {
             perform_hw_mfkey(with_card);
@@ -3676,10 +3770,41 @@ public:
         return true;
     }
 
+    struct MfkeyCaptureStatus {
+        size_t entries = 0;
+        size_t best_group = 0;
+        size_t ready_groups = 0;
+        unsigned auth_requests = 0;
+    };
+
+    // A usable pair must belong to the same UID/sector/key and have different NTs.
+    MfkeyCaptureStatus hw_mfkey_capture_status() const
+    {
+        MfkeyCaptureStatus status;
+        status.auth_requests = nfc_unit_mfkey_auth_requests_.load();
+        std::map<std::tuple<uint32_t, uint8_t, uint8_t>, std::set<uint32_t>> groups;
+        std::lock_guard<std::mutex> lock(nfc_unit_mfkey_mutex_);
+        for (const auto &entry : nfc_unit_mfkey_entries_)
+            groups[{entry.uid, entry.sector, entry.key_type}].insert(entry.nt);
+        for (const auto &group : groups) {
+            status.entries += group.second.size();
+            status.best_group = std::max(status.best_group, group.second.size());
+            if (group.second.size() >= 2) ++status.ready_groups;
+        }
+        return status;
+    }
+
     bool hw_mfkey_running() const
     {
         std::lock_guard<std::mutex> lk(pending_log_mutex_);
         return hw_mfkey_running_;
+    }
+
+    uint64_t hw_mfkey_elapsed_ms() const
+    {
+        std::lock_guard<std::mutex> lock(pending_log_mutex_);
+        return hw_mfkey_running_ ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - hw_mfkey_started_at_).count()) : hw_mfkey_elapsed_ms_;
     }
 
     int hw_mfkey_progress() const
@@ -3810,8 +3935,10 @@ public:
     bool set_spi_profile_index(int profile)
     {
         if (profile < 0 || profile > 2) return false;
+        stop_spi_emulation_worker(true);
         std::lock_guard<std::mutex> lock(mutex_);
         spi_emu_profile_ = profile;
+        spi_ntag_mem_.clear();
         selected_emulator_protocol_ = spi_profile_protocol_for_index(spi_emu_profile_);
         return true;
     }
@@ -3824,8 +3951,10 @@ public:
 
     void toggle_spi_profile()
     {
+        stop_spi_emulation_worker(true);
         std::lock_guard<std::mutex> lock(mutex_);
         spi_emu_profile_ = (spi_emu_profile_ + 1) % 3;
+        spi_ntag_mem_.clear();
         selected_emulator_protocol_ = spi_profile_protocol_for_index(spi_emu_profile_);
     }
 
@@ -5140,6 +5269,7 @@ private:
 
     void stop_spi_emulation_worker(bool stop_listener)
     {
+        spi_mfc_emulation_running_.store(false);
         spi_emu_cancel_.store(true);
         if (spi_emu_thread_.joinable()) spi_emu_thread_.join();
         if (stop_listener) {
@@ -5312,10 +5442,32 @@ private:
 
     void spi_listener_worker()
     {
+#if defined(__linux__)
+        // Transparent MFC replies must not be delayed by ordinary UI work.
+        // Only this joinable RF worker is promoted; its policy ends on exit.
+        sched_param rf_priority{};
+        rf_priority.sched_priority = 20; // APPLaunch's existing RT priority limit
+        if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &rf_priority)!=0) {
+            rf_priority.sched_priority=10;
+            (void)pthread_setschedparam(pthread_self(), SCHED_FIFO, &rf_priority);
+        }
+        // Keep turnaround work off the CPU serving most peripheral IRQs.
+        cpu_set_t available;
+        if (pthread_getaffinity_np(pthread_self(), sizeof(available), &available)==0) {
+            for (int cpu=CPU_SETSIZE-1;cpu>=0;--cpu) {
+                if (!CPU_ISSET(cpu,&available)) continue;
+                cpu_set_t rf_cpu; CPU_ZERO(&rf_cpu); CPU_SET(cpu,&rf_cpu);
+                (void)pthread_setaffinity_np(pthread_self(), sizeof(rf_cpu), &rf_cpu);
+                break;
+            }
+        }
+#endif
         auto calc_bcc = [](uint8_t a, uint8_t b, uint8_t c, uint8_t d) -> uint8_t {
             return static_cast<uint8_t>(a ^ b ^ c ^ d);
         };
 
+        MfcEmulator mfc;
+        uint16_t nonce_state = static_cast<uint16_t>(std::random_device{}());
         bool anticollision_started = false;
         bool anticollision_done    = false;  // SAK sent, now in data-exchange state
 
@@ -5347,6 +5499,36 @@ private:
                     sak = spi_emu_sak_;
                 }
 
+                const bool is_mfc = sak == 0x08;
+                if (is_mfc && mfc.state() != MfcEmulator::State::Idle && dev->listener_mfclassic_raw_rx()) {
+                    std::vector<uint8_t> encrypted;
+                    size_t bits=0;
+                    const bool replied=mfc.handle(frame,spi_ntag_mem_,encrypted,bits);
+                    const bool sent=replied && dev->send_listener_raw_frame(encrypted,bits);
+                    if (std::getenv("NFC_SPI_LISTENER_TRACE")) std::fprintf(stderr,"[SPI-MFC] rx=%s state=%d tx=%s bits=%zu ok=%d\n",
+                        bytes_to_hex_string(frame.data(),frame.size()).c_str(),int(mfc.state()),
+                        bytes_to_hex_string(encrypted.data(),encrypted.size()).c_str(),bits,int(sent));
+                    continue;
+                }
+                if (is_mfc) mfc.reset();
+                // Normal NFC-A commands include a CRC in the chip FIFO.
+                if (frame.size()>=3) {
+                    const uint16_t c=MfcEmulator::crc(frame.data(),frame.size()-2);
+                    if (frame[frame.size()-2]==uint8_t(c) && frame.back()==uint8_t(c>>8)) frame.resize(frame.size()-2);
+                }
+                if (is_mfc && frame.size()==2 && (frame[0]==0x60 || frame[0]==0x61)) {
+                    std::vector<uint8_t> nt;
+                    uint32_t uid32=0;for(size_t i=uid.size()-4;i<uid.size();++i) uid32=(uid32<<8)|uid[i];
+                    const uint32_t nonce=mfclassic_make_weak_nonce(&nonce_state);
+                    if (mfc.challenge(frame[1],frame[0]==0x61,uid32,nonce,spi_ntag_mem_,nt)) {
+                        dev->listener_set_mfclassic_auth_rx(true);
+                        dev->send_listener_frame(nt.data(),nt.size(),false);
+                    }
+                    continue;
+                }
+                // Hardware passive-target memory performs selection autonomously.
+                if (!is_mfc && (frame[0]==0x30 || frame[0]==0x3A || frame[0]==0x60 || frame[0]==0x3C || frame[0]==0x1B || frame[0]==0xA2))
+                    anticollision_done=true;
                 const uint8_t cmd0 = frame[0];
                 const uint8_t cmd1 = frame.size() > 1 ? frame[1] : 0x00;
 
@@ -5440,7 +5622,7 @@ private:
                 }
 
                 // ── NTAG Data-exchange phase (after anticollision) ─────────
-                if (!handled && anticollision_done) {
+                if (!handled && anticollision_done && !is_mfc) {
                     const std::vector<uint8_t> &mem = spi_ntag_mem_;
                     const size_t pages = mem.size() / 4;
 
@@ -5455,7 +5637,9 @@ private:
                                         mem.begin() + static_cast<ptrdiff_t>(p * 4),
                                         mem.begin() + static_cast<ptrdiff_t>(p * 4 + 4));
                                 } else {
-                                    response.insert(response.end(), 4, 0x00);
+                                    // Type 2 READ wraps to page zero at the memory boundary.
+                                    const auto wrapped=(p%pages)*4;
+                                    response.insert(response.end(),mem.begin()+wrapped,mem.begin()+wrapped+4);
                                 }
                             }
                         }
@@ -5479,6 +5663,7 @@ private:
                     } else if (cmd0 == 0x60 && frame.size() == 1) {
                         // GET_VERSION
                         response.assign(ntag_version, ntag_version + sizeof(ntag_version));
+                        response[6] = pages > 45 ? 0x11 : 0x0F;
                         with_crc = true;
                         handled = true;
                     } else if (cmd0 == 0x3C && frame.size() >= 2 && frame[1] == 0x00) {
@@ -7282,7 +7467,12 @@ private:
                     dumped = spi_dev->scan_and_dump_iso15693(&card_info, &blocks, &dump_err);
                 } else {
                     push_log("> Dumping SPI ST25R (Gen1A)...");
-                    dumped = spi_dev->scan_and_dump_gen1a(&card_info, &blocks, &dump_err);
+                    dumped = spi_dev->scan_and_dump_gen1a(&card_info, &blocks, &dump_err,
+                        [this, &bytes_to_hex](int block, const std::vector<uint8_t> &data) {
+                            char prefix[8];
+                            std::snprintf(prefix, sizeof(prefix), "%02d:", block);
+                            push_log(data.empty() ? "ERR block " + std::to_string(block) : std::string(prefix) + bytes_to_hex(data));
+                        });
                 }
 
                 if (dumped) {
@@ -7324,13 +7514,18 @@ private:
                     record.mifare_dump->attack.status = AttackStatus::Success;
                     record.mifare_dump->attack.dump_obtained = !dump_lines.empty();
 
-                    emit_dump_lines(dump_lines);
-                    if (!dump_err.empty()) push_log(std::string("WARN ") + dump_err);
-                    push_log("Tip: Press Ctrl+S to save dump.");
+                    if (is_ntag || is_iso15) {
+                        emit_dump_lines(dump_lines);
+                        if (!dump_err.empty()) push_log(std::string("WARN ") + dump_err);
+                        push_log("Tip: Press Ctrl+S to save dump.");
+                    } else {
+                        push_log(spi_dev->gen1a_summary());
+                    }
                     success = !record.tag.raw_data.empty();
                 } else {
-                    error = dump_err.empty() ? "SPI dump failed" : dump_err;
-                    push_log(std::string("ERR ") + error);
+                    error = (!is_ntag && p != ProtocolKind::Iso15693 && !spi_dev->gen1a_summary().empty())
+                        ? spi_dev->gen1a_summary() : (dump_err.empty() ? "SPI dump failed" : dump_err);
+                    push_log(error.rfind("ERR ", 0) == 0 ? error : std::string("ERR ") + error);
                 }
             }
         } else if (endpoint.kind == TransportKind::Mock) {
@@ -7989,11 +8184,12 @@ private:
     std::atomic<bool> nfc_unit_emu_cancel_{false};
     std::thread spi_emu_thread_;
     std::atomic<bool> spi_emu_cancel_{false};
+    std::atomic<bool> spi_mfc_emulation_running_{false};
     int spi_emu_profile_ = 1;  // 0=MFC 1K, 1=NTAG213, 2=NTAG215
     std::vector<uint8_t> spi_emu_uid_;
     uint16_t spi_emu_atqa_ = 0;
     uint8_t spi_emu_sak_ = 0;
-    std::vector<uint8_t> spi_ntag_mem_;  // NTAG emulation memory buffer (180 bytes for NTAG213)
+    std::vector<uint8_t> spi_ntag_mem_;  // Stable JSON snapshot: MFC blocks or NTAG pages
     std::atomic<bool> nfc_unit_emu_running_{false};
     ProtocolKind nfc_unit_emu_protocol_ = ProtocolKind::Iso14443A;
     int nfc_unit_emu_profile_ = 0;  // 0=NTAG213, 1=ISO15693
@@ -8002,6 +8198,7 @@ private:
     std::vector<uint8_t> nfc_unit_ntag_mem_;
     mutable std::mutex nfc_unit_mfkey_mutex_;
     std::vector<NfcUnitMfkeyEntry> nfc_unit_mfkey_entries_;
+    std::atomic<unsigned> nfc_unit_mfkey_auth_requests_{0};
     std::map<std::string, std::vector<MifareSectorKey>> mifare_read_key_maps_; // guarded by mutex_
     std::vector<std::string> mifare_keys_hex_list_;  // MFC key list for auth (dump + write)
     std::string mfkey_sniff_uid_hex_ = "11223344";
@@ -8017,6 +8214,8 @@ private:
     bool hw_upload_ok_       = false;
     bool hw_mfkey_running_   = false;
     int  hw_mfkey_progress_  = 0;
+    uint64_t hw_mfkey_elapsed_ms_ = 0;
+    std::chrono::steady_clock::time_point hw_mfkey_started_at_{};
     bool nfc_unit_emu_start_running_ = false;
     bool nfc_unit_emu_start_has_result_ = false;
     bool nfc_unit_emu_start_ok_ = false;
@@ -8386,6 +8585,7 @@ private:
     // Fetches sniff nonces from PN532Killer and calls mfkey64/mfkey32v2 binaries.
     void perform_hw_mfkey(bool with_card)
     {
+        const auto calculation_started = std::chrono::steady_clock::now();
         NfcHexLog::get().log_event(with_card ? "mfkey64" : "mfkey32v2",
                                    with_card ? "start mfkey64" : "start mfkey32v2");
         // Wait for device to finish saving sniffer log after reader-mode switch.
@@ -8403,7 +8603,7 @@ private:
         std::vector<MfkeyResult> results;
 
         std::vector<Pn532KillerClient::MfkeyEntry> entries;
-        if (kind == DeviceKind::NFCUnit) {
+        if ((kind == DeviceKind::NFCUnit || kind == DeviceKind::ST25RNFC)) {
             if (with_card) {
                 NfcHexLog::get().log_event("mfkey64", "NFCUnit path supports mfkey32v2 only");
             } else {
@@ -8516,6 +8716,8 @@ private:
             NfcHexLog::get().log_event(with_card ? "mfkey64" : "mfkey32v2", msg);
         }
         std::lock_guard<std::mutex> lk(pending_log_mutex_);
+        hw_mfkey_elapsed_ms_ = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - calculation_started).count());
         hw_mfkey_running_  = false;
         hw_mfkey_progress_ = 100;
         hw_mfkey_results_  = results;

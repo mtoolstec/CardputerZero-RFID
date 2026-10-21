@@ -806,6 +806,9 @@ public:
     static void grove_gpio_enable_bcm(int bcm_pin, bool high)
     {
 #if defined(__linux__)
+        // The kernel LED driver owns the Grove mux GPIO on Cardputer Zero;
+        // sysfs GPIO export cannot claim it. Use its writable control first.
+        if (bcm_pin == 4 && set_power_rail("/sys/class/leds/grove_fun/brightness", high)) return;
         // Find the base of the BCM/pinctrl chip (label = "pinctrl-bcm2835")
         int base = grove_find_chip_base("pinctrl-bcm2835");
         if (base < 0) base = 0; // fallback: no offset (bare sysfs numbering)

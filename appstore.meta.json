@@ -1,16 +1,19 @@
 {
   "title": "RFID",
   "summary": "Scan, dump, emulate and manage NFC/UHF tags",
-  "description": "RFID standalone app for CardputerZero. Supports READ/SAVED/EMU/TOOLS workflow, NFC Unit, PN532 and PN532Killer scenarios.",
+  "description": "RFID for CardputerZero: READ, SAVED, EMU and TOOLS for NFC/UHF readers. Includes M5 NFC CAP (SPI), M5 NFC Unit (IIC), PN532 and PN532Killer workflows, saved MFC dump writing, MFKey32v2/MFKey64/Staticnested tools and JSON-backed NTAG emulation. Hardware support varies by function. SPI MFC 1K encrypted emulation remains experimental and is disabled by default; it is not advertised as a stable feature.",
   "locales": {
     "zh-CN": {
       "title": "RFID",
       "summary": "NFC/UHF 扫描、Dump、模拟与工具集"
     }
   },
-  "categories": ["Utilities", "Development"],
+  "categories": [
+    "Hardware & IoT",
+    "Security"
+  ],
   "license": "MIT",
-  "source_repo": "https://github.com/CardputerZero/RFID",
+  "source_repo": "https://github.com/mtoolstec/CardputerZero-RFID",
   "icon": "share/images/ic_rfid.png",
   "screenshots": [
     "screenshots/01.png",
@@ -19,9 +22,16 @@
     "screenshots/04.png"
   ],
   "permissions": {
-    "keyboard_input": true,
-    "external_hardware": true,
-    "filesystem": "app-data-only",
-    "network": false
-  }
+    "camera": false,
+    "microphone": false,
+    "imu": false,
+    "network": false,
+    "additional_hardware": true,
+    "background_service": false,
+    "external_display": false
+  },
+  "author": {
+    "display_name": "whywilson"
+  },
+  "share_code": "RFID"
 }

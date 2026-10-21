@@ -1,42 +1,21 @@
-# Build artifacts
-build/
-dist/
-static_lib/
-dist_mfkey/
-.sconsign.dblite
-
-# Python cache
-__pycache__/
-*.pyc
-
-# macOS
-.DS_Store
-dist_stage/
-
-# Python tools
-__pycache__/
-*.pyc
-tools/__pycache__/
-
-# macOS
-.DS_Store
-
-# screenshots
-screenshots/.DS_Store
-
-# Build artifacts
+# Generated binaries and SDK dependencies
 build/
 dist/
 dist_stage/
 dist_mfkey/
-.sconsign.dblite
-
-# Platform
-screenshots/
-packaging/
-nfc_i2c_magic_probe.cpp
-
-# Local deploy script
-build_and_deploy.sh
-static_lib_v0.0.*.tar.gz
 static_lib
+static_lib_v*.tar.gz
+.sconsign.dblite
+
+# Local caches and OS files
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Local deployment credentials and scratch probes
+build_and_deploy.sh
+nfc_i2c_magic_probe.cpp
+backups/
+
+# Device captures and diagnostic card data are local only
+tests/results/

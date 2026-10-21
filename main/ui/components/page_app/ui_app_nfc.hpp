@@ -212,6 +212,8 @@ class UINfcPage : public app_base
 
     enum class Modal {
         None,
+        MfcWriteMode,
+        MfcWritePassword,
         Action,       // Upload to Slot / Edit Name / Edit Hex
         SlotSelect,   // Choose target slot 0-7
         EditName,     // Rename the record
@@ -252,6 +254,13 @@ class UINfcPage : public app_base
     };
 
 public:
+    bool status_updates_enabled() const override
+    {
+        // The status bar also uses SPI0: keep its independent timer and
+        // battery event updates out of transparent Crypto1 exchanges.
+        return !service_.spi_mfc_emulation_active();
+    }
+
     UINfcPage() : app_base()
     {
         set_page_title("RFID");
@@ -268,6 +277,7 @@ public:
 
     ~UINfcPage()
     {
+        if (spi_write_thread_.joinable()) spi_write_thread_.join();
         if (uhf_save_thread_.joinable()) uhf_save_thread_.join();
         (void)service_.grovenfc_deactivate();
         (void)service_.stop_pn532_ndef_emulation();
@@ -372,6 +382,7 @@ private:
     float mfkey_display_progress_ = 0.0f;
     uint32_t mfkey_progress_tick_ = 0;
     uint32_t mfkey_complete_tick_ = 0;
+    bool mfkey_uid_scan_pending_ = false;
     std::string mfkey_uid_input_; // hex UID typed by user (mfkey32v2 only)
     bool mfkey_save_mode_      = false; // save-all-to-file filename input overlay
     std::string mfkey_save_filename_;   // filename being typed in save overlay
@@ -437,6 +448,13 @@ private:
     uint32_t    last_key_codepoint_key_ = 0; // key whose press produced the codepoint
     nfc_app::DeviceKind last_serial_device_kind_ = nfc_app::DeviceKind::Unknown;
     // NFC Unit async write state
+    std::thread spi_write_thread_;
+    std::mutex spi_write_mutex_;
+    bool spi_write_running_ = false;
+    bool spi_write_done_ = false;
+    std::string spi_write_message_;
+    int spi_write_mode_ = 0;
+
     bool nfcunit_write_running_ = false;
     bool nfcunit_write_result_ok_ = false;
     std::string nfcunit_write_result_msg_;
@@ -636,9 +654,9 @@ private:
 
     static std::string emulator_source_filename(nfc_app::ProtocolKind protocol)
     {
-        if (protocol == nfc_app::ProtocolKind::MifareClassic) return "emulator/mfc1k_0.json";
-        if (protocol == nfc_app::ProtocolKind::Iso15693) return "emulator/iso15693_0.json";
-        return "emulator/ntag213_0.json";
+        if (protocol == nfc_app::ProtocolKind::MifareClassic) return "emulator/MFC/mfc1k_0.json";
+        if (protocol == nfc_app::ProtocolKind::Iso15693) return "emulator/ISO15693/iso15693_0.json";
+        return "emulator/NTAG/ntag213_0.json";
     }
 
     static bool is_identified_device_kind(nfc_app::DeviceKind kind)
@@ -685,6 +703,7 @@ private:
             self->perform_pending_usb_connect();
         }
         self->consume_nfcunit_emu_autostart_result();
+        self->poll_spi_write_result();
         self->poll_nfcunit_write_result();
         self->process_nfc_automation_command();
         const bool emu_probe_running_now = self->service_.emu_probe_running();
@@ -813,6 +832,19 @@ private:
             self->pending_hw_upload_slot_ = -1;
         }
         self->last_hw_upload_running_ = upload_running_now;
+        if (self->mfkey_uid_scan_pending_) {
+            const auto scan = self->service_.scan_state();
+            if (!scan.running) {
+                self->mfkey_uid_scan_pending_ = false;
+                const std::string uid = scan.has_result ? scan.last_record.tag.uid : "";
+                if (uid.size() == 8) {
+                    self->mfkey_uid_input_ = uid;
+                    self->ui_message_ = "UID read: " + uid;
+                } else {
+                    self->ui_message_ = scan.has_result ? "MFKey32 requires a 4-byte UID" : "No card - place original card, press R";
+                }
+            }
+        }
         // Detect MFKey crack completion → cache results and advance wizard to step 3
         const bool mfkey_running_now = self->service_.hw_mfkey_running();
         if (self->mfkey_step_ == 2) {
@@ -824,6 +856,7 @@ private:
             const float gap = std::max(0.0f, target - self->mfkey_display_progress_);
             // Ease toward real progress; never invent progress ahead of the worker.
             self->mfkey_display_progress_ += std::min(gap, std::max(0.5f, gap * dt / (180.0f + dt)));
+            if (self->active_tool_idx_ == 2 && !mfkey_running_now) self->mfkey_display_progress_ = 100.0f;
             if (!mfkey_running_now && self->mfkey_display_progress_ >= 99.9f) {
                 self->mfkey_display_progress_ = 100.0f;
                 if (!self->mfkey_complete_tick_) self->mfkey_complete_tick_ = now;
@@ -929,7 +962,10 @@ private:
             }
             self->last_uart_test_running_ = test_running_now;
         }
-        self->render_all();
+        // LCD and NFC CAP share SPI0. Rebuilding the unchanged page every
+        // 50 ms can put LCD traffic inside a transparent Crypto1 reply.
+        // Key handlers still redraw immediately; keep the idle MFC view static.
+        if (self->status_updates_enabled()) self->render_all();
     }
 
     static void uhf_beep_timer_cb(lv_timer_t *timer)
@@ -1041,6 +1077,7 @@ private:
        }
 
        if (!IS_KEY_RELEASED(e)) return;
+       if (spi_write_running_) return;
 
        std::fprintf(stderr, "[NFC-KEY] raw=%u normalized=%u mods=0x%X tab=%d modal=%d\n",
                     raw_key, normalize_main_key(raw_key), mods,
@@ -1731,9 +1768,10 @@ private:
             const auto leaving_conn = service_.connection_state();
             const bool keep_usb_nfc_connected =
                 leaving_conn.connected &&
-                leaving_conn.endpoint.kind == nfc_app::TransportKind::UsbSerial &&
-                (leaving_conn.device_kind == nfc_app::DeviceKind::PN532 ||
-                 leaving_conn.device_kind == nfc_app::DeviceKind::PN532Killer);
+                (leaving_conn.device_kind == nfc_app::DeviceKind::ST25RNFC ||
+                 (leaving_conn.endpoint.kind == nfc_app::TransportKind::UsbSerial &&
+                  (leaving_conn.device_kind == nfc_app::DeviceKind::PN532 ||
+                   leaving_conn.device_kind == nfc_app::DeviceKind::PN532Killer)));
             if (service_.uhf_continuous_scan_running()) {
                 std::string ignored;
                 (void)service_.stop_uhf_continuous_scan(&ignored);
@@ -1933,6 +1971,57 @@ private:
         }
     }
 
+    void start_spi_write_async(int index, int mode)
+    {
+        if (spi_write_running_ || index<0 || index>=static_cast<int>(saved_records_.size())) return;
+        if (spi_write_thread_.joinable()) spi_write_thread_.join();
+        const auto rec=saved_records_[index];
+        const auto password=mode==4 ? uid_changer_normalize_hex(uid_changer_gen4_pwd_input_,8) : std::string("00000000");
+        spi_write_running_=true;spi_write_done_=false;
+        spi_write_message_="Scanning target..."; ui_message_=spi_write_message_;
+        spi_write_thread_=std::thread([this,rec,mode,password]() {
+            std::string err, summary;
+            const bool ok=service_.spi_write_saved(rec,mode,password,[this,&summary](const std::string &line) {
+                std::lock_guard<std::mutex> lock(spi_write_mutex_);
+                spi_write_message_=line;
+                if (line.find("OK ")==0) summary=line;
+            },&err);
+            std::lock_guard<std::mutex> lock(spi_write_mutex_);
+            spi_write_message_=ok?summary:("ERR "+err);
+            spi_write_done_=true;
+        });
+    }
+
+    void poll_spi_write_result()
+    {
+        if (!spi_write_running_) return;
+        std::lock_guard<std::mutex> lock(spi_write_mutex_);
+        ui_message_=spi_write_message_;
+        if (spi_write_done_) {
+            spi_write_running_=false;
+            show_toast(spi_write_message_,3000,spi_write_message_.find("ERR ")==0);
+        }
+    }
+
+    void render_mfc_write_mode(lv_obj_t *parent)
+    {
+        lv_obj_t *card=make_modal_card(parent,220,96,0xF7A600);
+        const char *options[]={"Gen1A", "Normal / Gen2", "Gen3", "Gen4"};
+        for(int i=0;i<4;++i) {
+            auto *row=create_panel(card,5,5+i*22,210,20,modal_idx_==i?0xF7A600:0x2A2A2A);
+            create_text(row,8,3,options[i],modal_idx_==i?0x000000:0xDDDDDD,12);
+        }
+    }
+
+    void render_mfc_write_password(lv_obj_t *parent)
+    {
+        lv_obj_t *card=make_modal_card(parent,280,92,0xF7A600);
+        create_text(card,10,8,"Gen4 password",0xFFFFFF,12);
+        auto *field=create_panel(card,10,30,260,26,0x303030);
+        create_text(field,8,6,(uid_changer_gen4_pwd_input_+"_").c_str(),0xF7A600,12);
+        create_text(card,10,66,"8 hex | Enter: write | Esc: back",0xAAAAAA,12);
+    }
+
     void start_nfcunit_write_async(int saved_index)
     {
         if (nfcunit_write_running_) return;
@@ -2092,8 +2181,8 @@ private:
     {
         const std::string n = normalize_profile_token(token);
         if (n == "MIFARE" || n == "MIFARE1K" || n == "MIFARECLASSIC" || n == "MIFARECLASSIC1K" || n == "MFC" || n == "MFC1K") return 0;
-        if (n == "NTAG" || n == "NTAG215" || n == "ISO14443A" || n == "NFCA") return 1;
-        if (n == "NTAG216") return 2;
+        if (n == "NTAG" || n == "NTAG213" || n == "ISO14443A" || n == "NFCA") return 1;
+        if (n == "NTAG215") return 2;
         return -1;
     }
 
@@ -2254,11 +2343,26 @@ private:
                 emit_err("invalid UID or UID upload failed"); return;
             }
             if (!service_.hw_sniff_enter_mode(false)) { emit_err("sniffer start failed"); return; }
+            current_tab_ = Tab::Tools; tools_idx_ = 2; activate_tool_action();
+            mfkey_step_ = 1;
             emit_ok("sniffer no tag active"); return;
         }
+        if (verb_upper == "MFKEY_CAPTURE_STATUS") {
+            const auto status = service_.hw_mfkey_capture_status();
+            emit_ok("auth=" + std::to_string(status.auth_requests) + " logs=" + std::to_string(status.entries) +
+                    " pair=" + std::to_string(status.best_group) + "/2 ready=" + std::to_string(status.ready_groups));
+            return;
+        }
         if (verb_upper == "MFKEY_CALCULATE") {
+            const auto kind = service_.connection_state().device_kind;
+            if ((kind == nfc_app::DeviceKind::ST25RNFC || kind == nfc_app::DeviceKind::NFCUnit) &&
+                service_.hw_mfkey_capture_status().ready_groups == 0) {
+                emit_err("need 2 logs for the same sector/key"); return;
+            }
             service_.hw_switch_to_reader_mode();
             if (!service_.hw_start_mfkey_async(false)) { emit_err("calculation busy"); return; }
+            mfkey_step_ = 2; mfkey_display_progress_ = 0;
+            mfkey_progress_tick_ = lv_tick_get(); mfkey_complete_tick_ = 0;
             emit_ok("mfkey calculation started"); return;
         }
         if (verb_upper == "MFKEY_RESULTS") {
@@ -2472,6 +2576,48 @@ private:
             return;
         }
 
+        if (verb_upper == "SAVE") {
+            std::string err;
+            if(service_.save_last_scan(&err)) { refresh_saved_records();emit_ok("saved"); }
+            else emit_err(err);
+            return;
+        }
+        if (verb_upper == "WRITE_RESULT") {
+            std::lock_guard<std::mutex> lock(spi_write_mutex_);
+            emit_ok(std::string("running=")+(spi_write_running_?"1 ":"0 ")+spi_write_message_);return;
+        }
+        if (spi_write_running_) { emit_err("Write running");return; }
+        if (verb_upper == "WRITE_SAVED") {
+            std::istringstream in(arg);std::string id;int mode=0;in>>id>>mode;
+            refresh_saved_records();
+            for(size_t i=0;i<saved_records_.size();++i) if(saved_records_[i].tag.uid==id) {
+                current_tab_=Tab::Saved;saved_idx_=i;start_spi_write_async(i,mode);emit_ok("write started");return;
+            }
+            emit_err("Saved UID not found");return;
+        }
+        if (verb_upper == "SPI_SCAN") {
+            std::string err;
+            if (!ensure_spi_connected_for_automation(arg, &err)) { emit_err(err); return; }
+            current_tab_ = Tab::Read;
+            std::string status;
+            if (service_.connect_and_scan(&status)) emit_ok("scan started");
+            else emit_err(status);
+            return;
+        }
+        if (verb_upper == "DUMP") {
+            current_tab_ = Tab::Read;
+            if (service_.start_dump_last_scan()) emit_ok("dump started");
+            else emit_err("dump failed to start");
+            return;
+        }
+        if (verb_upper == "READ_RESULT") {
+            const auto scan = service_.scan_state();
+            std::ostringstream out;
+            out << "running=" << scan.running << " status=" << scan.status << " error=" << scan.error;
+            for (const auto &line : scan_log_lines_) out << "\n" << line;
+            emit_ok(out.str());
+            return;
+        }
         if (verb_upper == "SCAN") {
             std::string status;
             if (service_.connect_and_scan(&status)) {
@@ -3738,9 +3884,9 @@ private:
         lv_obj_t *list = create_panel(parent, 0, 0, 122, 104, 0x101010);
         lv_obj_t *detail = create_panel(parent, 126, 0, 194, 104, 0x101010);
         auto label = [&](lv_obj_t *panel, int x, int y, int width, const std::string &text,
-                         uint32_t color, int size = 10) {
+                         uint32_t color, int size = 12) {
             lv_obj_t *item = create_text(panel, x, y, text.c_str(), color, size);
-            lv_obj_set_size(item, width, size >= 12 ? 14 : 12);
+            lv_obj_set_size(item, width, size >= 12 ? 13 : 11);
             lv_label_set_long_mode(item, LV_LABEL_LONG_DOT);
             return item;
         };
@@ -3755,14 +3901,14 @@ private:
                 const int index = offset + row;
                 const bool selected = index == saved_idx_;
                 const auto &record = saved_records_[index];
-                lv_obj_t *entry = create_panel(list, 4, 2 + row * 26, 114, 24,
+                lv_obj_t *entry = create_panel(list, 4, 1 + row * 26, 114, 25,
                     selected ? 0xF7A600 : 0x171717);
                 label(entry, 4, 1, 106, record.meta.display_name,
                     selected ? 0x000000 : 0xFFFFFF);
                 const std::string type = record.uhf_memory ? "UHF" :
                     record.tag.protocol == nfc_app::ProtocolKind::MifareClassic ? "MIFARE Classic" :
                     nfc_app::to_string(record.tag.protocol);
-                label(entry, 4, 12, 106, type, selected ? 0x303030 : 0xB8B8B8, 10);
+                label(entry, 4, 13, 106, type, selected ? 0x303030 : 0xB8B8B8, 10);
             }
             const auto &record = saved_records_[saved_idx_];
             const std::string uid = record.tag.uid.empty() ? "(none)" : record.tag.uid;
@@ -3774,7 +3920,7 @@ private:
             std::string date = record.meta.created_at.substr(0, 16);
             std::replace(date.begin(), date.end(), 'T', ' ');
             label(detail, 6, 75, 182, date, 0xB8B8B8,
-                10);
+                12);
             if (record.uhf_memory) {
                 std::string banks;
                 for (const auto &bank : record.uhf_memory->banks) {
@@ -3782,7 +3928,7 @@ private:
                     banks += bank.name.substr(0, 1) + ":" + std::to_string(bank.hex.size() / 2) +
                         (bank.complete ? "" : "!");
                 }
-                label(detail, 6, 90, 182, banks, 0xF7A600, 10);
+                label(detail, 6, 90, 182, banks, 0xF7A600, 12);
             }
         }
         create_footer(parent, ui_message_);
@@ -3937,28 +4083,28 @@ private:
             const bool is_grove_or_nfcunit =
                 !is_st25r && (emu_device_kind == nfc_app::DeviceKind::GroveNFC || is_nfc_unit);
             if (is_st25r) {
-                // SPI EMU: same dump format as I2C with ASCII + scrolling
                 lv_obj_t *emu_panel = create_panel(parent, 0, 0, 320, 104, 0x101010);
-                service_.load_spi_ntag_memory_if_empty();  // eager load from JSON
-                const auto &mem = service_.spi_ntag_memory();
-                const size_t pages = mem.size() / 4;
-
-                // Build dump_lines from memory (same "pp:HEX" format as I2C)
+                service_.load_spi_ntag_memory_if_empty();
+                const auto mem = service_.spi_ntag_memory();
+                const bool mfc = protocol == nfc_app::ProtocolKind::MifareClassic;
+                const size_t stride = mfc ? 16 : 4;
+                const auto hex_bytes=[](const uint8_t *data,size_t size) {
+                    std::string hex; const char digits[]="0123456789ABCDEF";
+                    for(size_t i=0;i<size;++i) { hex+=digits[data[i]>>4];hex+=digits[data[i]&15]; }
+                    return hex;
+                };
                 std::vector<std::string> dump_lines;
                 std::string uid_str;
-                for (size_t p = 0; p < pages; ++p) {
-                    char line[32];
-                    std::snprintf(line, sizeof(line), "%02zu:%02X%02X%02X%02X",
-                                  p, mem[p*4], mem[p*4+1], mem[p*4+2], mem[p*4+3]);
-                    dump_lines.push_back(line);
+                for (size_t p=0;p<mem.size()/stride;++p) {
+                    char prefix[12]; std::snprintf(prefix,sizeof(prefix),"%02zu:",p);
+                    dump_lines.push_back(std::string(prefix)+hex_bytes(mem.data()+p*stride,stride));
                 }
-                if (pages >= 2) {
-                    char u[16];
-                    std::snprintf(u, sizeof(u), "%02X%02X%02X%02X%02X%02X%02X",
-                                  mem[0], mem[1], mem[2], mem[4], mem[5], mem[6], mem[7]);
-                    uid_str = u;
+                if (mfc && mem.size()>=4) uid_str=hex_bytes(mem.data(),4);
+                else if (mem.size()>=8) {
+                    const uint8_t uid[]={mem[0],mem[1],mem[2],mem[4],mem[5],mem[6],mem[7]};
+                    uid_str=hex_bytes(uid,7);
                 }
-                if (uid_str.empty()) uid_str = "-";
+                if (uid_str.empty()) uid_str="-";
 
                 // Same ContentLine + render as I2C below (see is_grove_or_nfcunit)
                 struct ContentLine { std::string text; uint32_t color; bool mono; };
@@ -3966,7 +4112,7 @@ private:
                 lines.push_back({proto_name + "  UID:" + uid_str, 0x00D2FF, true});
                 lines.push_back({"Loaded: " + emulator_source_filename(protocol), 0x8DB6FF, true});
                 if (!uid_str.empty() && uid_str != "-") {
-                    lines.push_back({"ATQA:0044 SAK:00", 0xD8D8D8, true});
+                    lines.push_back({mfc ? "ATQA:0004 SAK:08  Read only" : "ATQA:0044 SAK:00", 0xD8D8D8, true});
                 }
                 lines.push_back({"Dump:", 0x9E9E9E, true});
 
@@ -4084,9 +4230,12 @@ private:
         std::string footer_text = ui_message_;
         if (emu_device_kind == nfc_app::DeviceKind::PN532Killer) {
             footer_text = "PN532Killer HW Slot " + std::to_string(hw_emu_slot_ + 1);
+        } else if (emu_device_kind == nfc_app::DeviceKind::ST25RNFC) {
+            footer_text = service_.spi_listener_active()
+                ? ("Emulating " + service_.spi_profile_label() + " | Space: pause")
+                : (ui_message_.empty() ? "Space: start | Enter: menu" : ui_message_);
         } else if (emu_device_kind == nfc_app::DeviceKind::GroveNFC ||
-            emu_device_kind == nfc_app::DeviceKind::NFCUnit ||
-            emu_device_kind == nfc_app::DeviceKind::ST25RNFC) {
+            emu_device_kind == nfc_app::DeviceKind::NFCUnit) {
             footer_text = "Load from " + emulator_source_filename(protocol);
         }
         create_footer(parent, footer_text);
@@ -4271,7 +4420,8 @@ private:
 
     void render_tools_tab(lv_obj_t *parent)
     {
-        const bool tool_page_active = (modal_ == Modal::ToolPage);
+        const bool tool_page_active = modal_ == Modal::ToolPage ||
+            (modal_ == Modal::ToolInfo && tool_help_return_ == Modal::ToolPage);
         const bool modal_full_width = tool_page_active ||
                                       modal_ == Modal::DeviceProbe ||
                                       modal_ == Modal::UartConfig;
@@ -4304,10 +4454,8 @@ private:
             }
         }
 
-        if (modal_ == Modal::ToolPage || modal_ == Modal::DeviceProbe || modal_ == Modal::UartConfig) {
+        if (tool_page_active || modal_ == Modal::DeviceProbe || modal_ == Modal::UartConfig) {
             render_tools_modal(detail);
-        } else if (modal_ == Modal::ToolInfo) {
-            render_tool_info_modal(parent);
         } else {
             create_text(detail, 6, 6, tool_name(tools_idx_), 0xFFFFFF, 12);
             switch (tools_idx_) {
@@ -4347,7 +4495,8 @@ private:
             }
         }
 
-        if (modal_ != Modal::ToolInfo && !tool_page_active) create_footer(parent, ui_message_);
+        if (!tool_page_active) create_footer(parent, ui_message_);
+        if (modal_ == Modal::ToolInfo) render_tool_info_modal(parent);
     }
 
     // ── Post-scan action menu (OK after a scan result) ───────────────────────
@@ -5048,9 +5197,7 @@ private:
     // ── Tool info popup ('i' key) ────────────────────────────────────────────
     void render_tool_info_modal(lv_obj_t *parent)
     {
-        lv_obj_t *card = make_modal_card(parent, 312, 116, 0x00D2FF);
         const int tool = tool_help_return_ == Modal::ToolPage ? active_tool_idx_ : tools_idx_;
-        create_text(card, 8, 5, tool_name(tool), 0x00D2FF, 12);
         std::vector<std::string> lines;
         if (tool == 0) {
             if (mifare_key_editing_) {
@@ -5080,8 +5227,16 @@ private:
                      mfkey_step_ >= 3 ? "Up/Down: key  Enter: import" : "Enter: next  Esc: back/cancel"};
             if (mfkey_step_ >= 3) lines.push_back("S: save file  R: retry");
         }
-        for (size_t i = 0; i < lines.size(); ++i) create_text(card, 8, 23 + static_cast<int>(i) * 14, lines[i].c_str(), 0xD8D8D8, 10);
-        create_text(card, 8, 102, "I / Esc: close help", 0x777777, 10);
+        const int card_h = 42 + static_cast<int>(lines.size()) * 12;
+        lv_obj_t *card = make_modal_card(parent, 280, card_h, 0x00D2FF);
+        create_text(card, 8, 5, tool_name(tool), 0x00D2FF, 12);
+        for (size_t i = 0; i < lines.size(); ++i) {
+            lv_obj_t *line = create_text(card, 8, 23 + static_cast<int>(i) * 12, lines[i].c_str(), 0xD8D8D8, 10);
+            lv_obj_set_style_text_font(line, &lv_font_montserrat_10, 0);
+            lv_obj_set_width(line, 264);
+            lv_label_set_long_mode(line, LV_LABEL_LONG_DOT);
+        }
+        create_text(card, 8, card_h - 13, "I / Esc: close help", 0x777777, 10);
     }
 
     // ── Global RFID App intro popup ('i' key, any tab) ───────────────────────
@@ -5223,37 +5378,40 @@ private:
        size_t total = 0;
 
        std::snprintf(lines_buf[total], sizeof(lines_buf[total]), "Device:  %s", nfc_app::to_string(conn.device_kind));
-       lines[total++] = {lines_buf[total-1], 0xFFD700};
+       lines[total] = {lines_buf[total], 0xFFD700}; ++total;
 
        { std::string fw_display = conn.detail;
            auto at = fw_display.find(" @ ");
            if (at != std::string::npos) fw_display = fw_display.substr(0, at);
        const std::string fw_str = fw_display.empty() ? "(none)" : fw_display.substr(0, 46);
         std::snprintf(lines_buf[total], sizeof(lines_buf[total]), "FW:      %s", fw_str.c_str());
-        lines[total++] = {lines_buf[total-1], 0xD8D8D8};
+        lines[total] = {lines_buf[total], 0xD8D8D8}; ++total;
         }
 
        const std::string path_str = ep.path.empty() ? "(none)" : ep.path.substr(0, 46);
        std::snprintf(lines_buf[total], sizeof(lines_buf[total]), "Port:    %s", path_str.c_str());
-       lines[total++] = {lines_buf[total-1], 0xD8D8D8};
+       lines[total] = {lines_buf[total], 0xD8D8D8}; ++total;
 
        const char *status_str = conn.connected ? "Connected" : "Disconnected";
        std::snprintf(lines_buf[total], sizeof(lines_buf[total]), "Status:  %s", status_str);
-       lines[total++] = {lines_buf[total-1], conn.connected ? 0x44FF88u : 0xFF5555u};
+       lines[total] = {lines_buf[total], conn.connected ? 0x44FF88u : 0xFF5555u}; ++total;
        const char *hash = RFID_BUILD_HASH;
        std::snprintf(lines_buf[total], sizeof(lines_buf[total]), "Build:   %.42s", hash);
-       lines[total++] = {lines_buf[total-1], 0x777777};
+       lines[total] = {lines_buf[total], 0x777777}; ++total;
 
        // Scroll & render
        if (total > 5 && app_info_scroll_ > (int)total - 5)
            app_info_scroll_ = (int)total - 5;
        const int visible = std::min((int)total - app_info_scroll_, 5);
-       const int card_h = 22 + visible * 13 + 6;
-       lv_obj_t *card = make_modal_card(parent, 308, card_h, 0x00D2FF);
+       const int card_h = 32 + visible * 12;
+       lv_obj_t *card = make_modal_card(parent, 280, card_h, 0x00D2FF);
        create_text(card, 8, 4, "Device Info", 0x00D2FF, 12);
        for (int i = 0; i < visible; ++i) {
            int idx = app_info_scroll_ + i;
-           create_text(card, 8, 22 + i * 13, lines[idx].value, lines[idx].color, 11);
+           lv_obj_t *line = create_text(card, 8, 20 + i * 12, lines[idx].value, lines[idx].color, 10);
+           lv_obj_set_style_text_font(line, &lv_font_montserrat_10, 0);
+           lv_obj_set_width(line, 264);
+           lv_label_set_long_mode(line, LV_LABEL_LONG_DOT);
        }
        if (total > 5) { char scroll_buf[16];
            std::snprintf(scroll_buf, sizeof(scroll_buf), "%d/%d", app_info_scroll_ + 1, (int)total - 4);
@@ -5264,7 +5422,7 @@ private:
     // ── Tools-specific modal overlay ─────────────────────────────────────────
     void render_tools_modal(lv_obj_t *parent)
     {
-        if (modal_ == Modal::ToolPage) {
+        if (modal_ == Modal::ToolPage || (modal_ == Modal::ToolInfo && tool_help_return_ == Modal::ToolPage)) {
             if (active_tool_idx_ == 0) {
                 render_mifare_keys_tool(parent);
                 return;
@@ -5402,9 +5560,30 @@ private:
 
         if (mfkey_step_ >= 3) {
             render_mfkey_results(parent);
+            if (active_tool_idx_ == 2) {
+                const size_t found = std::count_if(mfkey_results_.begin(), mfkey_results_.end(),
+                    [](const auto &result) { return !result.key_hex.empty(); });
+                char summary[64];
+                std::snprintf(summary, sizeof(summary), "Keys %zu/%zu  %.2fs", found, mfkey_results_.size(),
+                              service_.hw_mfkey_elapsed_ms() / 1000.0);
+                create_footer(parent, summary);
+            }
             return;
         }
         if (mfkey_step_ == 2) {
+            if (active_tool_idx_ == 2) {
+                const bool running = service_.hw_mfkey_running();
+                create_text(parent, 12, 12, running ? "Calculating keys..." : "Calculation complete", 0xF7A600, 12);
+                create_panel(parent, 12, 39, 292, 6, 0x303030);
+                // The helper reports completed keys, not inner-loop percentages.
+                // Show activity and real elapsed time instead of invented progress.
+                const int offset = running ? static_cast<int>((lv_tick_get() % 1200) * 244 / 1200) : 0;
+                create_panel(parent, 12 + offset, 39, running ? 48 : 292, 6, 0xF7A600);
+                char elapsed[48];
+                std::snprintf(elapsed, sizeof(elapsed), "Elapsed %.1fs", service_.hw_mfkey_elapsed_ms() / 1000.0);
+                create_text(parent, 12, 58, elapsed, 0xD8D8D8, 10);
+                return;
+            }
             char progress[32];
             const int pct = static_cast<int>(mfkey_display_progress_);
             std::snprintf(progress, sizeof(progress), "Calculating keys  %d%%", pct);
@@ -5424,9 +5603,16 @@ private:
                 create_text(parent, 12, 33, "Keep PN532Killer beside the card.", 0x999999, 10);
             } else {
                 create_text(parent, 12, 7, "UID (optional)", 0x999999, 10);
-                const std::string uid = mfkey_uid_input_.empty() ? "Default UID" : mfkey_uid_input_ + "_";
+                const bool nfc_cap = service_.connection_state().device_kind == nfc_app::DeviceKind::ST25RNFC;
+                const std::string uid = mfkey_uid_input_.empty()
+                    ? ((nfc_cap || service_.connection_state().device_kind == nfc_app::DeviceKind::NFCUnit) ? "11223344" : "Default UID") : mfkey_uid_input_ + "_";
                 create_text_mono(parent, 12, 27, uid.c_str(), 0x00FFAA, 12);
-                create_text(parent, 12, 49, "8 hex digits, or leave empty", 0x888888, 10);
+                create_text(parent, 12, 49, mfkey_uid_scan_pending_ ? "Reading original card UID..." :
+                    (nfc_cap ? "R: Read original card UID" : "8 hex digits, or leave empty"), 0x888888, 10);
+                if (nfc_cap) {
+                    create_text(parent, 12, 69, "Enter: capture  Hex: edit UID", 0x888888, 10);
+                    create_footer(parent, ui_message_);
+                }
             }
 
             return;
@@ -5438,8 +5624,20 @@ private:
             create_text_mono(parent, 12, 29, (mfkey_uid_input_ + "_").c_str(), 0xFFFFFF, 12);
             create_text(parent, 12, 49, "Enter restarts capture with this UID", 0x999999, 10);
         } else {
-            create_text(parent, 12, 29, with_card ? "Let reader authenticate the card." : "Hold PN532Killer near the reader.", 0xD8D8D8, 10);
-            create_text(parent, 12, 49, with_card ? "Keep card in place until finished." : "New UID? Type 8 hex digits.", 0x888888, 10);
+            const auto kind = service_.connection_state().device_kind;
+            if (!with_card && (kind == nfc_app::DeviceKind::ST25RNFC || kind == nfc_app::DeviceKind::NFCUnit)) {
+                const auto status = service_.hw_mfkey_capture_status();
+                char counts[80];
+                std::snprintf(counts, sizeof(counts), "AUTH %u   Logs %zu   Pair %zu/2",
+                              status.auth_requests, status.entries, std::min<size_t>(2, status.best_group));
+                create_text(parent, 12, 29, counts, 0xFFFFFF, 12);
+                create_text(parent, 12, 50, status.ready_groups ? "Capture ready - Enter: calculate" : "Need 2 logs for same sector/key",
+                            status.ready_groups ? 0x00FFAA : 0xF7A600, 10);
+                create_text(parent, 12, 69, status.auth_requests == 0 ? "Waiting for block authentication" : "Capture only: read may fail", 0x999999, 10);
+            } else {
+                create_text(parent, 12, 29, with_card ? "Let reader authenticate the card." : "Hold PN532Killer near the reader.", 0xD8D8D8, 10);
+                create_text(parent, 12, 49, with_card ? "Keep card in place until finished." : "New UID? Type 8 hex digits.", 0x888888, 10);
+            }
         }
 
     }
@@ -5486,7 +5684,7 @@ private:
             }
         } else {
         // Three rows leave room for the step header and action footer.
-        constexpr int visible = 6;
+        const int visible = active_tool_idx_ == 2 ? 5 : 6;
         const int total = static_cast<int>(mfkey_results_.size());
         int offset = mfkey_result_idx_ - 1;
         if (offset < 0) offset = 0;
@@ -5940,6 +6138,8 @@ private:
         lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
 
         switch (modal_) {
+        case Modal::MfcWriteMode: render_mfc_write_mode(overlay); break;
+        case Modal::MfcWritePassword: render_mfc_write_password(overlay); break;
         case Modal::Action:     render_action_modal_card(overlay);     break;
         case Modal::SlotSelect: render_slot_select_modal_card(overlay); break;
         case Modal::FileImport: render_file_import_modal_card(overlay); break;
@@ -5977,17 +6177,18 @@ private:
         const auto &rec = saved_records_[saved_idx_];
         if (rec.uhf_memory) {
             lv_obj_t *card = make_modal_card(parent, 220, 94, 0xF7A600);
-            create_text(card, 8, 5, to_compact(rec.meta.display_name, 26).c_str(), 0xFFFFFF, 11);
+            create_text(card, 8, 5, to_compact(rec.meta.display_name, 26).c_str(), 0xFFFFFF, 12);
             const char *options[] = {"View Memory", "Edit Name", "Delete"};
             for (int i = 0; i < 3; ++i) {
                 lv_obj_t *row = create_panel(card, 8, 24 + i * 20, 204, 18,
                                              modal_idx_ == i ? 0xF7A600 : 0x2A2A2A);
-                create_text(row, 6, 3, options[i], modal_idx_ == i ? 0x000000 : 0xD0D0D0, 10);
+                create_text(row, 6, 3, options[i], modal_idx_ == i ? 0x000000 : 0xD0D0D0, 12);
             }
             return;
         }
         const bool record_from_i2c = (rec.meta.transport == nfc_app::TransportKind::I2cBus);
-        const bool show_write_to_tag = is_i2c_dev || is_pn532_dev || record_from_i2c;
+        const bool show_write_to_tag = is_i2c_dev || is_pn532_dev || record_from_i2c ||
+            (service_.connection_state().device_kind == nfc_app::DeviceKind::ST25RNFC);
         const bool has_first_action = is_i2c_dev || is_pn532killer;
         const int n_opts = has_first_action ? (show_write_to_tag ? 6 : 5)
                                             : (show_write_to_tag ? 5 : 4);
@@ -6027,7 +6228,7 @@ private:
             lv_obj_set_style_bg_color(row, lv_color_hex(sel ? (is_delete ? 0xFF4444 : 0xF7A600) : (is_delete ? 0x3A1A1A : 0x2A2A2A)), LV_PART_MAIN | LV_STATE_DEFAULT);
             lv_obj_set_style_bg_opa(row, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
             lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-            create_text(row, 6, 4, options[i], sel ? 0x000000 : (is_delete ? 0xFF8888 : 0xD0D0D0), 11);
+            create_text(row, 6, 4, options[i], sel ? 0x000000 : (is_delete ? 0xFF8888 : 0xD0D0D0), 12);
         }
     }
 
@@ -6463,6 +6664,7 @@ private:
         // Letter navigation is available only where no text/hex input is active.
         bool letter_navigation = false;
         switch (modal_) {
+        case Modal::MfcWriteMode:
         case Modal::Action:
         case Modal::SlotSelect:
         case Modal::FileImport:
@@ -6496,6 +6698,29 @@ private:
             return;
         }
         switch (modal_) {
+        case Modal::MfcWriteMode:
+            if (key==KEY_ESC) {modal_=Modal::Action;modal_idx_=0;}
+            else if (key==KEY_UP) modal_idx_=(modal_idx_+3)%4;
+            else if (key==KEY_DOWN) modal_idx_=(modal_idx_+1)%4;
+            else if (key==KEY_ENTER) {
+                spi_write_mode_=modal_idx_+1;
+                if(spi_write_mode_==4) {
+                    uid_changer_gen4_pwd_input_="00000000";
+                    modal_=Modal::MfcWritePassword;
+                } else {modal_=Modal::None;start_spi_write_async(saved_idx_,spi_write_mode_);}
+            }
+            break;
+        case Modal::MfcWritePassword:
+            if(key==KEY_ESC) {modal_=Modal::MfcWriteMode;modal_idx_=3;}
+            else if(key==KEY_BACKSPACE && !uid_changer_gen4_pwd_input_.empty()) uid_changer_gen4_pwd_input_.pop_back();
+            else if(key==KEY_ENTER) {
+                if(uid_changer_gen4_pwd_input_.size()!=8) ui_message_="Password requires 8 hex digits";
+                else {modal_=Modal::None;start_spi_write_async(saved_idx_,4);}
+            } else {
+                const char hex=keycode_to_hex_char(key);
+                if(std::isxdigit(static_cast<unsigned char>(hex)) && uid_changer_gen4_pwd_input_.size()<8) uid_changer_gen4_pwd_input_+=hex;
+            }
+            break;
         case Modal::Action:     handle_action_key(key);      break;
         case Modal::SlotSelect: handle_slot_select_key(key); break;
         case Modal::FileImport: handle_file_import_key(key);  break;
@@ -6627,7 +6852,8 @@ private:
         const bool is_pn532killer = (emu_kind2 == nfc_app::DeviceKind::PN532Killer);
         const auto &rec = saved_records_[saved_idx_];
         const bool record_from_i2c = (rec.meta.transport == nfc_app::TransportKind::I2cBus);
-        const bool show_write_to_tag = is_i2c_dev || is_pn532_dev || record_from_i2c;
+        const bool show_write_to_tag = is_i2c_dev || is_pn532_dev || record_from_i2c ||
+            (service_.connection_state().device_kind == nfc_app::DeviceKind::ST25RNFC);
         const bool has_first_action = is_i2c_dev || is_pn532killer;
         const int n_opts = has_first_action ? (show_write_to_tag ? 6 : 5)
                                             : (show_write_to_tag ? 5 : 4);
@@ -6655,6 +6881,10 @@ private:
                     ui_message_ = "Hardware not supported";
                     modal_     = Modal::None;
                     modal_idx_ = 0;
+                } else if (conn2.device_kind == nfc_app::DeviceKind::ST25RNFC) {
+                    if (rec.tag.protocol != nfc_app::ProtocolKind::MifareClassic) {
+                        ui_message_="M5 NFC CAP writes MFC dumps only";modal_=Modal::None;
+                    } else { modal_=Modal::MfcWriteMode;modal_idx_=0; }
                 } else if (is_nfcunit) {
                     modal_     = Modal::None;
                     modal_idx_ = 0;
@@ -7664,6 +7894,22 @@ private:
             return;
         }
 
+        if (mfkey_step_ >= 3 && mfkey_save_mode_) { handle_mfkey_results_key(key); return; }
+        if (key == KEY_ESC && mfkey_step_ >= 3) {
+            if (service_.hw_sniff_enter_mode(with_card, true)) {
+                mfkey_step_ = 1;
+                mfkey_uid_input_.clear();
+                ui_message_ = "Capture resumed - Enter: calculate";
+            } else ui_message_ = "Failed to resume capture";
+            return;
+        }
+        if (mfkey_uid_scan_pending_ && key != KEY_ESC) return;
+        if (!with_card && mfkey_step_ == 0 && key == KEY_R &&
+            service_.connection_state().device_kind == nfc_app::DeviceKind::ST25RNFC) {
+            mfkey_uid_scan_pending_ = service_.start_scan();
+            ui_message_ = mfkey_uid_scan_pending_ ? "Reading original card UID..." : "UID reader busy";
+            return;
+        }
         // Cancel UID editing without interrupting the current capture.
         if (key == KEY_ESC && !with_card && mfkey_step_ == 1 && !mfkey_uid_input_.empty()) {
             mfkey_uid_input_.clear();
@@ -7673,6 +7919,7 @@ private:
         // ESC backs out one wizard step.
         if (key == KEY_ESC) {
             if (mfkey_step_ == 0) {
+                mfkey_uid_scan_pending_ = false;
                 modal_ = Modal::None;
             } else {
                 // Reset to idle — also switch device back to reader mode if sniffing
@@ -7708,14 +7955,19 @@ private:
                             return;
                         }
                     }
+                    if (mfkey_uid_input_.empty() &&
+                        (service_.connection_state().device_kind == nfc_app::DeviceKind::ST25RNFC ||
+                         service_.connection_state().device_kind == nfc_app::DeviceKind::NFCUnit) &&
+                        !service_.hw_sniff_set_uid("11223344")) {
+                        ui_message_ = "Failed to set default UID";
+                        return;
+                    }
                     if (!service_.hw_sniff_enter_mode(false)) {
                         ui_message_ = "Failed to enter sniffer mode";
                         return;
                     }
                     mfkey_step_ = 1;
-                    ui_message_ = mfkey_uid_input_.empty()
-                        ? "Sniffer active (no UID set). Approach reader."
-                        : "Sniffer active (UID set). Approach reader.";
+                    ui_message_ = "Sniffer active. Approach reader.";
                     mfkey_uid_input_.clear();
                     return;
                 }
@@ -7751,6 +8003,12 @@ private:
                         }
                         mfkey_uid_input_.clear();
                         ui_message_ = "Sniffer no tag: approach reader, Enter to crack";
+                        return;
+                    }
+                    const auto kind = service_.connection_state().device_kind;
+                    if ((kind == nfc_app::DeviceKind::ST25RNFC || kind == nfc_app::DeviceKind::NFCUnit) &&
+                        service_.hw_mfkey_capture_status().ready_groups == 0) {
+                        ui_message_ = "Need 2 logs for the same sector/key";
                         return;
                     }
                     // Switch back to reader mode, then start async crack

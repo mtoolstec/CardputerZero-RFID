@@ -271,7 +271,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--version", default=None, help="Override version from app-builder.json")
     parser.add_argument(
         "--maintainer",
-        default="m5stack <m5stack@m5stack.com>",
+        default="whywilson <15230131+whywilson@users.noreply.github.com>",
         help="Maintainer field in DEBIAN/control",
     )
     parser.add_argument(

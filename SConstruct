@@ -29,7 +29,6 @@ if "CardputerZero" in os.environ:
                 f.write(f'CONFIG_TOOLCHAIN_PATH="{homebrew_toolchain}"\n')
             f.write('CONFIG_TOOLCHAIN_PREFIX="aarch64-linux-gnu-"\n')
             f.write(f'''CONFIG_TOOLCHAIN_SYSROOT="{os.path.join(sys.path[0], "build", "static_lib")}"\n''')
-            f.write(f'''CONFIG_TOOLCHAIN_FLAGS="-I{os.path.join(sys.path[0], "build", "static_lib", "usr", "include", "aarch64-linux-gnu")}"\n''')
             f.write(f'''CONFIG_TOOLCHAIN_FLAGS="-I{os.path.join(sys.path[0], "static_lib", "usr", "include", "aarch64-linux-gnu")}"\n''')
 elif arch != "aarch64":
     if not os.path.exists("build/config/config_tmp.mk"):
@@ -56,7 +55,6 @@ env = SConscript(
 
 # ── Inject git commit hash as compile-time define for AppInfo modal ──────────
 try:
-    import subprocess
     import datetime
     git_hash = subprocess.check_output(
         ["git", "rev-parse", "--short", "HEAD"],

@@ -1,4 +1,4 @@
-#include "../main/ui/components/nfc/nfc_protocol.hpp"
+#include "../main/nfc/nfc_protocol.hpp"
 #include <cassert>
 #include <cstring>
 #include <iostream>

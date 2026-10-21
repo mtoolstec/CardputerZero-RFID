@@ -7,6 +7,7 @@
 #include "nfc_models.hpp"
 #include "nfc_i2c_device.hpp"  // reuse I2cCardInfo
 #include "nfc_hex_logger.hpp"
+#include "hal/hal_panel_mode.hpp"
 
 #include <cerrno>
 #include <cctype>
@@ -19,6 +20,7 @@
 #include <string>
 #include <vector>
 #include <utility>
+#include <functional>
 
 #if defined(__linux__)
 #include <fcntl.h>
@@ -132,6 +134,7 @@ public:
 
     bool open(const std::string &spidev_path, std::string *error = nullptr)
     {
+        rfid_board::PanelModeRecovery restore_panel;
 #if defined(__linux__)
         close();
         rst_line_unavailable_ = false;
@@ -197,9 +200,9 @@ public:
 
         const uint8_t mode_candidates_all[] = {
             // spidev0.2 (ST25R3916): MODE_1 is correct per datasheet and reference demo.
-            // Other paths retain legacy MODE_2 first for compatibility.
-            static_cast<uint8_t>(parse_env_int("NFC_SPI_MODE0", is_st25r_spidev ? SPI_MODE_1 : SPI_MODE_2)),
-            static_cast<uint8_t>(parse_env_int("NFC_SPI_MODE1", SPI_MODE_1)),
+            // The same chip on spidev0.1 uses the same framing; keep MODE_2 as fallback.
+            static_cast<uint8_t>(parse_env_int("NFC_SPI_MODE0", SPI_MODE_1)),
+            static_cast<uint8_t>(parse_env_int("NFC_SPI_MODE1", SPI_MODE_2)),
             static_cast<uint8_t>(parse_env_int("NFC_SPI_MODE2", SPI_MODE_0)),
             static_cast<uint8_t>(parse_env_int("NFC_SPI_MODE3", SPI_MODE_3)),
         };
@@ -210,8 +213,8 @@ public:
         // spidev0.2: ST25R3916 read = CMD + DUMMY → data in rx[1], no extra dummy byte needed.
         // read_dummy=true means 3-byte transfer; read_dummy=false means 2-byte (correct for ST25R).
         const bool read_dummy_candidates_all[] = {
-            parse_env_int("NFC_SPI_READ_DUMMY_FIRST",  is_st25r_spidev ? 0 : 1) != 0,
-            parse_env_int("NFC_SPI_READ_DUMMY_SECOND", is_st25r_spidev ? 1 : 0) != 0,
+            parse_env_int("NFC_SPI_READ_DUMMY_FIRST", 0) != 0,
+            parse_env_int("NFC_SPI_READ_DUMMY_SECOND", 1) != 0,
         };
 
         std::vector<uint8_t> mode_candidates;
@@ -277,7 +280,7 @@ public:
                     for (bool with_dummy : dummy_opts) {
                         read_reg_with_dummy_ = with_dummy;
                         if (parse_env_int("NFC_SPI_FLIPPER_PROBE_INIT", 1) != 0) {
-                            direct_cmd(st25r_cmd::SET_DEFAULT);
+                            reset_chip_defaults();
                             sleep_ms(2);
                             write_reg(st25r_reg::IO_CONF2, 0x04);
                         }
@@ -405,7 +408,9 @@ probe_done:
 
     void close()
     {
+        rfid_board::PanelModeRecovery restore_panel{fd_ >= 0};
 #if defined(__linux__)
+        release_listener_wave_spi();
         if (fd_ >= 0) {
             // Turn RF off before closing
             set_rf_field(false);
@@ -455,6 +460,13 @@ probe_done:
 
 private:
     int fd_ = -1;
+    int listener_raw_tx_fd_ = -1;
+    void release_listener_wave_spi()
+    {
+#if defined(__linux__)
+        if (listener_raw_tx_fd_>=0) { ::close(listener_raw_tx_fd_); listener_raw_tx_fd_=-1; }
+#endif
+    }
     DeviceKind device_kind_ = DeviceKind::Unknown;
     std::string spidev_path_;
     uint8_t last_sak_ = 0x00;
@@ -504,6 +516,9 @@ private:
     } listener_state_ = ListenerState::Off;
     uint8_t listener_br_detected_ = 0xFF;
     bool listener_keep_auto_collision_ = false;
+    bool listener_mfclassic_raw_rx_ = false;
+    uint8_t listener_aux_base_ = 0;
+    uint32_t listener_irq_latch_ = 0;
 
     static void sleep_ms(int ms)
     {
@@ -1066,10 +1081,12 @@ private:
         tr.delay_usecs = 0;
         const bool ok = (::ioctl(fd_, SPI_IOC_MESSAGE(1), &tr) >= 0);
         release_bss();
-        if (ok) {
+        // Per-transfer file IO can exceed the target's AUTH response deadline.
+        // The MFKey worker still logs complete protocol frames after replying.
+        if (ok && !listener_active_) {
             NfcHexLog::get().log_tx("SPI", tx, len);
             NfcHexLog::get().log_rx("SPI", rx, len);
-        } else {
+        } else if (!ok) {
             NfcHexLog::get().log_tx("SPI", tx, len);
             NfcHexLog::get().log_event("SPI", "transfer ioctl failed");
         }
@@ -1193,6 +1210,15 @@ private:
         return spi_transfer(tx, rx, 1);
     }
 
+    bool reset_chip_defaults()
+    {
+        if (!direct_cmd(st25r_cmd::SET_DEFAULT)) return false;
+        // ST25R3916 Set Default/overheat-protection erratum. The CAP's
+        // reference driver applies this test-register write before normal setup.
+        uint8_t tx[] = {0xFC,0x04,0x10}, rx[3]{};
+        return spi_transfer(tx,rx,sizeof(tx));
+    }
+
     // Space-B access: [0xFB, reg&0x3F, value]
     bool write_spaceb(uint8_t reg, uint8_t value)
     {
@@ -1277,7 +1303,7 @@ private:
     void init_chip()
     {
         // Software reset
-        direct_cmd(st25r_cmd::SET_DEFAULT);
+        reset_chip_defaults();
         sleep_ms(2);
 
         // Match the official Cap-CC1101-NFC driver. Both MISO pull-downs are
@@ -1547,6 +1573,60 @@ private:
     }
 
 public:
+    bool write_mfc_dump(const std::vector<std::string> &lines, int mode,
+                        const std::string &password, const std::vector<std::string> *keys,
+                        const std::function<void(const std::string&)> &progress, std::string *error)
+    {
+        rfid_board::PanelModeRecovery restore_panel;
+#if defined(__linux__)
+        if (!is_open()) { if (error) *error="M5 NFC CAP not connected"; return false; }
+        stop_listener();
+        I2cGroveNfcDevice protocol;
+        I2cGroveNfcDevice::St25rBackend io;
+        io.write_reg=[this](uint8_t reg,uint8_t value) { return write_reg(reg,value); };
+        io.read_reg=[this](uint8_t reg,uint8_t &value) { return read_reg(reg,&value); };
+        io.command=[this](uint8_t cmd) { return direct_cmd(cmd); };
+        io.fifo_write=[this](const uint8_t *p,uint8_t n) { return write_fifo(p,n); };
+        io.fifo_read=[this](uint8_t *p,uint8_t n) {
+            std::vector<uint8_t> tx(n+1),rx(n+1);tx[0]=ST25R_SPI_CMD_FIFO_READ;
+            if (!spi_transfer(tx.data(),rx.data(),tx.size())) return false;
+            std::copy(rx.begin()+1,rx.end(),p); return true;
+        };
+        io.select=[this](std::vector<uint8_t> &uid,uint8_t &sak) {
+            I2cCardInfo info;
+            bool selected=false;
+            for (int retry=0;retry<3 && !selected;++retry) {
+                write_reg(st25r_reg::OP_CONTROL,0x80); sleep_ms(60+retry*30);
+                init_chip();
+                selected=select_card_iso14443a(&info,true);
+            }
+            if (!selected) return false;
+            uid.clear();
+            std::string compact;
+            for (char c:info.uid) if(std::isxdigit(static_cast<unsigned char>(c))) compact+=c;
+            for (size_t i=0;i+1<compact.size();i+=2) uid.push_back(std::strtoul(compact.substr(i,2).c_str(),nullptr,16));
+            sak=std::strtoul(info.sak_hex.c_str(),nullptr,16);return true;
+        };
+        io.unlock=[this,&io](const std::string &expected) {
+            for (int retry=0;retry<3;++retry) {
+                std::vector<uint8_t> uid;uint8_t sak=0;
+                if (!io.select(uid,sak)) continue;
+                std::string actual;
+                const char *digits="0123456789ABCDEF";
+                for (uint8_t b:uid) { actual+=digits[b>>4];actual+=digits[b&15]; }
+                if(actual!=expected) return false;
+                if(is_gen1a()) return true;
+            }
+            return false;
+        };
+        io.read_plain=[this](uint8_t block,uint8_t *p) { return gen1a_read_block(block,p); };
+        protocol.set_st25r_backend(io);
+        return protocol.write_mfc_dump(lines,mode,password,keys,progress,error);
+#else
+        if (error) *error="SPI requires Linux";return false;
+#endif
+    }
+
     // Check if the currently-selected card is a Gen1A magic card.
     // Requires the card to have been previously selected (readCard completed).
     // Gen1A backdoor: 7-bit 0x40 → ACK, then full-byte 0x43 → ACK.
@@ -1563,7 +1643,7 @@ public:
 
     // Read one 16-byte MFC block using plain READ command (0x30).
     // Card must be in Gen1A unlocked state (call is_gen1a() first).
-    bool gen1a_read_block(uint8_t block, uint8_t data[16])
+    bool gen1a_read_block(uint8_t block, uint8_t data[16], int *preferred = nullptr)
     {
 #if defined(__linux__)
         if (fd_ < 0) return false;
@@ -1592,17 +1672,25 @@ public:
 
             size_t got = 0;
             uint8_t buf[20] = {0};
-            if (!read_fifo(buf, sizeof(buf), &got) || got < 16) return false;
+            if (!read_fifo(buf, sizeof(buf), &got) || (got != 16 && got != 18)) return false;
+            if (got == 18) {
+                const uint16_t crc = crc_a(buf, 16);
+                if (buf[16] != static_cast<uint8_t>(crc) || buf[17] != static_cast<uint8_t>(crc >> 8)) return false;
+            }
             std::memcpy(data, buf, 16);
             return true;
         };
 
-        // Order mirrors proven I2C strategy: native first, then raw+CRC,
-        // each with normal and no-rx-par receive profiles.
-        if (try_read(0x00, true,  false)) return true;
-        if (try_read(0x40, true,  false)) return true;
-        if (try_read(0x00, false, true )) return true;
-        if (try_read(0x40, false, true )) return true;
+        const uint8_t modes[] = {0x00, 0x40, 0x00, 0x40};
+        const int first = preferred ? *preferred : -1;
+        if (first >= 0 && first < 4 && try_read(modes[first], first < 2, first >= 2 && first < 4)) return true;
+        for (int i = 0; i < 4; ++i) {
+            if (i == first) continue;
+            if (try_read(modes[i], i < 2, i >= 2 && i < 4)) {
+                if (preferred) *preferred = i;
+                return true;
+            }
+        }
         return false;
 #else
         return false;
@@ -1614,16 +1702,31 @@ public:
     // out_blocks receives 64 × 16-byte blocks (may be nullptr for detect-only).
     bool scan_and_dump_gen1a(I2cCardInfo *out_info,
                              std::vector<std::vector<uint8_t>> *out_blocks,
-                             std::string *error)
+                             std::string *error,
+                             std::function<void(int, const std::vector<uint8_t> &)> on_block = nullptr)
     {
+        rfid_board::PanelModeRecovery restore_panel;
 #if defined(__linux__)
+        last_gen1a_summary_.clear();
         if (fd_ < 0) {
             if (error) *error = "SPI device not open";
             return false;
         }
 
+        // Restore initiator registers after previous dumps/listener sessions.
+        init_chip();
         I2cCardInfo local_info;
-        if (!select_card_iso14443a(out_info ? out_info : &local_info, true)) {
+        bool selected = false;
+        for (int attempt = 0; attempt < 3 && !selected; ++attempt) {
+            if (attempt) {
+                set_rf_field(false);
+                sleep_ms(80);
+                init_chip();
+            }
+            selected = select_card_iso14443a(out_info ? out_info : &local_info, true);
+        }
+        if (!selected) {
+            set_rf_field(false);
             if (error) *error = "No card detected";
             return false;
         }
@@ -1660,26 +1763,55 @@ public:
 
         out_blocks->clear();
         int failures = 0;
+        int consecutive_failures = 0;
+        int preferred = -1;
+        const auto started = std::chrono::steady_clock::now();
         for (int blk = 0; blk < 64; ++blk) {
+            sleep_ms(10);
             std::vector<uint8_t> block(16, 0xFF);
-            if (!gen1a_read_block(static_cast<uint8_t>(blk), block.data())) {
-                ++failures;
+            bool read_ok = gen1a_read_block(static_cast<uint8_t>(blk), block.data(), &preferred);
+            for (int retry = 0; !read_ok && retry < 5; ++retry) {
+                // A failed framing attempt can leave the card outside the
+                // backdoor session. Bound recovery to five fresh sessions.
+                set_rf_field(false);
+                sleep_ms(60 + retry * 30);
+                init_chip();
+                I2cCardInfo retry_info;
+                const I2cCardInfo &expected = out_info ? *out_info : local_info;
+                if (select_card_iso14443a(&retry_info, true) && retry_info.uid == expected.uid && is_gen1a()) {
+                    preferred = -1;
+                    read_ok = gen1a_read_block(static_cast<uint8_t>(blk), block.data(), &preferred);
+                }
             }
+            if (!read_ok) {
+                ++failures;
+                ++consecutive_failures;
+                block.clear();
+            }
+            if (read_ok) consecutive_failures = 0;
+            if (on_block) on_block(blk, block);
             out_blocks->push_back(std::move(block));
+            if (consecutive_failures >= 3) break; // Stop when no block can be read.
         }
 
+        const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - started).count();
+        last_gen1a_summary_ = std::string(failures ? "ERR " : "OK ") + std::to_string(static_cast<int>(out_blocks->size()) - failures) + "/64 blocks " + std::to_string(seconds) + "s";
         set_rf_field(false);
         if (failures > 0 && error) {
             char buf[64];
             std::snprintf(buf, sizeof(buf), "dump completed with %d block read errors", failures);
             *error = buf;
         }
-        return true;
+        return failures == 0;
 #else
         if (error) *error = "SPI not supported";
         return false;
 #endif
     }
+
+    std::string last_gen1a_summary_;
+    const std::string &gen1a_summary() const { return last_gen1a_summary_; }
 
     // Standard NTAG/MFU dump without Gen1A backdoor. Reads pages via READ cmd.
     bool scan_and_dump_mfu(I2cCardInfo *out_info,
@@ -1687,6 +1819,7 @@ public:
                            int *out_pages,
                            std::string *error)
     {
+        rfid_board::PanelModeRecovery restore_panel;
 #if defined(__linux__)
         if (fd_ < 0) {
             if (error) *error = "SPI device not open";
@@ -1987,7 +2120,7 @@ public:
         direct_cmd(st25r_cmd::STOP);
         usleep(5000);
         // Full software reset to recover from SubCarrierStream mode
-        direct_cmd(st25r_cmd::SET_DEFAULT);
+        reset_chip_defaults();
         usleep(2000);
         write_reg(st25r_reg::IO_CONF1, 0x07);
         write_reg(st25r_reg::IO_CONF2, 0x3C);
@@ -2063,6 +2196,7 @@ public:
                                 std::string *error,
                                 Iso15Info *iso15 = nullptr)
     {
+        rfid_board::PanelModeRecovery restore_panel;
 #if defined(__linux__)
         if (fd_ < 0) {
             if (error) *error = "SPI device not open";
@@ -2239,15 +2373,12 @@ public:
     bool read_irq32(uint32_t *out)
     {
 #if defined(__linux__)
-        uint8_t main_irq = 0, timer_irq = 0, err_irq = 0, pta_irq = 0;
-        if (!read_reg(st25r_reg::IRQ_MAIN,      &main_irq))  return false;
-        if (!read_reg(st25r_reg::IRQ_TIMER_NFC, &timer_irq)) return false;
-        if (!read_reg(st25r_reg::IRQ_ERR_WUP,   &err_irq))   return false;
-        if (!read_reg(st25r_reg::IRQ_TARGET,    &pta_irq))   return false;
-        if (out) *out = (static_cast<uint32_t>(pta_irq)   << 24) |
-                        (static_cast<uint32_t>(err_irq)   << 16) |
-                        (static_cast<uint32_t>(timer_irq) <<  8) |
-                         static_cast<uint32_t>(main_irq);
+        // Read-to-clear IRQ banks must be sampled in one SPI transaction.
+        const size_t skip=read_reg_with_dummy_?2:1;
+        uint8_t tx[6]{},rx[6]{}; tx[0]=ST25R_SPI_CMD_READ_REG|st25r_reg::IRQ_MAIN;
+        if (!spi_transfer(tx,rx,skip+4)) return false;
+        if(out) *out=uint32_t(rx[skip])|(uint32_t(rx[skip+1])<<8)|
+                     (uint32_t(rx[skip+2])<<16)|(uint32_t(rx[skip+3])<<24);
         return true;
 #else
         return false;
@@ -2267,34 +2398,33 @@ public:
     bool listener_set_state(ListenerState new_state)
     {
 #if defined(__linux__)
-        // MODE values aligned with RFAL listener flow:
-        // 0xC8: POWER_OFF/IDLE (target NFC-A with bitrate detection)
-        // 0xC8: IDLE      (target NFC-A with bitrate detection)
-        // 0x88: READY/ACTIVE NFC-A
-        constexpr uint8_t kModePowerOff = 0xC8;
-        constexpr uint8_t kModeIdle     = 0xC8;
+        // NFC-A hardware anticollision uses fixed 106 kbit/s in every state.
+        constexpr uint8_t kModePowerOff = 0x88;
+        constexpr uint8_t kModeIdle     = 0x88;
         constexpr uint8_t kModeListenA  = 0x88;
 
         switch (new_state) {
             case ListenerState::PowerOff:
                 if (!direct_cmd(st25r_cmd::STOP)) return false;
                 if (!listener_set_mode(kModePowerOff)) return false;  // MODE must be set first
-                // en (0x80) keeps oscillator on; en_fd (0x02) enables field detection.
+                // en (0x80) keeps oscillator on; automatic en_fd (0x03) enables field detection.
                 // No GOTO_SENSE: field detection via en_fd is passive/hardware-driven.
-                if (!write_reg(st25r_reg::OP_CONTROL, 0x82)) return false;
+                if (!write_reg(st25r_reg::OP_CONTROL, 0x83)) return false;
                 if (!modify_reg_bits(st25r_reg::PASSIVE_TARGET, 0x00, 0x01)) return false;
                 if (!write_reg(st25r_reg::IRQ_MASK_MAIN, 0x5F)) return false;
                 break;
 
             case ListenerState::Idle:
+                if (listener_mfclassic_raw_rx_ && !listener_set_mfclassic_auth_rx(false)) return false;
+                listener_irq_latch_ = 0;
                 if (!listener_set_mode(kModeIdle)) return false;  // set MODE before GOTO_SENSE
-                // en (0x80) + rx_en (0x40) + en_fd (0x02) for bitrate detection.
-                if (!write_reg(st25r_reg::OP_CONTROL, 0xC2)) return false;
+                // en (0x80) + rx_en (0x40) + automatic en_fd (0x03) for bitrate detection.
+                if (!write_reg(st25r_reg::OP_CONTROL, 0xC3)) return false;
                 if (!modify_reg_bits(st25r_reg::PASSIVE_TARGET, 0x00, 0x01)) return false;
-                if (!direct_cmd(st25r_cmd::GOTO_SENSE)) return false;  // start bitrate detection
                 if (!write_reg(st25r_reg::IRQ_MASK_MAIN, 0x5F)) return false;
                 (void)direct_cmd(st25r_cmd::CLEAR_FIFO);
                 (void)direct_cmd(st25r_cmd::UNMASK_RECEIVE_DATA);
+                if (!direct_cmd(st25r_cmd::GOTO_SENSE)) return false;
                 break;
 
             case ListenerState::ReadyA:
@@ -2313,13 +2443,11 @@ public:
 
             case ListenerState::ActiveA:
             case ListenerState::ActiveAx:
-                if (!listener_set_mode(kModeListenA)) return false;
-                // Keep tx_en cleared in active listen mode; transmit commands
-                // assert TX as needed and this matches the proven I2C flow.
-                if (!write_reg(st25r_reg::OP_CONTROL, 0xC2)) return false;
+                // Hardware has already selected this target. Preserve its MODE,
+                // operation state and any AUTH frame coalesced with selection.
                 if (!modify_reg_bits(st25r_reg::PASSIVE_TARGET, 0x01, 0x00)) return false;
                 if (!write_reg(st25r_reg::IRQ_MASK_MAIN, 0xEF)) return false; // unmask RXE (bit4=0)
-                (void)direct_cmd(st25r_cmd::CLEAR_FIFO);
+                // Selection IRQ can be coalesced with AUTH; preserve FIFO.
                 (void)direct_cmd(st25r_cmd::UNMASK_RECEIVE_DATA);
                 break;
 
@@ -2403,6 +2531,18 @@ public:
 
         stop_listener();
 
+        // Reader settings must not leak into passive load modulation. Match
+        // the cold listener setup used by the project's ST25R NFC Unit path,
+        // with the SPI board's MISO pull-downs retained (0x18 in IO_CONFIG2).
+        if (!reset_chip_defaults()) return fail("listener reset failed");
+        sleep_ms(2);
+        if (!write_checked(0x00,0x07,"listener IO configuration failed") ||
+            !write_checked(0x01,0x3C,"listener power configuration failed") ||
+            !write_checked(st25r_reg::OP_CONTROL,0x80,"listener oscillator failed") ||
+            !write_checked(0x09,0x00,"listener stream reset failed") ||
+            !write_checked(0x28,0xD0,"listener load modulation driver failed")) return false;
+        sleep_ms(5);
+
         // Baseline check: verify SPI is alive after stop_listener/init_chip.
         {
             uint8_t ic_base = 0;
@@ -2443,8 +2583,8 @@ public:
             return false;
         }
         // en (0x80) must stay set so the oscillator remains active for field detection.
-        // en_fd (0x02) enables external field detection (EON/EOF interrupts).
-        if (!write_checked(st25r_reg::OP_CONTROL, 0x82, "OP_CONTROL setup failed")) {
+        // automatic en_fd (0x03) enables external field detection (EON/EOF interrupts).
+        if (!write_checked(st25r_reg::OP_CONTROL, 0x83, "OP_CONTROL setup failed")) {
             return false;
         }
         // Check: is SPI still alive after enabling oscillator?
@@ -2460,12 +2600,20 @@ public:
         if (!change_bits(st25r_reg::TIMER_EMV_CONTROL, 0x08, 0x00, "TIMER_EMV_CONTROL setup failed")) {
             return false;
         }
-        if (!write_checked(st25r_reg::MASK_RX_TIMER, 0x04, "MASK_RX_TIMER setup failed")) {
+        if (!write_checked(st25r_reg::MASK_RX_TIMER, 0x02, "MASK_RX_TIMER setup failed")) {
             return false;
         }
         if (!change_bits(st25r_reg::ISO14443A_NFC, 0x00, 0xE0, "ISO14443A_NFC setup failed")) {
             return false;
         }
+        // NFC-A listener receiver configuration, matching Flipper's HAL.
+        (void)write_reg(st25r_reg::BIT_RATE,0x00);
+        (void)write_reg(st25r_reg::RX_CONF1,0x08);
+        (void)write_reg(st25r_reg::RX_CONF2,0x2D);
+        (void)write_reg(st25r_reg::RX_CONF3,0x00);
+        (void)write_reg(st25r_reg::RX_CONF4,0x00);
+        (void)write_spaceb(0x0C,0x51);
+        (void)write_spaceb(0x0D,0x00);
         // Align with the proven listener configuration used by NfcUnit path.
         (void)write_spaceb(0x05, 0x40);
         (void)write_reg(st25r_reg::ANT_TUNE_A, 0x00);
@@ -2476,24 +2624,35 @@ public:
         (void)write_spaceb(0x33, 0x00);
 
         // ── 2. AUX: uid_7 bit = 0x10 for 7-byte UID, 0x00 for 4-byte ─────
-        // Keep no_crc_rx(0x80) enabled, aligned with the proven I2C listener
-        // enter-off/enter-idle sequence.
+        // Keep hardware CRC checking and select the configured UID length.
         uint8_t aux_val = 0;
         if (!read_reg(st25r_reg::AUX, &aux_val)) {
             return fail("AUX read failed");
         }
         aux_val = static_cast<uint8_t>((aux_val & 0x4F) |
                                        (uid_len == 7 ? 0x10 : 0x00) |
-                                       0x80);
+                                       0x00);
         if (!write_reg(st25r_reg::AUX, aux_val)) {
             return fail("AUX write failed");
         }
+        listener_aux_base_ = aux_val;
+        listener_mfclassic_raw_rx_ = false;
+        listener_irq_latch_ = 0;
         sleep_ms(5);
 
         if (!write_pt_memory_a(pt, 15)) {
             return fail("PT memory A write failed");
         }
         sleep_ms(2);
+        // PT memory read has one extra dummy byte after the opcode.
+        uint8_t pt_tx[17]{},pt_rx[17]{}; pt_tx[0]=0xBF;
+        if (!spi_transfer(pt_tx,pt_rx,sizeof(pt_tx)) ||
+            !std::equal(pt,pt+15,pt_rx+2)) {
+            fprintf(stderr,"[NFC-SPI] PT read-back:");
+            for (uint8_t v:pt_rx) fprintf(stderr," %02X",v);
+            fprintf(stderr,"\n");
+            return fail("NFC CAP PT memory read-back failed");
+        }
 
         // ── 7. Enable listener IRQs; mask everything else ─────────────────
         // MAIN: OSC|RXS, TIMER: EON|EOF|NFCT,
@@ -2530,7 +2689,7 @@ public:
         listener_active_ = true;
         listener_br_detected_ = 0xFF;
         listener_keep_auto_collision_ = false;
-        if (!listener_set_state(ListenerState::PowerOff)) {
+        if (!listener_set_state(ListenerState::Idle)) {
             listener_active_ = false;
             listener_state_ = ListenerState::Off;
             return fail("listener state init failed");
@@ -2565,6 +2724,7 @@ public:
         // Some boards can wedge SPI if we repeatedly STOP from initiator state.
         if (!listener_active_) return;
         direct_cmd(st25r_cmd::STOP);
+        release_listener_wave_spi();
         // Restore initiator registers
         init_chip();
         listener_active_ = false;
@@ -2609,28 +2769,33 @@ public:
             return static_cast<uint8_t>(pta_status & 0x0F);
         };
 
+        static const bool trace = std::getenv("NFC_SPI_LISTENER_TRACE") != nullptr;
         static uint32_t s_poll_seq = 0;
         static bool s_spi_dead_logged = false;
         const auto deadline = std::chrono::steady_clock::now() +
                               std::chrono::milliseconds(timeout_ms);
         while (std::chrono::steady_clock::now() < deadline) {
-            uint32_t irq = 0;
-            if (!read_irq32(&irq)) { sleep_ms(2); continue; }
+            uint32_t irq = listener_irq_latch_;
+            listener_irq_latch_ = 0;
+            if (irq == 0 && !read_irq32(&irq)) { sleep_ms(2); continue; }
             ++s_poll_seq;
             if (irq == 0xFFFFFFFF) {
                 // SPI MISO stuck high: chip not driving MISO (SPI dead or chip reset).
                 if (!s_spi_dead_logged || (s_poll_seq % 500) == 0) {
                     uint8_t ic = 0;
                     read_reg(st25r_reg::IC_IDENTITY, &ic);
-                    fprintf(stderr,
+                    if (trace) fprintf(stderr,
                         "[NFC-SPI] seq=%u SPI-STUCK state=%d IC_ID=%02X\n",
                         s_poll_seq, static_cast<int>(listener_state_), ic);
-                    fflush(stderr);
+                    if (trace) fflush(stderr);
                     s_spi_dead_logged = true;
                 }
+                // A floating/stuck MISO value is not a selection event.
+                sleep_ms(1);
+                continue;
             } else if (irq != 0 || (s_poll_seq % 500) == 0) {
                 // Log any real event (non-zero, non-stuck) and heartbeat every 500.
-                fprintf(stderr,
+                if (trace) fprintf(stderr,
                     "[NFC-SPI] seq=%u state=%d irq=%08X"
                     " main=%02X timer=%02X err=%02X pta=%02X\n",
                     s_poll_seq, static_cast<int>(listener_state_), irq,
@@ -2638,7 +2803,7 @@ public:
                     static_cast<uint8_t>((irq >> 8) & 0xFF),
                     static_cast<uint8_t>((irq >> 16) & 0xFF),
                     static_cast<uint8_t>(irq >> 24));
-                fflush(stderr);
+                if (trace) fflush(stderr);
                 s_spi_dead_logged = false;
             }
 
@@ -2660,77 +2825,19 @@ public:
             }
 
             if (listener_state_ == ListenerState::Idle) {
-                if ((timer & 0x01) != 0) {
-                    decode_detected_br();
-                }
-
-                if ((timer & 0x08) != 0) {
-                    // Keep listener alive on EOF; do not drop to PowerOff.
-                    (void)direct_cmd(st25r_cmd::CLEAR_FIFO);
-                    (void)direct_cmd(st25r_cmd::UNMASK_RECEIVE_DATA);
-                    sleep_ms(2);
+                // Hardware owns the complete REQA/anticollision/SELECT exchange.
+                // WU_A/WU_AX signals selection; no timed Linux mode switch.
+                if (pta & 0x03) {
+                    listener_br_detected_=0;
+                    if (!set_state_safe((pta & 0x02)?ListenerState::ActiveAx:ListenerState::ActiveA)) return false;
+                    if (trace) fprintf(stderr,"[NFC-SPI] hardware anticollision selected pta=%02X\n",pta);
+                } else {
+                    if (timer & 0x08) {
+                        (void)direct_cmd(st25r_cmd::GOTO_SENSE);
+                    }
+                    sleep_ms(1);
                     continue;
                 }
-
-                const bool rxe_main_idle = (main_irq & 0x10) != 0;
-                if (rxe_main_idle && listener_br_detected_ != 0xFF) {
-                    uint8_t fifo_data[64] = {0};
-                    size_t fifo_len = 0;
-                    const bool fifo_ok = read_fifo(fifo_data, sizeof(fifo_data), &fifo_len);
-                    fprintf(stderr,
-                            "[NFC-SPI] idle-main-rxe fifo_ok=%u fifo_len=%zu main=%02X pta=%02X\n",
-                            fifo_ok ? 1u : 0u,
-                            fifo_len,
-                            main_irq,
-                            pta);
-                    fflush(stderr);
-                    (void)direct_cmd(st25r_cmd::CLEAR_FIFO);
-                    (void)direct_cmd(st25r_cmd::UNMASK_RECEIVE_DATA);
-                }
-
-                if ((pta & 0x10) != 0 && listener_br_detected_ == 0) {
-                    if (!listener_keep_auto_collision_) {
-                        uint8_t fifo_data[64] = {0};
-                        size_t fifo_len = 0;
-                        const bool fifo_ok = read_fifo(fifo_data, sizeof(fifo_data), &fifo_len);
-                        if (fifo_ok && fifo_len > 0) {
-                            if (!set_state_safe(ListenerState::ActiveA)) {
-                                listener_active_ = false;
-                                listener_state_ = ListenerState::Off;
-                                return false;
-                            }
-                            frame.assign(fifo_data, fifo_data + fifo_len);
-                            return true;
-                        }
-                    }
-
-                    const uint8_t pta_state = read_pta_state();
-                    if ((pta_state & 0x0F) > 0x01) {
-                        (void)set_state_safe(ListenerState::ReadyA);
-                    }
-                }
-                sleep_ms(2);
-                continue;
-            }
-
-            if (listener_state_ == ListenerState::ReadyA || listener_state_ == ListenerState::ReadyAx) {
-                if ((timer & 0x08) != 0) {
-                    (void)direct_cmd(st25r_cmd::CLEAR_FIFO);
-                    (void)direct_cmd(st25r_cmd::UNMASK_RECEIVE_DATA);
-                    (void)set_state_safe(ListenerState::Idle);
-                    sleep_ms(2);
-                    continue;
-                }
-
-                if ((pta & 0x01) != 0 || (pta & 0x02) != 0 ||
-                    ((pta & 0x10) != 0 && !listener_keep_auto_collision_)) {
-                    if (!listener_keep_auto_collision_) {
-                        if ((pta & 0x02) != 0) (void)set_state_safe(ListenerState::ActiveAx);
-                        else (void)set_state_safe(ListenerState::ActiveA);
-                    }
-                }
-                sleep_ms(2);
-                continue;
             }
 
             // Active states: RXE/RXE_PTA carry incoming reader frames.
@@ -2739,8 +2846,8 @@ public:
             const bool state_active = (listener_state_ == ListenerState::ActiveA ||
                                        listener_state_ == ListenerState::ActiveAx);
 
-            if (state_active && ((timer & 0x08) != 0)) {
-                (void)set_state_safe(ListenerState::PowerOff);
+            if (state_active && ((timer & 0x08) != 0) && !rxe_main && !(pta & 0x03)) {
+                (void)set_state_safe(ListenerState::Idle);
                 sleep_ms(2);
                 continue;
             }
@@ -2752,11 +2859,11 @@ public:
                     size_t fifo_len = 0;
                     const bool fifo_ok = read_fifo(fifo_data, sizeof(fifo_data), &fifo_len);
                     if (fifo_ok && fifo_len > 0) {
-                        fprintf(stderr,
+                        if (trace) fprintf(stderr,
                                 "[NFC-SPI] active-rxe err=%02X salvage len=%zu\n",
                                 err_irq,
                                 fifo_len);
-                        fflush(stderr);
+                        if (trace) fflush(stderr);
                         frame.assign(fifo_data, fifo_data + fifo_len);
                         return true;
                     }
@@ -2771,24 +2878,86 @@ public:
                 uint8_t fifo_data[64] = {0};
                 size_t  fifo_len = 0;
                 const bool fifo_ok = read_fifo(fifo_data, sizeof(fifo_data), &fifo_len);
-                fprintf(stderr,
+                if (trace) fprintf(stderr,
                         "[NFC-SPI] active-rxe fifo_ok=%u fifo_len=%zu main=%02X pta=%02X\n",
                         fifo_ok ? 1u : 0u,
                         fifo_len,
                         main_irq,
                         pta);
-                fflush(stderr);
+                if (trace) fflush(stderr);
                 if (fifo_ok && fifo_len > 0) {
                     frame.assign(fifo_data, fifo_data + fifo_len);
                     return true;
                 }
             }
 
-            sleep_ms(2);
+            // MF1 AT and encrypted reads have a short PICC response window.
+            // A 2 ms sleep after RXS can miss it before RXE is sampled.
+            if (listener_state_ != ListenerState::ActiveA && listener_state_ != ListenerState::ActiveAx)
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
         return false;
 #else
         return false;
+#endif
+    }
+
+    // Encrypted NR/AR has encrypted parity and no CRC. Receive all nine bits
+    // per byte; the MFKey worker removes the parity bits after capture.
+    bool listener_mfclassic_raw_rx() const { return listener_mfclassic_raw_rx_; }
+
+    bool listener_set_mfclassic_auth_rx(bool enabled)
+    {
+        if (!write_reg(st25r_reg::AUX, listener_aux_base_ | (enabled ? 0x80 : 0x00)) ||
+            !write_reg(st25r_reg::ISO14443A_NFC, enabled ? 0x40 : 0x00)) return false;
+        listener_mfclassic_raw_rx_ = enabled;
+        return true;
+    }
+
+    bool mfc_tx_driver_available() const
+    {
+#if defined(__linux__) && defined(__aarch64__)
+        return parse_env_int("NFC_SPI_MFC_EXPERIMENTAL",0)!=0 &&
+            spidev_path_=="/dev/spidev0.2" && ::access("/dev/rfid_mfc_tx",R_OK|W_OK)==0;
+#else
+        return false;
+#endif
+    }
+
+    bool prepare_mfc_tx(std::string *error=nullptr)
+    {
+        if (parse_env_int("NFC_SPI_MFC_EXPERIMENTAL",0)==0) {
+            if (error) *error="SPI MFC emulation experimental; disabled by default";
+            return false;
+        }
+#if defined(__linux__) && defined(__aarch64__)
+        if (listener_raw_tx_fd_>=0) return true;
+        if (spidev_path_=="/dev/spidev0.2") listener_raw_tx_fd_=::open("/dev/rfid_mfc_tx",O_RDWR|O_CLOEXEC);
+        if (listener_raw_tx_fd_>=0) return true;
+#endif
+        if (error) *error="MFC emulation TX driver unavailable";
+        return false;
+    }
+
+    bool send_listener_raw_frame(const std::vector<uint8_t> &raw, size_t bits)
+    {
+#if defined(__linux__) && defined(__aarch64__)
+        if (!listener_active_ || raw.empty() || !bits || bits>raw.size()*8 || bits>162 || !prepare_mfc_tx())
+            return false;
+        // Manchester + fc/16 load modulation, 16 SPI samples per RF bit.
+        // The kernel helper holds the SPI bus through transparent TX and RX
+        // rearm. Neither LCD traffic nor user-space scheduling can split it.
+        std::vector<uint8_t> waveform;
+        waveform.reserve((bits+1)*2+4);
+        auto symbol=[&](bool one) { waveform.push_back(one?0xAA:0); waveform.push_back(one?0:0xAA); };
+        symbol(true);
+        for(size_t bit=0;bit<bits;++bit) symbol((raw[bit/8]>>(bit%8))&1);
+        waveform.push_back(0); waveform.push_back(0); // EOF
+        struct WaveRequest { uint32_t length; uint32_t reserved; uint64_t data; };
+        const WaveRequest request{static_cast<uint32_t>(waveform.size()),0,reinterpret_cast<uintptr_t>(waveform.data())};
+        return ::ioctl(listener_raw_tx_fd_,_IOW('N',0x42,WaveRequest),&request)==0;
+#else
+        (void)raw; (void)bits; return false;
 #endif
     }
 
@@ -2864,10 +3033,11 @@ public:
         // Wait briefly for TXE to avoid racing into the next RX poll cycle.
         // In listener mode this improves short-frame response stability.
         for (int i = 0; i < 40; ++i) {
-            uint8_t main_irq = 0;
-            if (!read_reg(st25r_reg::IRQ_MAIN, &main_irq)) break;
-            if ((main_irq & 0x08) != 0) break; // TXE
-            sleep_ms(1);
+            uint32_t irq = 0;
+            if (!read_irq32(&irq)) return false;
+            listener_irq_latch_ |= irq & ~uint32_t(0x08);
+            if (irq & 0x08) break; // TXE; preserve a coalesced RXE/field event
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
 
         (void)direct_cmd(st25r_cmd::UNMASK_RECEIVE_DATA);

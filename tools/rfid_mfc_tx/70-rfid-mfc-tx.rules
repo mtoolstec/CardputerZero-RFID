@@ -1,0 +1,2 @@
+ACTION=="add", SUBSYSTEM=="spi", KERNEL=="spi0.2", RUN+="/usr/sbin/modprobe rfid_mfc_tx"
+SUBSYSTEM=="misc", KERNEL=="rfid_mfc_tx", GROUP="spi", MODE="0660"

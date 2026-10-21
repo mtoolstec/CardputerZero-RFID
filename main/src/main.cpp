@@ -12,6 +12,8 @@ extern "C" {
 #include "hal/hal_paths.h"
 }
 
+#include "hal/hal_panel_mode.hpp"
+
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -342,6 +344,7 @@ static void init_display(void)
     lv_display_t *disp = lv_linux_fbdev_create();
     if (!disp) { fprintf(stderr, "[RFID] lv_linux_fbdev_create failed\n"); return; }
     lv_linux_fbdev_set_file(disp, fb);
+    rfid_board::restore_panel_mode();
 #elif LV_USE_LINUX_DRM
     lv_linux_drm_create();
 #endif
@@ -375,6 +378,24 @@ int main(void)
     ::std::signal(SIGPIPE, SIG_IGN);
 
     hal_paths_init(nullptr);
+    rfid_board::PanelModeRecovery restore_panel_on_exit;
+
+#ifdef __linux__
+    // The CAP's NFC chip uses GPIO22, separate from the CC1101 SPI endpoint.
+    // Load the board-provided runtime overlay so the kernel owns NFC CS.
+    // Software CS over spidev0.1 can corrupt target-mode transactions.
+    if (::access("/dev/spidev0.2", F_OK) != 0 &&
+        ::access("/boot/firmware/overlays/spi0-spidev2-gpio22-overlay.dtbo", R_OK) == 0) {
+        const char *load_command = ::geteuid() == 0 ?
+            "/usr/bin/timeout --signal=KILL 5s /usr/bin/dtoverlay "
+            "-d /boot/firmware/overlays spi0-spidev2-gpio22-overlay" :
+            "/usr/bin/sudo -n /usr/bin/timeout --signal=KILL 5s /usr/bin/dtoverlay "
+            "-d /boot/firmware/overlays spi0-spidev2-gpio22-overlay";
+        const int status = std::system(load_command);
+        std::fprintf(stderr, "[RFID] NFC CAP SPI overlay: status=%d endpoint=%s\n",
+                     status, ::access("/dev/spidev0.2", F_OK) == 0 ? "ready" : "unavailable");
+    }
+#endif
 
     // Power both expansion connectors before endpoint discovery starts.
     const bool ext_power = ::nfc_app::NfcTransportFactory::set_ext_5v(true);
@@ -385,12 +406,6 @@ int main(void)
                 grove_power ? "on" : "failed");
     std::fflush(stdout);
     usleep(500000);
-
-    // Reset framebuffer to prevent black screen on re-entry
-    {
-        int _fb = ::open("/dev/fb0", O_RDWR);
-        if (_fb >= 0) ::close(_fb);
-    }
 
     lv_init();
 

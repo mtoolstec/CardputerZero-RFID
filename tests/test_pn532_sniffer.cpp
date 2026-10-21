@@ -1,4 +1,4 @@
-// Standalone regression: c++ -std=c++17 -I main/ui/components/nfc -I ../CardputerZero-Emulator/vendor tools/test_pn532_sniffer.cpp -o /tmp/test-sniffer
+// Standalone regression: c++ -std=c++17 -I main/nfc -I ../CardputerZero-Emulator/vendor tools/test_pn532_sniffer.cpp -o /tmp/test-sniffer
 #include "nfc_protocol.hpp"
 #include <cassert>
 #include <cstring>

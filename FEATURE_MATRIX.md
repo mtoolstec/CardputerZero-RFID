@@ -32,7 +32,7 @@
 | 标准 PN532（UART 模块） | △ 按协议 | 同标准 PN532 | — | ✓ | ✓ |
 | M5 NFC Unit（ST25R3916B） | △ 按协议 | Gen1A/Gen4；Gen3 禁用 | △ NFC-A/NTAG/MFC listener | — | ✓ |
 | GroveNFC | △ 按协议 | ? | ✓ NTAG/MFC1K/China2/15693 | — | ✓ |
-| M5 NFC CAP（ST25R3916） | △ 按协议 | ? | △ NFC-A listener | — | ✓ |
+| M5 NFC CAP（ST25R3916） | Gen1A/Gen4 全块；Normal/Gen3 保留密钥 | Gen1A/Gen3/Gen4 | NTAG JSON；MFC1K 实验且默认禁用 | — | ✓ |
 
 ### Mifare Classic 工具
 
@@ -45,7 +45,7 @@
 | 标准 PN532（UART 模块） | ✓ | — | — | — | — | — |
 | M5 NFC Unit（ST25R3916B） | ✓ | ✓ 无卡 listener | — | — | — | — |
 | GroveNFC | ✓ | — | — | — | — | — |
-| M5 NFC CAP（ST25R3916） | △ 按读卡路径 | — | — | — | — | — |
+| M5 NFC CAP（ST25R3916） | △ 按读卡路径 | ✓ 无卡 listener | — | — | — | — |
 
 ## UHF：超高频读卡器
 
@@ -69,7 +69,10 @@
 
 ## 代码核对入口
 
-- `main/ui/components/nfc/nfc_transport.hpp`：设备枚举、USB 身份、串口/I²C/SPI 与供电。
-- `main/ui/components/nfc/nfc_device_service.hpp`：读写路由、UID 写入限制、模拟、MFkey、UHF bank 操作。
-- `main/ui/components/nfc/nfc_i2c_device.hpp`、`nfc_spi_device.hpp`：I²C/SPI 具体读卡和 listener 实现。
+- `main/nfc/nfc_transport.hpp`：设备枚举、USB 身份、串口/I²C/SPI 与供电。
+- `main/nfc/nfc_device_service.hpp`：读写路由、UID 写入限制、模拟、MFkey、UHF bank 操作。
+- `main/nfc/nfc_i2c_device.hpp`、`nfc_spi_device.hpp`：I²C/SPI 具体读卡和 listener 实现。
 - `main/ui/components/page_app/ui_app_nfc.hpp`：用户可进入的功能和设备能力限制。
+
+- Gen1A Saved 写入复用解锁会话，每块检查两次 ACK，不进行读回 verify；其余写入模式仍写完后校验。
+- SPI 加密 MFC1K 模拟尚未通过完整重启认证回归，默认禁用，不能按稳定能力发布。

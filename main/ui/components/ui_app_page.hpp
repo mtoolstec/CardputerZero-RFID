@@ -127,8 +127,11 @@ public:
         if (self) self->update_status_bar();
     }
 
+    virtual bool status_updates_enabled() const { return true; }
+
     void update_status_bar()
     {
+        if (!status_updates_enabled()) return;
         char time_buf[16];
         hal_time_str(time_buf, sizeof(time_buf));
         lv_label_set_text(ui_TOP_time_Label, time_buf);
@@ -156,6 +159,7 @@ public:
 
     void update_battery_status(const hal_battery_info_t &bat)
     {
+        if (!status_updates_enabled()) return;
         if (bat.valid) {
             int soc = bat.soc;
             if (soc > 100) soc = 100;
