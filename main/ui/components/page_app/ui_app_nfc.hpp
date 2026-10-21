@@ -4326,17 +4326,22 @@ private:
             case 2:
                 create_text(detail, 6, 22, "MIFARE Classic Sniff", 0xD8D8D8, 11);
                 create_text(detail, 6, 35, "without tag present", 0xD8D8D8, 11);
-                create_text(detail, 6, 50, "Killer / NFC Unit", 0x8DB6FF, 11);
+                create_text(detail, 6, 51, "Supported HW:", 0x9E9E9E, 10);
+                create_text(detail, 6, 65, "- PN532Killer", 0x8DB6FF, 10);
+                create_text(detail, 6, 79, "- M5 NFC CAP", 0x8DB6FF, 10);
+                create_text(detail, 6, 93, "- M5 NFC Unit", 0x8DB6FF, 10);
                 break;
             case 4:
                 create_text(detail, 6, 24, "Dictionary + nested", 0xD8D8D8, 10);
                 create_text(detail, 6, 44, "Classic sectors A/B", 0xD8D8D8, 10);
-                create_text(detail, 6, 64, "PN532Killer only", 0x8DB6FF, 10);
+                create_text(detail, 6, 64, "Supported HW:", 0x9E9E9E, 10);
+                create_text(detail, 6, 78, "- PN532Killer", 0x8DB6FF, 10);
                 break;
             case 3:
                 create_text(detail, 6, 22, "MIFARE Classic Sniff", 0xD8D8D8, 11);
                 create_text(detail, 6, 35, "with tag present", 0xD8D8D8, 11);
-                create_text(detail, 6, 50, "PN532Killer required", 0x8DB6FF, 11);
+                create_text(detail, 6, 51, "Supported HW:", 0x9E9E9E, 10);
+                create_text(detail, 6, 65, "- PN532Killer", 0x8DB6FF, 10);
                 break;
             default: break;
             }
