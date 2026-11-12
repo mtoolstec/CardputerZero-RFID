@@ -1421,6 +1421,11 @@ private:
                         service_.toggle_spi_profile();
                         ui_message_ = std::string("Profile -> ") + service_.spi_profile_label();
                     } else if (emu_device_kind == nfc_app::DeviceKind::GroveNFC) {
+                        if (!service_.grovenfc_deactivate()) {
+                            ui_message_ = "GroveNFC pause failed";
+                            render_all();
+                            return;
+                        }
                         service_.cycle_hw_emu_protocol();
                         emu_dump_scroll_ = 0;
                         const auto proto2 = service_.current_emulator_protocol();
@@ -1598,23 +1603,17 @@ private:
         }
 
         if (device_kind == nfc_app::DeviceKind::GroveNFC) {
-            if (service_.nfcunit_emulation_running()) {
+            if (service_.grovenfc_emulation_running()) {
                 const bool ok = service_.grovenfc_deactivate();
                 ui_message_ = ok ? "GroveNFC emulation paused" : "GroveNFC pause failed";
                 return true;
             }
 
             const auto protocol = service_.current_emulator_protocol();
-            service_.i2c_emulator_dump_lines(protocol);
-            service_.reload_i2c_profile_from_cache(protocol);
             std::string error;
             if (service_.grovenfc_activate(protocol, 0, &error)) {
-                scan_log_lines_.push_back(std::string("> GroveNFC EMU: ") +
-                                          nfc_app::to_string(protocol) + " started");
                 ui_message_ = "GroveNFC emulation running";
             } else {
-                scan_log_lines_.push_back(std::string("ERR GroveNFC EMU: ") +
-                                          (error.empty() ? "activate failed" : error));
                 ui_message_ = error.empty() ? "GroveNFC start failed" : error;
             }
             return true;
@@ -1769,6 +1768,7 @@ private:
             const bool keep_usb_nfc_connected =
                 leaving_conn.connected &&
                 (leaving_conn.device_kind == nfc_app::DeviceKind::ST25RNFC ||
+                 leaving_conn.device_kind == nfc_app::DeviceKind::GroveNFC ||
                  (leaving_conn.endpoint.kind == nfc_app::TransportKind::UsbSerial &&
                   (leaving_conn.device_kind == nfc_app::DeviceKind::PN532 ||
                    leaving_conn.device_kind == nfc_app::DeviceKind::PN532Killer)));
@@ -1783,7 +1783,7 @@ private:
         } else if (current_tab_ == Tab::Read) {
             sync_ext_usb_power();
         }
-        // When leaving Emulator tab, stop NDEF emulation only.
+        // Stop the active emulator when leaving EMU.
         if (prev_tab == Tab::Emulator && current_tab_ != Tab::Emulator) {
             if (service_.pn532_ndef_state().running) {
                 service_.stop_pn532_ndef_emulation();
@@ -1815,7 +1815,11 @@ private:
         if (current_tab_ == Tab::Emulator) {
             const auto proto = service_.current_emulator_protocol();
             const std::string src_filename = emulator_source_filename(proto);
-            const auto conn = service_.connection_state();
+            auto conn = service_.connection_state();
+            if (!conn.connected && service_.current_endpoint().kind == nfc_app::TransportKind::I2cBus) {
+                service_.connect_current();
+                conn = service_.connection_state();
+            }
             cache_serial_device_kind(conn);
             const auto kind = effective_emu_device_kind(conn);
             if (conn.connected && kind == nfc_app::DeviceKind::PN532Killer) {
@@ -3278,7 +3282,7 @@ private:
             uhf_table_scroll_offset_ = std::max(0, std::min(max_scroll, uhf_table_scroll_offset_));
         }
 
-        // Always drain real-time block lines pushed during Gen1A dump
+        // Drain incoming block data while the reader is still working.
         {
             auto lines = service_.drain_pending_log();
             const auto conn = service_.connection_state();
@@ -4266,13 +4270,15 @@ private:
                                    (emu_device_kind == nfc_app::DeviceKind::NFCUnit ||
                                     endpoint.kind == nfc_app::TransportKind::I2cBus);
         const bool i2c_emu_mode = !st25r_mode && (grove_mode || nfc_unit_mode);
+        const auto protocol = service_.current_emulator_protocol();
         const bool i2c_url_mode = i2c_emu_mode &&
-            service_.current_emulator_protocol() == nfc_app::ProtocolKind::Iso14443A;
+            (protocol == nfc_app::ProtocolKind::Iso14443A ||
+             (grove_mode && protocol == nfc_app::ProtocolKind::Iso15693));
         const bool pn532k_mode = !st25r_mode && !i2c_emu_mode && !pn532_ndef_menu;
         const int emu_slot = (i2c_emu_mode || st25r_mode) ? 0 : hw_emu_slot_;
         const bool dump_ready = service_.emu_dump_loaded(service_.current_emulator_protocol(), emu_slot);
         // PN532Killer: Download Data, Upload Data, Reset Data
-        // I2C emu (GroveNFC/NFCUnit): only Set URL (for NTAG) + Reset Data (no Download/Upload)
+        // I2C emu (GroveNFC/NFCUnit): Set URL on NDEF profiles and Reset Data
         const int n_opts = pn532_ndef_menu ? 1 :
                           (st25r_mode ? 4 :
                           (pn532k_mode ? 3 :
@@ -4305,7 +4311,7 @@ private:
             "Upload Data",
             "Cancel"
         };
-        // I2C EMU (GroveNFC/NFCUnit): NTAG shows Set URL + Reset; others show just Reset
+        // I2C EMU (GroveNFC/NFCUnit): NDEF profiles offer Set URL and Reset Data
         const char *i2c_url_opts[] = {"Set URL", "Reset Data"};
         const char *i2c_reset_only[] = {"Reset Data"};
         const char *pn532_opts[] = {"Edit URI"};
@@ -4344,7 +4350,11 @@ private:
         static const char *PFXS[] = {"https://", "http://", "tel:", "mailto:", ""};
 
         lv_obj_t *card = make_modal_card(overlay, 280, 86, 0x00D2FF);
-        create_text(card, 8, 4, uri_edit_for_nfcunit_ ? "Set NTAG213 URL" : "Edit URI", 0x00D2FF, 12);
+        const bool iso15693_url = uri_edit_for_grove_ &&
+            service_.current_emulator_protocol() == nfc_app::ProtocolKind::Iso15693;
+        const char *title = iso15693_url ? "Set ISO15693 URL" :
+                            uri_edit_for_nfcunit_ ? "Set NTAG213 URL" : "Edit URI";
+        create_text(card, 8, 4, title, 0x00D2FF, 12);
 
         // Type indicator: current prefix shown in yellow; Tab to cycle
         const char *pfx = PFXS[pn532_ndef_type_idx_];
@@ -4394,10 +4404,12 @@ private:
                 ui_message_ = "NTAG213 URL updated";
                 uri_edit_for_nfcunit_ = false;
             } else if (uri_edit_for_grove_) {
-                if (service_.set_grove_ntag_ndef_uri(pn532_ndef_uri_)) {
-                    ui_message_ = "GroveNFC NTAG URL updated";
+                const auto protocol = service_.current_emulator_protocol();
+                std::string error;
+                if (service_.set_grove_ndef_uri(protocol, pn532_ndef_uri_, &error)) {
+                    ui_message_ = std::string(nfc_app::to_string(protocol)) + " URL updated";
                 } else {
-                    ui_message_ = "Set URL failed (save error)";
+                    ui_message_ = error;
                 }
                 uri_edit_for_grove_ = false;
             } else {
@@ -7126,8 +7138,10 @@ private:
                                    (dev_kind == nfc_app::DeviceKind::NFCUnit ||
                                     endpoint.kind == nfc_app::TransportKind::I2cBus);
         const bool i2c_emu_mode = !st25r_mode && (grove_mode || nfc_unit_mode);
+        const auto protocol = service_.current_emulator_protocol();
         const bool i2c_url_mode = i2c_emu_mode &&
-            service_.current_emulator_protocol() == nfc_app::ProtocolKind::Iso14443A;
+            (protocol == nfc_app::ProtocolKind::Iso14443A ||
+             (grove_mode && protocol == nfc_app::ProtocolKind::Iso15693));
         const int emu_slot = (i2c_emu_mode || st25r_mode) ? 0 : hw_emu_slot_;
         const bool dump_ready = service_.emu_dump_loaded(service_.current_emulator_protocol(), emu_slot);
         const bool pn532k_mode = !st25r_mode && !i2c_emu_mode && !pn532_ndef_menu;
@@ -7204,8 +7218,10 @@ private:
                         uri_edit_for_grove_ = !nfc_unit_mode;
                         pn532_ndef_type_idx_ = 0;
                         pn532_ndef_body_ = "m5stack.com";
-                        const std::string cur_uri = service_.nfcunit_ndef_uri();
+                        const std::string cur_uri = grove_mode
+                            ? service_.grove_ndef_uri(protocol) : service_.nfcunit_ndef_uri();
                         if (!cur_uri.empty()) {
+                            pn532_ndef_type_idx_ = 4;
                             pn532_ndef_body_ = cur_uri;
                             for (int pi = 0; pi < 4; ++pi) {
                                 const size_t plen = strlen(PFXS_[pi]);

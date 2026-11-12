@@ -43,6 +43,19 @@ See [FEATURE_MATRIX.md](FEATURE_MATRIX.md) for per-device details. A visible UID
 - **Dump from emulator** — read back emulated slot content as hex lines
 - **Profile switcher** — toggle protocol/slot and auto-reprobe
 
+With GroveNFC selected on I²C, enter **EMU** to start the active profile. Press
+**Tab** in EMU to cycle MFC 1K → NTAG213 → ISO15693. Each switch stops the
+previous profile before loading the next image. **Space** pauses or resumes.
+
+To scan the MFC or NTAG profile on the USB PN532 test bench:
+
+```sh
+PN532_PORT=/dev/cu.wchusbserial14410 python3 /Users/wilson/Github/pn532-python/script/test_usb.py -p /dev/cu.wchusbserial14410
+```
+
+The script uses `PN532_PORT` to pin the reader. Use a separate ISO15693 reader
+to verify the ISO15693 profile.
+
 ### Tools Tab
 | Tool | Description |
 |------|-------------|

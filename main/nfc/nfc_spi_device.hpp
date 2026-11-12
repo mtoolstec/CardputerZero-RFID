@@ -1817,7 +1817,8 @@ public:
     bool scan_and_dump_mfu(I2cCardInfo *out_info,
                            std::vector<std::vector<uint8_t>> *out_blocks,
                            int *out_pages,
-                           std::string *error)
+                           std::string *error,
+                           std::function<void(int, const std::vector<uint8_t> &)> on_block = nullptr)
     {
         rfid_board::PanelModeRecovery restore_panel;
 #if defined(__linux__)
@@ -1926,6 +1927,7 @@ public:
             for (int i = 0; i < 4 && (pg + i) < total_pages; ++i) {
                 std::vector<uint8_t> block(buf + i*4, buf + i*4 + 4);
                 out_blocks->push_back(std::move(block));
+                if (on_block) on_block(pg + i, out_blocks->back());
             }
         }
 
@@ -2194,7 +2196,8 @@ public:
     bool scan_and_dump_iso15693(I2cCardInfo *out_info,
                                 std::vector<std::vector<uint8_t>> *out_blocks,
                                 std::string *error,
-                                Iso15Info *iso15 = nullptr)
+                                Iso15Info *iso15 = nullptr,
+                                std::function<void(int, const std::vector<uint8_t> &)> on_block = nullptr)
     {
         rfid_board::PanelModeRecovery restore_panel;
 #if defined(__linux__)
@@ -2329,6 +2332,7 @@ public:
 
             std::vector<uint8_t> block_data(dec + 1, dec + dec_len);
             out_blocks->push_back(std::move(block_data));
+            if (on_block) on_block(block, out_blocks->back());
             usleep(1000);  // small gap between blocks
         }
 

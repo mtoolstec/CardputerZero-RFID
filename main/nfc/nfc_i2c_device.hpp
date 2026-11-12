@@ -276,10 +276,10 @@ public:
         if (!is_nfc_unit()) {
             switch (protocol) {
             case ProtocolKind::Iso15693:
-                return dumpGroveISO15(uid_hint, out_lines, error);
+                return dumpGroveISO15(uid_hint, out_lines, progress, error);
             case ProtocolKind::Iso14443A: {
                 std::string ntag_err;
-                if (dumpGroveNTAG(uid_hint, tag_type, out_lines, &ntag_err))
+                if (dumpGroveNTAG(uid_hint, tag_type, out_lines, progress, &ntag_err))
                     return true;
                 return dumpGroveMFC(uid_hint, tag_type, mfc_key_hex, out_lines, progress, error);
             }
@@ -293,10 +293,10 @@ public:
 
         switch (protocol) {
         case ProtocolKind::Iso15693:
-            return dumpNFCUnitISO15693(uid_hint, out_lines, error);
+            return dumpNFCUnitISO15693(uid_hint, out_lines, progress, error);
         case ProtocolKind::Iso14443A: {
             std::string mfu_err;
-            if (dumpNFCUnitMFU(uid_hint, out_lines, &mfu_err)) {
+            if (dumpNFCUnitMFU(uid_hint, out_lines, progress, &mfu_err)) {
                 if (error) error->clear();
                 return true;
             }
@@ -785,9 +785,9 @@ public:
 
     bool startEmulationNtag213()
     {
-        writeSysReg(i2c_reg::SET_MODE, i2c_mode::DEFAULT | i2c_mode::TAG_NONE);
+        if (!stopEmulation()) return false;
         delay_ms(5);
-        writeSysReg(i2c_reg::SET_TAGADDR, TAG_ADDR_NTAG213);
+        if (!writeSysReg(i2c_reg::SET_TAGADDR, TAG_ADDR_NTAG213)) return false;
         delay_ms(5);
         return writeSysReg(i2c_reg::SET_MODE, i2c_mode::DEFAULT | i2c_mode::TAG_NTAG213);
     }
@@ -812,10 +812,10 @@ public:
 
     bool startEmulationMifare1K()
     {
-        writeSysReg(i2c_reg::SET_MODE, i2c_mode::DEFAULT | i2c_mode::TAG_NONE);
-        delay_ms(5);
-        writeSysReg(i2c_reg::SET_TAGADDR, TAG_ADDR_MFC1K);
-        delay_ms(5);
+        if (!stopEmulation()) return false;
+        delay_ms(10);
+        if (!writeSysReg(i2c_reg::SET_TAGADDR, TAG_ADDR_MFC1K)) return false;
+        delay_ms(10);
         return writeSysReg(i2c_reg::SET_MODE, i2c_mode::DEFAULT | i2c_mode::TAG_MFC1K);
     }
 
@@ -823,34 +823,55 @@ public:
     {
         writeSysReg(i2c_reg::SET_MODE, i2c_mode::DEFAULT | i2c_mode::TAG_NONE);
         delay_ms(5);
-        writeSysReg(i2c_reg::SET_RFCFG, i2c_rfcfg::R15 | i2c_rfcfg::T15);
-        delay_ms(2);
-        writeSysReg(i2c_reg::SET_TAGADDR, TAG_ADDR_ISO15);
+        if (is_nfc_unit()) {
+            if (!writeSysReg(i2c_reg::SET_RFCFG, i2c_rfcfg::R15 | i2c_rfcfg::T15)) return false;
+            delay_ms(2);
+        }
+        if (!writeSysReg(i2c_reg::SET_TAGADDR, TAG_ADDR_ISO15)) return false;
         delay_ms(5);
         return writeSysReg(i2c_reg::SET_MODE, i2c_mode::DEFAULT | i2c_mode::TAG_ISO15);
     }
 
-    // Write default emulation dump to EEPROM for GroveNFC.
-    // Called before activate to ensure card data is present.
-    template<typename Storage>
-    void writeEmulationDefaultDump(ProtocolKind protocol, const Storage &storage)
+    bool write_grove_emulation_image(ProtocolKind protocol, std::vector<uint8_t> data)
     {
-        if (is_nfc_unit()) return;  // NFCUnit uses RAM not EEPROM
-        std::vector<uint8_t> data = storage.load_emulator_default_dump(protocol);
-        uint16_t addr = 0;
-        // Use a static default if no custom dump is loaded
-        if (data.empty()) return;
-        // Custom dump loaded
-        if (data.size() < 4) return;
+        uint16_t addr;
+        size_t chunk = 32;
+        unsigned settle_ms = 2;
         switch (protocol) {
-        case ProtocolKind::MifareClassic: addr = TAG_ADDR_MFC1K; break;
-        case ProtocolKind::Iso15693:      addr = TAG_ADDR_ISO15; break;
-        default:                          addr = TAG_ADDR_NTAG213; break;
+        case ProtocolKind::MifareClassic:
+            if (data.size() != 1024) return false;
+            addr = TAG_ADDR_MFC1K;
+            chunk = 64;
+            settle_ms = 10;
+            data[4] = data[0] ^ data[1] ^ data[2] ^ data[3];
+            data[5] = 0x08;
+            data[6] = 0x04;
+            data[7] = 0x00;
+            break;
+        case ProtocolKind::Iso15693:
+            if (data.size() != 272) return false;
+            addr = TAG_ADDR_ISO15;
+            break;
+        case ProtocolKind::Iso14443A:
+            if (data.size() != 180) return false;
+            addr = TAG_ADDR_NTAG213;
+            data[3] = 0x88 ^ data[0] ^ data[1] ^ data[2];
+            data[8] = data[4] ^ data[5] ^ data[6] ^ data[7];
+            break;
+        default:
+            return false;
         }
-        writeSysReg(i2c_reg::SET_MODE, i2c_mode::DEFAULT | i2c_mode::TAG_NONE); delay_ms(2);
-        writeSysReg(i2c_reg::SET_TAGADDR, addr); delay_ms(2);
-        writeData(i2c_reg::EPROM, data.data(), data.size()); delay_ms(2);
-        writeMiscReg(i2c_reg::MISC_EPWR, 0x01); delay_ms(350);
+
+        if (!writeSysReg(i2c_reg::SET_TAGADDR, addr)) return false;
+        delay_ms(settle_ms);
+        for (size_t offset = 0; offset < data.size(); offset += chunk) {
+            const auto length = std::min(chunk, data.size() - offset);
+            if (!writeData(i2c_reg::EPROM + offset, data.data() + offset, length)) return false;
+            delay_ms(settle_ms);
+        }
+        if (!writeMiscReg(i2c_reg::MISC_EPWR, 0x01)) return false;
+        delay_ms(protocol == ProtocolKind::MifareClassic ? 500 : 320);
+        return true;
     }
 
     bool nfcunit_refresh_iso15_emulation()
@@ -3686,9 +3707,6 @@ private:
                 if (sector_auth_ok) break;
             }
 
-            emit_progress(std::string("Check Keys for Sector ") + std::to_string(sector) +
-                          (sector_auth_ok ? " OK" : " FAIL"));
-
             if (!sector_auth_ok) {
                 if (first_failed_sector < 0) first_failed_sector = sector;
                 continue;
@@ -3723,7 +3741,9 @@ private:
                         continue;
                     }
 
-                    out_lines[static_cast<size_t>(block)] = format_mfc_block_line(block, rx);
+                    auto &line = out_lines[static_cast<size_t>(block)];
+                    line = format_mfc_block_line(block, rx);
+                    emit_progress(line);
                     any_block_ok = true;
                     ++ok;
                 }
@@ -3748,14 +3768,12 @@ private:
                     if (writeData(i2c_reg::DATA, auth_frame, sizeof(auth_frame))) {
                         uint16_t auth_status = 0;
                         if (wait_status(STATUS_MIFARE1_AUTHOK, 80, &auth_status)) {
-                            read_ok = read_sector_blocks();
+                            read_sector_blocks();
                         }
                     }
                 }
             }
 
-            emit_progress("Read Sector " + std::to_string(sector) + " " +
-                          std::to_string(read_ok) + "/" + std::to_string(sector_blocks));
         }
 
         stopRF();
@@ -3781,6 +3799,7 @@ private:
 
     bool dumpNFCUnitMFU(const std::string &uid_hint,
                         std::vector<std::string> &out_lines,
+                        const std::function<void(const std::string &)> *progress,
                         std::string *error)
     {
         std::vector<uint8_t> uid;
@@ -3858,6 +3877,7 @@ private:
                 char prefix[8];
                 std::snprintf(prefix, sizeof(prefix), "%02u:", static_cast<unsigned>(p));
                 out_lines.push_back(std::string(prefix) + hex_compact(rx + i * 4, 4));
+                if (progress && *progress) (*progress)(out_lines.back());
             }
         }
 
@@ -3910,6 +3930,7 @@ private:
                 std::array<uint8_t, 16> data{};
                 if (st25r_mfc_read_plain_block(static_cast<uint8_t>(block), data)) {
                     out_lines[static_cast<size_t>(block)] = format_mfc_block_line(block, data);
+                    if (progress && *progress) (*progress)(out_lines[static_cast<size_t>(block)]);
                     any_ok = true;
                 }
             }
@@ -3961,17 +3982,6 @@ private:
         bool any_auth_ok = false;
         int first_failed_sector = -1;
 
-        auto emit_progress = [&](const std::string &line) {
-            if (progress && *progress) (*progress)(line);
-        };
-
-        auto key_to_hex = [](const std::array<uint8_t, 6> &key) {
-            char buf[13];
-            std::snprintf(buf, sizeof(buf), "%02X%02X%02X%02X%02X%02X",
-                          key[0], key[1], key[2], key[3], key[4], key[5]);
-            return std::string(buf);
-        };
-
         auto select_same_card = [&](std::vector<uint8_t> &sector_uid, uint8_t &sector_sak) {
             sector_uid.clear();
             sector_sak = 0;
@@ -3993,21 +4003,17 @@ private:
         // Phase 1: probe each sector with the key list and remember usable auth mode/key.
         for (int sector = 0; sector < sector_count; ++sector) {
             const int trailer_block = mfc_sector_trailer_block(sector);
-            std::string progress_line = "Check Keys for Sector " + std::to_string(sector) + " ";
 
             for (const auto &k : auth_keys) {
-                progress_line.push_back('.');
                 Crypto1Local probe_crypto;
                 if (authenticate_after_select(0x60, trailer_block, k, probe_crypto)) {
                     sector_auth[static_cast<size_t>(sector)] = {true, 0x60, k};
                     any_auth_ok = true;
-                    progress_line += " OK KeyA " + key_to_hex(k);
                     break;
                 }
                 if (authenticate_after_select(0x61, trailer_block, k, probe_crypto)) {
                     sector_auth[static_cast<size_t>(sector)] = {true, 0x61, k};
                     any_auth_ok = true;
-                    progress_line += " OK KeyB " + key_to_hex(k);
                     break;
                 }
             }
@@ -4015,8 +4021,6 @@ private:
             if (!sector_auth[static_cast<size_t>(sector)].valid && first_failed_sector < 0) {
                 first_failed_sector = sector;
             }
-            if (!sector_auth[static_cast<size_t>(sector)].valid) progress_line += " FAIL";
-            emit_progress(progress_line);
         }
 
         out_lines.assign(static_cast<size_t>(block_count), std::string());
@@ -4036,19 +4040,16 @@ private:
                 continue;
             }
 
-            int read_ok = 0;
             for (int i = 0; i < sector_blocks; ++i) {
                 const int block = first_block + i;
                 std::array<uint8_t, 16> data{};
                 if (st25r_mfc_read_block(crypto, static_cast<uint8_t>(block), data)) {
                     out_lines[static_cast<size_t>(block)] = format_mfc_block_line(block, data);
+                    if (progress && *progress) (*progress)(out_lines[static_cast<size_t>(block)]);
                     any_block_ok = true;
-                    ++read_ok;
                 }
             }
-            emit_progress("Read Sector " + std::to_string(sector) + " " +
-                          std::string(static_cast<size_t>(read_ok), '.') +
-                          " " + std::to_string(read_ok) + "/" + std::to_string(sector_blocks));
+
         }
 
         // Post-process: replace zero trailer keys with authenticated key
@@ -4104,7 +4105,8 @@ private:
 
     bool dumpNFCUnitISO15693(const std::string &uid_hint,
                              std::vector<std::string> &out_lines,
-                             std::string *error)
+                             const std::function<void(const std::string &)> *progress,
+                        std::string *error)
     {
         if (!configure_nfcv()) {
             if (error) *error = "ISO15693 init failed";
@@ -4186,6 +4188,7 @@ private:
             char prefix[8];
             std::snprintf(prefix, sizeof(prefix), "%02u:", static_cast<unsigned>(block));
             out_lines.push_back(std::string(prefix) + hex_compact(dec + 1, dec_len - 1));
+            if (progress && *progress) (*progress)(out_lines.back());
         }
 
         restore_iso14443a();
@@ -5808,7 +5811,8 @@ private:
         bool dumpGroveNTAG(const std::string &uid_hint,
                        const std::string &tag_type,
                        std::vector<std::string> &out_lines,
-                       std::string *error)
+                       const std::function<void(const std::string &)> *progress,
+                        std::string *error)
     {
         I2cCardInfo card;
         if (!readISO14A(card)) {
@@ -5902,6 +5906,7 @@ private:
                     std::snprintf(buf, sizeof(buf), "%02d: %02X%02X%02X%02X",
                                   blk, rx[i], rx[i+1], rx[i+2], rx[i+3]);
                     out_lines.push_back(buf);
+                    if (progress && *progress) (*progress)(out_lines.back());
                 }
             } else {
                 // Fill failed read with zero blocks
@@ -5918,6 +5923,7 @@ private:
 
                         bool dumpGroveISO15(const std::string &uid_hint,
                         std::vector<std::string> &out_lines,
+                        const std::function<void(const std::string &)> *progress,
                         std::string *error)
     {
         I2cCardInfo card;
@@ -5944,6 +5950,7 @@ private:
                 char buf[40]; std::snprintf(buf, sizeof(buf), "%02d: %02X%02X%02X%02X",
                     start, rx[1], rx[2], rx[3], rx[4]);
                 out_lines.push_back(buf);
+                if (progress && *progress) (*progress)(out_lines.back());
             } else {
                 break;
             }

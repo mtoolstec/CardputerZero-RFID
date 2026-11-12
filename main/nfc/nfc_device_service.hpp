@@ -1354,6 +1354,8 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         if (transport_) transport_->close();
         transport_.reset();
+        if (grove_emu_running_ && i2c_device_) i2c_device_->stopEmulation();
+        grove_emu_running_ = false;
         i2c_device_.reset();
         spi_device_.reset();
         connection_ = ConnectionState{};
@@ -4129,22 +4131,36 @@ public:
         nfc_unit_ndef_uri_ = uri.empty() ? "https://m5stack.com" : uri;
     }
 
-    // Generate NTAG213 NDEF pages from a URI and save to the GroveNFC emulator JSON.
-    bool set_grove_ntag_ndef_uri(const std::string &uri)
+    std::string grove_ndef_uri(ProtocolKind protocol) const
+    {
+        return storage_.grove_ndef_uri(protocol);
+    }
+
+    bool set_grove_ndef_uri(ProtocolKind protocol, const std::string &uri, std::string *error)
     {
         const std::string safe_uri = uri.empty() ? "https://m5stack.com" : uri;
-        const size_t pages = 45; // NTAG213
-        auto mem = default_nfcunit_ntag_memory(pages, safe_uri);
-        // Write to both the display JSON (ntag213_0.json) and the binary default dump
-        // that grovenfc_activate→writeEmulationDefaultDump reads.
-        bool ok = storage_.save_emulator_json_from_ntag_pages(mem);
-        storage_.save_emulator_default_dump(ProtocolKind::Iso14443A, mem);
-        // Invalidate the in-memory cache so the EMU tab reloads from JSON
+        std::vector<uint8_t> mem;
+        if (protocol == ProtocolKind::Iso15693) {
+            // Type 5 CC, followed by the NDEF Message TLV in user memory.
+            // Leave optional reader commands disabled.
+            mem = {0xE1, 0x40, 0x1F, 0x00};
+            const auto tlv = build_ndef_uri_tlv(safe_uri);
+            mem.insert(mem.end(), tlv.begin(), tlv.end());
+            mem.resize(256);
+        } else {
+            mem = default_nfcunit_ntag_memory(45, safe_uri);
+        }
+        if (!storage_.save_grove_ndef_blocks(protocol, mem, safe_uri)) {
+            if (error) *error = "Set URL failed (save error)";
+            return false;
+        }
+        if (protocol == ProtocolKind::Iso14443A)
+            storage_.save_emulator_default_dump(protocol, mem);
         {
             std::lock_guard<std::mutex> lk(pending_log_mutex_);
-            emu_slot_cache_.erase({ProtocolKind::Iso14443A, 0});
+            emu_slot_cache_.erase({protocol, 0});
         }
-        return ok;
+        return !grovenfc_emulation_running() || grovenfc_activate(protocol, 0, error);
     }
 
     bool emulation_allowed(std::string *reason = nullptr) const
@@ -4185,9 +4201,7 @@ public:
             }
         }
 
-        // Save to emulator_defaults so the existing writeEmulationDefaultDump()
-        // (called by grovenfc_activate) picks up the JSON-sourced data instead
-        // of the old hardcoded defaults.
+        // Keep the NFC Unit default dump in sync with the selected JSON profile.
         if (!bytes.empty()) {
             storage_.save_emulator_default_dump(protocol, bytes);
         }
@@ -4225,10 +4239,48 @@ public:
         return ok;
     }
 
+    bool grovenfc_emulation_running() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return grove_emu_running_;
+    }
+
     // Activate GroveNFC emulation for the given protocol/slot (GroveNFC 0x48 only).
     bool grovenfc_activate(ProtocolKind protocol, int slot_index, std::string *error = nullptr)
     {
         stop_nfcunit_emulation_worker(false);
+        const bool grove = connection_state().device_kind == DeviceKind::GroveNFC;
+        std::vector<uint8_t> image;
+        if (grove) {
+            if (!grovenfc_deactivate()) {
+                if (error) *error = "GroveNFC pause failed";
+                return false;
+            }
+            const auto lines = i2c_emulator_dump_lines(protocol);
+            const size_t stride = emulator_block_hex_chars(protocol) / 2;
+            const size_t blocks = protocol == ProtocolKind::Iso14443A ? 45 : 64;
+            const size_t header = protocol == ProtocolKind::Iso15693 ? 16 : 0;
+            if (!lines.empty()) {
+                image.resize(header + blocks * stride);
+                for (const auto &line : lines) {
+                    const size_t colon = line.find(':');
+                    const size_t index = std::stoul(line.substr(0, colon), nullptr, 16);
+                    if (index >= blocks) continue;
+                    const auto bytes = NfcStorage::hex_string_to_bytes(line.substr(colon + 2));
+                    if (bytes.size() == stride)
+                        std::copy(bytes.begin(), bytes.end(), image.begin() + header + index * stride);
+                }
+                if (header != 0) {
+                    std::lock_guard<std::mutex> cache_lock(pending_log_mutex_);
+                    const auto uid = NfcStorage::hex_string_to_bytes(emu_slot_cache_[{protocol, 0}].uid);
+                    const uint8_t example_uid[] = {0xC1, 0xC6, 0x02, 0xB9, 0x50, 0x00, 0x07, 0xE0};
+                    std::copy(std::begin(example_uid), std::end(example_uid), image.begin());
+                    if (uid.size() == 8 && uid.front() == 0xE0)
+                        std::reverse_copy(uid.begin(), uid.end(), image.begin());
+                }
+            }
+        }
+
         std::lock_guard<std::mutex> lock(mutex_);
         if (!i2c_device_ || !i2c_device_->is_open() ||
             (i2c_device_->device_kind() != DeviceKind::GroveNFC &&
@@ -4249,14 +4301,17 @@ public:
             return false;
         }
 
-        stop_nfcunit_emulation_worker(false);
-        i2c_device_->setSlot((uint8_t)clamped_slot);
-        i2c_device_->writeMiscReg(0x0020, 0x00);  // MISC_RFON = 0 → stop RF
+        if (!i2c_device_->writeMiscReg(i2c_reg::MISC_RFON, 0x00) ||
+            !i2c_device_->setSlot(static_cast<uint8_t>(clamped_slot))) {
+            if (error) *error = "GroveNFC RF or slot setup failed";
+            return false;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
-
-        // Write default dump to EEPROM — now sources from emulator_defaults
-        // which was refreshed by reload_i2c_profile_from_cache() before this call.
-        i2c_device_->writeEmulationDefaultDump(protocol, storage_);
+        if (protocol != ProtocolKind::Iso14443B &&
+            !i2c_device_->write_grove_emulation_image(protocol, std::move(image))) {
+            if (error) *error = "GroveNFC image missing or EEPROM write failed";
+            return false;
+        }
 
         bool ok = false;
         const char *emu_type = "NTAG";
@@ -4273,12 +4328,11 @@ public:
         default:
             ok = i2c_device_->startEmulationNtag213(); break;
         }
+        grove_emu_running_ = ok;
         if (!ok) {
             if (error) *error = (std::string("GroveNFC activate failed: ") + emu_type).c_str();
-            push_log(std::string("ERR GroveNFC EMU fail: ") + emu_type);
             NfcHexLog::get().log_event("emu", (std::string("FAIL ") + emu_type).c_str());
         } else {
-            push_log(std::string("OK GroveNFC EMU: ") + emu_type);
             NfcHexLog::get().log_event("emu", (std::string("OK ") + emu_type).c_str());
         }
         return ok;
@@ -4295,7 +4349,9 @@ public:
             nfc_unit_emu_running_.store(false);
             return ok_listener || ok_mode;
         }
-        return i2c_device_->stopEmulation();
+        if (!i2c_device_->stopEmulation()) return false;
+        grove_emu_running_ = false;
+        return true;
     }
 
     void set_default_slot()
@@ -7260,8 +7316,16 @@ private:
         std::string error;
         bool success = false;
 
+        const std::function<void(const std::string &)> emit_read_data = [this](const std::string &line) {
+            // Reader callbacks also report status. Data rows start with their index.
+            if (!line.empty() && std::isdigit(static_cast<unsigned char>(line.front())))
+                push_log(line);
+        };
+
         auto emit_dump_lines = [this](const std::vector<std::string> &lines) {
-            for (const auto &line : lines) push_log(line);
+            for (const auto &line : lines) {
+                if (!line.empty()) push_log(line);
+            }
         };
 
         auto bytes_to_hex = [](const std::vector<uint8_t> &bytes) {
@@ -7390,24 +7454,18 @@ private:
                         for (const auto &k : file_keys) append_key(k);
                     }
 
-                    char key_msg[48];
-                    std::snprintf(key_msg, sizeof(key_msg), "MFC Key loaded: %d", static_cast<int>(mfc_default_keys.size()));
-                    push_log(key_msg);
                 }
 
                 std::vector<std::string> dump_lines;
                 std::string i2c_magic_type;
                 std::string dump_err;
-                const std::function<void(const std::string &)> dump_progress = [this](const std::string &line) {
-                    push_log(line);
-                };
                 if (!success && i2c_dev->dumpCard(dump_protocol,
                                                   record.tag.uid,
                                                   record.tag.tag_type,
                                                   is_mfc ? &mfc_default_keys : nullptr,
                                                   &i2c_magic_type,
                                                   dump_lines,
-                                                  is_mfc ? &dump_progress : nullptr,
+                                                  &emit_read_data,
                                                   &dump_err)) {
                     record.tag.protocol = dump_protocol;
                     record.tag.raw_data = dump_lines;
@@ -7427,9 +7485,6 @@ private:
                         record.mifare_dump->attack.method = AttackMethod::DefaultKeys;
                         record.mifare_dump->attack.status = AttackStatus::Success;
                         record.mifare_dump->attack.dump_obtained = !dump_lines.empty();
-                        emit_dump_lines(dump_lines);
-                    } else {
-                        emit_dump_lines(dump_lines);
                     }
 
                     push_log("Tip: Press Ctrl+S to save dump.");
@@ -7458,21 +7513,22 @@ private:
                 std::string dump_err;
                 bool dumped = false;
 
+                const auto emit_block = [this, &bytes_to_hex](int block, const std::vector<uint8_t> &data) {
+                    if (data.empty()) return;
+                    char prefix[8];
+                    std::snprintf(prefix, sizeof(prefix), "%02d:", block);
+                    push_log(std::string(prefix) + bytes_to_hex(data));
+                };
                 if (is_ntag) {
                     push_log("> Dumping SPI ST25R (NTAG/MFU)...");
                     int pages = 0;
-                    dumped = spi_dev->scan_and_dump_mfu(&card_info, &blocks, &pages, &dump_err);
+                    dumped = spi_dev->scan_and_dump_mfu(&card_info, &blocks, &pages, &dump_err, emit_block);
                 } else if (p == ProtocolKind::Iso15693) {
                     push_log("> Dumping SPI ST25R (ISO15693)...");
-                    dumped = spi_dev->scan_and_dump_iso15693(&card_info, &blocks, &dump_err);
+                    dumped = spi_dev->scan_and_dump_iso15693(&card_info, &blocks, &dump_err, nullptr, emit_block);
                 } else {
                     push_log("> Dumping SPI ST25R (Gen1A)...");
-                    dumped = spi_dev->scan_and_dump_gen1a(&card_info, &blocks, &dump_err,
-                        [this, &bytes_to_hex](int block, const std::vector<uint8_t> &data) {
-                            char prefix[8];
-                            std::snprintf(prefix, sizeof(prefix), "%02d:", block);
-                            push_log(data.empty() ? "ERR block " + std::to_string(block) : std::string(prefix) + bytes_to_hex(data));
-                        });
+                    dumped = spi_dev->scan_and_dump_gen1a(&card_info, &blocks, &dump_err, emit_block);
                 }
 
                 if (dumped) {
@@ -7515,7 +7571,6 @@ private:
                     record.mifare_dump->attack.dump_obtained = !dump_lines.empty();
 
                     if (is_ntag || is_iso15) {
-                        emit_dump_lines(dump_lines);
                         if (!dump_err.empty()) push_log(std::string("WARN ") + dump_err);
                         push_log("Tip: Press Ctrl+S to save dump.");
                     } else {
@@ -7591,17 +7646,13 @@ private:
                             push_log("> Dumping ISO15693 blocks...");
                             std::vector<std::vector<uint8_t>> blocks;
                             std::string dump_err;
-                            if (client.iso15693_read_all_blocks(&blocks, &dump_err, nullptr)) {
-                                std::vector<std::string> dump_lines;
-                                dump_lines.reserve(blocks.size());
+                            if (client.iso15693_read_all_blocks(&blocks, &dump_err, emit_read_data)) {
                                 for (size_t i = 0; i < blocks.size(); ++i) {
                                     char prefix[8];
                                     std::snprintf(prefix, sizeof(prefix), "%02d:", static_cast<int>(i));
                                     const std::string line = std::string(prefix) + bytes_to_hex(blocks[i]);
-                                    dump_lines.push_back(line);
                                     record.tag.raw_data.push_back(line);
                                 }
-                                emit_dump_lines(dump_lines);
                                 push_log("Tip: Press Ctrl+S to save dump.");
                                 success = !record.tag.raw_data.empty();
                             } else {
@@ -7614,19 +7665,15 @@ private:
                             std::vector<std::vector<uint8_t>> pages;
                             std::string ntag_type;
                             std::string dump_err;
-                            if (client.ntag_read_all_pages(&pages, &ntag_type, &dump_err, nullptr)) {
+                            if (client.ntag_read_all_pages(&pages, &ntag_type, &dump_err, emit_read_data)) {
                                 if (!ntag_type.empty()) record.tag.tag_type = ntag_type;
-                                std::vector<std::string> dump_lines;
-                                dump_lines.reserve(pages.size());
                                 for (size_t i = 0; i < pages.size(); ++i) {
                                     char prefix[8];
                                     std::snprintf(prefix, sizeof(prefix), "%02d:", static_cast<int>(i));
                                     const std::string line = std::string(prefix) + bytes_to_hex(pages[i]);
-                                    dump_lines.push_back(line);
                                     record.tag.raw_data.push_back(line);
                                 }
-                                emit_dump_lines(dump_lines);
-                                if (static_cast<int>(dump_lines.size()) > 24)
+                                if (pages.size() > 24)
                                     push_log("Tip: Press Ctrl+S to save dump.");
                                 success = !record.tag.raw_data.empty();
                             } else {
@@ -7682,7 +7729,7 @@ private:
                                 }
                                 std::string mfc_err;
                                 mfc_read_ok = client.read_mifare_standard(uid_bytes, sc, &mfc_blocks, &mfc_err,
-                                    [this](const std::string &line) { push_log(line); }, dictionary, &key_map);
+                                    emit_read_data, dictionary, &key_map);
                                 {
                                     std::lock_guard<std::mutex> lock(mutex_);
                                     mifare_read_key_maps_[live_tag.uid] = std::move(key_map);
@@ -8190,6 +8237,7 @@ private:
     uint16_t spi_emu_atqa_ = 0;
     uint8_t spi_emu_sak_ = 0;
     std::vector<uint8_t> spi_ntag_mem_;  // Stable JSON snapshot: MFC blocks or NTAG pages
+    bool grove_emu_running_ = false;
     std::atomic<bool> nfc_unit_emu_running_{false};
     ProtocolKind nfc_unit_emu_protocol_ = ProtocolKind::Iso14443A;
     int nfc_unit_emu_profile_ = 0;  // 0=NTAG213, 1=ISO15693
