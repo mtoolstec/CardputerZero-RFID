@@ -92,3 +92,4 @@
 - Icon: `share/images/ic_rfid.png`; screenshots: `screenshots/01.png` through `04.png`.
 - Six fake-transport/parser regression suites passed on the macOS host and the ARM64 device at `192.168.0.115`. Installed `rfid 1.0.4` on that device; APPLaunch service remained active and the transferred package SHA-256 matched. Physical antenna behavior is unverified for this package.
 - Source release commit: `c3172da`, pushed to `origin/main`.
+- GitHub Release: https://github.com/mtoolstec/CardputerZero-RFID/releases/tag/v1.0.4 (Debian package attached). Application Store update remains pending portal login/submission.
