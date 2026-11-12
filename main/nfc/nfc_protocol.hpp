@@ -2072,6 +2072,63 @@ public:
 
     // ── ISO15693 data dump ───────────────────────────────────────────────────
 
+    bool iso15693_write_verified(const std::vector<uint8_t> &uid, uint8_t block,
+                                  const std::vector<uint8_t> &data, std::string *error)
+    {
+        if (uid.size() != 8 || data.size() != 4) {
+            if (error) *error = "Expected an eight-byte UID and four-byte block";
+            return false;
+        }
+        const auto crc15693 = [](const uint8_t *bytes, size_t size) {
+            uint16_t crc = 0xFFFF;
+            for (size_t i = 0; i < size; ++i) {
+                crc ^= bytes[i];
+                for (int bit = 0; bit < 8; ++bit)
+                    crc = (crc >> 1) ^ ((crc & 1) ? 0x8408 : 0);
+            }
+            return static_cast<uint16_t>(~crc);
+        };
+        const auto exchange = [&](uint8_t opcode, const std::vector<uint8_t> &payload,
+                                  std::vector<uint8_t> &response) {
+            // Killer raw ISO15693 exchange requires the ACK flag and tag number.
+            std::vector<uint8_t> frame = {0x80, 0x00, 0x22, opcode};
+            frame.insert(frame.end(), uid.rbegin(), uid.rend());
+            frame.push_back(block);
+            frame.insert(frame.end(), payload.begin(), payload.end());
+            const uint16_t crc = crc15693(frame.data() + 2, frame.size() - 2);
+            frame.push_back(static_cast<uint8_t>(crc));
+            frame.push_back(static_cast<uint8_t>(crc >> 8));
+            return in_communicate_thru_raw(frame.data(), frame.size(), &response, error);
+        };
+
+        std::vector<uint8_t> response;
+        // Some tags program the block without an ACK. Require exact readback.
+        if (exchange(0x21, data, response) && response.size() >= 2 &&
+            response[0] == 0 && (response[1] & 1)) {
+            if (error) *error = "tag rejected write";
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        response.clear();
+        if (!exchange(0x20, {}, response)) return false;
+        if (response.size() == 8) {
+            const uint16_t expected = crc15693(response.data() + 1, 5);
+            const uint16_t received = response[6] | (uint16_t(response[7]) << 8);
+            if (expected != received) {
+                if (error) *error = "readback CRC mismatch";
+                return false;
+            }
+            response.resize(6);
+        }
+        if (response.size() != 6 || response[0] != 0 || response[1] != 0 ||
+            !std::equal(data.begin(), data.end(), response.begin() + 2)) {
+            if (error) *error = "readback did not match";
+            return false;
+        }
+        if (error) error->clear();
+        return true;
+    }
+
     // Read all ISO15693 blocks via InDataExchange.
     // Target must already be selected (in_list_passive_target_iso15693 returned true).
     // Reads single blocks until failure (end of memory or command error).

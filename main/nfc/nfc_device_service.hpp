@@ -2535,70 +2535,48 @@ private:
                                               const std::function<void(const std::string &)> &emit,
                                               std::string *error)
     {
-        std::map<int, std::vector<uint8_t>> blk_data;
-        int line_idx = 0;
-        for (const auto &line : lines) {
-            if (line.empty()) { ++line_idx; continue; }
-            size_t colon = line.find(':');
-            int blk = line_idx;
-            std::string hex;
-            if (colon != std::string::npos && colon + 1 < line.size()) {
-                try { blk = std::stoi(line.substr(0, colon)); } catch (...) { blk = line_idx; }
-                hex = line.substr(colon + 1);
-            } else {
-                hex = line;
-            }
-            if (blk < 0) { ++line_idx; continue; }
-            auto &dst = blk_data[blk];
-            for (size_t i = 0; i + 1 < hex.size(); i += 2) {
-                if (!std::isxdigit(static_cast<unsigned char>(hex[i])) ||
-                    !std::isxdigit(static_cast<unsigned char>(hex[i + 1]))) continue;
-                dst.push_back(static_cast<uint8_t>(std::strtoul(hex.substr(i, 2).c_str(), nullptr, 16)));
-            }
-            ++line_idx;
+        const auto uid = NfcStorage::hex_string_to_bytes(live_tag.uid);
+        if (uid.size() != 8) {
+            if (error) *error = "Invalid ISO15693 target UID";
+            return false;
         }
 
-        if (blk_data.empty()) {
+        std::map<int, std::vector<uint8_t>> blocks;
+        for (size_t index = 0; index < lines.size(); ++index) {
+            const auto &line = lines[index];
+            if (line.empty()) continue;
+            const size_t colon = line.find(':');
+            char *end = nullptr;
+            const long block = colon == std::string::npos
+                ? static_cast<long>(index) : std::strtol(line.c_str(), &end, 10);
+            const auto payload = line.substr(colon == std::string::npos ? 0 : colon + 1);
+            std::string hex;
+            for (unsigned char ch : payload) {
+                if (!std::isspace(ch)) hex.push_back(static_cast<char>(ch));
+            }
+            if ((end && (end == line.c_str() || end != line.c_str() + colon)) ||
+                block < 0 || block > 255 || hex.size() != 8 ||
+                !std::all_of(hex.begin(), hex.end(), [](unsigned char ch) { return std::isxdigit(ch); })) {
+                if (error) *error = "Invalid ISO15693 block at row " + std::to_string(index);
+                return false;
+            }
+            blocks[static_cast<int>(block)] = NfcStorage::hex_string_to_bytes(hex);
+        }
+        if (blocks.empty()) {
             if (error) *error = "No block data to write";
             return false;
         }
 
-        int written = 0;
-        for (auto &kv : blk_data) {
-            const int blk = kv.first;
-            auto &data = kv.second;
-            if (data.size() < 4) data.resize(4, 0);
-
-            std::vector<uint8_t> cmd = {0x22, 0x21};
-            for (int i = 7; i >= 0; --i) {
-                if (static_cast<size_t>(i) < live_tag.uid.size() / 2)
-                    cmd.push_back(static_cast<uint8_t>(std::strtoul(live_tag.uid.substr(i * 2, 2).c_str(), nullptr, 16)));
-                else
-                    cmd.push_back(0);
+        for (const auto &[block, data] : blocks) {
+            if (!client.iso15693_write_verified(uid, static_cast<uint8_t>(block), data, error)) {
+                if (error) *error = "ISO15693 block " + std::to_string(block) + ": " + *error;
+                return false;
             }
-            cmd.push_back(static_cast<uint8_t>(blk & 0xFF));
-            cmd.push_back(static_cast<uint8_t>((blk >> 8) & 0xFF));
-            cmd.insert(cmd.end(), data.begin(), data.begin() + 4);
-
-            std::vector<uint8_t> resp;
-            std::string wr_err;
-            if (client.in_data_exchange(0x01, cmd, &resp, &wr_err)) {
-                ++written;
-                // Show block index + hex value in footer
-                char progress[64];
-                std::snprintf(progress, sizeof(progress), "Write block %d:%02X%02X%02X%02X",
-                              blk, data[0], data[1], data[2], data[3]);
-                emit(progress);
-            } else {
-                char msg[64];
-                std::snprintf(msg, sizeof(msg), "Write block %d failed", blk);
-                emit(msg);
-            }
+            emit("Write block " + std::to_string(block) + ":" + NfcStorage::bytes_to_hex_string(data));
         }
-
-        emit("ISO15693 write done: " + std::to_string(written) + " blocks");
+        emit("ISO15693 write verified: " + std::to_string(blocks.size()) + " blocks");
         if (error) error->clear();
-        return written > 0;
+        return true;
     }
 
 public:
