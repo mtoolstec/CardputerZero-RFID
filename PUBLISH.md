@@ -90,4 +90,5 @@
 - Package: `build/rfid_1.0.4-m5stack1_arm64.deb`; package `rfid`, version `1.0.4`, architecture `arm64`.
 - SHA-256: `04f9f9c8a964d3f002e0bd3a1ac190f6648a0744089c95e22d232a11ada1d2d6`.
 - Icon: `share/images/ic_rfid.png`; screenshots: `screenshots/01.png` through `04.png`.
-- Six fake-transport/parser regression suites passed on the macOS host. Device run and installation could not be checked because `192.168.0.120:22` refused connections. Physical antenna behavior is unverified for this package.
+- Six fake-transport/parser regression suites passed on the macOS host and the ARM64 device at `192.168.0.115`. Installed `rfid 1.0.4` on that device; APPLaunch service remained active and the transferred package SHA-256 matched. Physical antenna behavior is unverified for this package.
+- Source release commit: `c3172da`, pushed to `origin/main`.
