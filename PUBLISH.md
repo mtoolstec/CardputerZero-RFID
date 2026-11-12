@@ -93,3 +93,4 @@
 - Six fake-transport/parser regression suites passed on the macOS host and the ARM64 device at `192.168.0.115`. Installed `rfid 1.0.4` on that device; APPLaunch service remained active and the transferred package SHA-256 matched. Physical antenna behavior is unverified for this package.
 - Source release commit: `c3172da`, pushed to `origin/main`.
 - GitHub Release: https://github.com/mtoolstec/CardputerZero-RFID/releases/tag/v1.0.4 (Debian package attached). Application Store update remains pending portal login/submission.
+- AppStore portal submission: accepted under `@whywilson`; automated processing run https://github.com/CardputerZero/packages/actions/runs/43322913050 succeeded. Release PR https://github.com/CardputerZero/packages/pull/283 merged on 2026-11-13 (Asia/Shanghai). The portal's My packages page shows `rfid 1.0.4` as "Merged, index rebuilding…"; APT index visibility may lag the merge.
