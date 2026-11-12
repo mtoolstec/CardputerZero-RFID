@@ -3340,21 +3340,27 @@ public:
             }
 
             // Logging AUTH before replying adds filesystem latency to its deadline.
-            if (!((frame.size()==2 || frame.size()==4) && (frame[0]==0x60 || frame[0]==0x61)))
+            if (!((frame.size()==2 || frame.size()==4) && (frame[0]==0x60 || frame[0]==0x61)) &&
+                !(!pending_auth && !frame.empty() &&
+                  (frame[0] == 0x26 || frame[0] == 0x52 || frame[0] == 0x93)))
                 NfcHexLog::get().log_rx(spi ? "MFKEY-SPI" : "MFKEY-I2C", frame.data(), frame.size());
             if (spi && !pending_auth) {
+                const auto send_discovery = [&](const uint8_t *data, uint8_t size, bool crc) {
+                    return spi ? spi->send_listener_frame(data, size, crc)
+                               : dev->nfcunit_send_listener_frame(data, size, crc);
+                };
                 const uint8_t u[] = {uint8_t(uid >> 24), uint8_t(uid >> 16), uint8_t(uid >> 8), uint8_t(uid)};
                 if (frame.size() == 1 && (frame[0] == 0x26 || frame[0] == 0x52)) {
                     const uint8_t atqa[] = {0x04, 0x00};
-                    spi->send_listener_frame(atqa, 2, false); continue;
+                    send_discovery(atqa, 2, false); continue;
                 }
                 if (frame.size() == 2 && frame[0] == 0x93 && frame[1] == 0x20) {
                     const uint8_t cl[] = {u[0], u[1], u[2], u[3], uint8_t(u[0]^u[1]^u[2]^u[3])};
-                    spi->send_listener_frame(cl, 5, false); continue;
+                    send_discovery(cl, 5, false); continue;
                 }
                 if (frame.size() >= 7 && frame[0] == 0x93 && frame[1] == 0x70) {
                     const uint8_t sak[] = {0x08};
-                    spi->send_listener_frame(sak, 1, true); continue;
+                    send_discovery(sak, 1, true); continue;
                 }
             }
 
@@ -3468,7 +3474,7 @@ public:
         const std::vector<uint8_t> uid_vec = {uid[0], uid[1], uid[2], uid[3]};
         const bool emu_ok = use_spi
             ? spi_device_->start_listener_a(uid_vec, kNfcUnitMfc1kAtqa, kNfcUnitMfc1kSak, error)
-            : i2c_device_->nfcunit_start_listener_a(uid_vec, kNfcUnitMfc1kAtqa, kNfcUnitMfc1kSak);
+            : i2c_device_->nfcunit_start_listener_a(uid_vec, kNfcUnitMfc1kAtqa, kNfcUnitMfc1kSak, false, true);
         if (!emu_ok) {
             if (error) *error = "NFC Unit listener init failed";
             return false;

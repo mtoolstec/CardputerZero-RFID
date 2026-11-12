@@ -1768,6 +1768,7 @@ private:
             const bool keep_usb_nfc_connected =
                 leaving_conn.connected &&
                 (leaving_conn.device_kind == nfc_app::DeviceKind::ST25RNFC ||
+                 leaving_conn.device_kind == nfc_app::DeviceKind::NFCUnit ||
                  leaving_conn.device_kind == nfc_app::DeviceKind::GroveNFC ||
                  (leaving_conn.endpoint.kind == nfc_app::TransportKind::UsbSerial &&
                   (leaving_conn.device_kind == nfc_app::DeviceKind::PN532 ||
@@ -3094,7 +3095,10 @@ private:
         // Reset MFKey wizard state when (re-)entering the tool
         if (active_tool_idx_ == 2 || active_tool_idx_ == 3 || active_tool_idx_ == 4) {
             mfkey_step_           = 0;
-            mfkey_uid_input_      = "";
+            mfkey_uid_input_      = active_tool_idx_ == 2 &&
+                (service_.connection_state().device_kind == nfc_app::DeviceKind::NFCUnit ||
+                 service_.connection_state().device_kind == nfc_app::DeviceKind::ST25RNFC)
+                ? "11223344" : "";
             mfkey_results_.clear();
             mfkey_result_idx_     = 0;
             mfkey_save_mode_      = false;
@@ -5621,7 +5625,7 @@ private:
                 create_text_mono(parent, 12, 27, uid.c_str(), 0x00FFAA, 12);
                 create_text(parent, 12, 49, mfkey_uid_scan_pending_ ? "Reading original card UID..." :
                     (nfc_cap ? "R: Read original card UID" : "8 hex digits, or leave empty"), 0x888888, 10);
-                if (nfc_cap) {
+                if (nfc_cap || service_.connection_state().device_kind == nfc_app::DeviceKind::NFCUnit) {
                     create_text(parent, 12, 69, "Enter: capture  Hex: edit UID", 0x888888, 10);
                     create_footer(parent, ui_message_);
                 }

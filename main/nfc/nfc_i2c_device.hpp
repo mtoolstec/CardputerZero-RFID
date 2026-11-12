@@ -914,7 +914,7 @@ public:
     bool nfcunit_start_listener_a(const std::vector<uint8_t> &uid,
                                   uint16_t atqa,
                                   uint8_t sak,
-                                  bool keep_auto_collision = false)
+                                  bool keep_auto_collision = false, bool auto_discovery = false)
     {
         if (!is_open() || !is_nfc_unit()) return false;
         if (!(uid.size() == 4 || uid.size() == 7)) return false;
@@ -1093,6 +1093,7 @@ public:
         nfcunit_listener_irq_latch_ = 0;
         nfcunit_listener_mode_f_ = false;
         nfcunit_listener_keep_auto_collision_ = keep_auto_collision;
+        nfcunit_listener_auto_discovery_ = auto_discovery;
 
         return nfcunit_listener_enter_off();
     }
@@ -1389,6 +1390,7 @@ private:
     bool nfcunit_listener_data_flag_ = false;
     bool nfcunit_listener_mode_f_ = false;
     bool nfcunit_listener_mfclassic_raw_rx_ = false;
+    bool nfcunit_listener_auto_discovery_ = false;
     bool nfcunit_listener_keep_auto_collision_ = false;
     uint16_t nfcunit_listener_active_idle_ticks_ = 0;
     uint8_t nfcunit_listener_bitrate_ = 0xFF;  // 0:106, 1:212, 2:424, 0xFF:invalid
@@ -1731,6 +1733,9 @@ private:
         }
 
         st25r_change_bits(0x0A, 0x80, 0x00);  // set no_crc_rx
+        if (nfcunit_listener_auto_discovery_) {
+            st25r_write_reg(0x03, ST25R_MODE_LISTEN_NFCA);
+        }
 
         if (previous_state == NfcUnitListenerState::Active && !nfcunit_listener_wakeup_) {
             if (nfcunit_listener_mode_f_) {
@@ -1796,7 +1801,7 @@ private:
 
         if (nfcunit_listener_mode_f_) {
             st25r_change_bits(0x08, 0x04, 0x09);  // Disable NFC-F auto response
-        } else {
+        } else if (!nfcunit_listener_auto_discovery_) {
             st25r_change_bits(0x08, 0x01, 0x00);  // Disable auto response for NFC-A
         }
         (void)nfcunit_listener_take_irq(ST25R_I_PAR32 | ST25R_I_CRC32 | ST25R_I_ERR232 | ST25R_I_ERR132);
@@ -1956,10 +1961,9 @@ private:
         }
         if (irq32 & ST25R_I_EOF32) {
             nfcunit_listener_trace("ready eof -> off");
-            if (!nfcunit_listener_mode_f_) {
-                nfcunit_listener_trace("ready eof -> idle");
-                return nfcunit_listener_enter_idle();
-            }
+            // Restore bitrate-detection mode after an aborted selection.
+            // Entering IDLE directly leaves MODE at listen-A (0x88), so
+            // later RF fields cannot restart automatic anticollision.
             return nfcunit_listener_enter_off();
         }
         return true;
@@ -1988,6 +1992,17 @@ private:
                 const uint16_t to_read = std::min<uint16_t>(fifo_cnt, sizeof(raw));
                 (void)st25r_fifo_read(raw, static_cast<uint8_t>(to_read));
 
+                // RXE from the hardware-handled WUPA can remain latched
+                // when selection promotes READY to ACTIVE. It is not a bad
+                // application frame: resetting here interrupts selection/AUTH.
+                if ((to_read == 1 && (raw[0] == 0x52 || raw[0] == 0x26)) ||
+                    (to_read == 2 && raw[0] == 0x93 && raw[1] == 0x20)) {
+                    frame.assign(raw, raw + to_read);
+                    st25r_cmd(0xD1);
+                    return true;
+                }
+                nfcunit_listener_trace("bad irq", irq32);
+                nfcunit_listener_trace_bytes("bad fifo", raw, to_read);
                 st25r_cmd(0xDB);  // CLEAR_FIFO
                 st25r_cmd(0xD1);  // UNMASK_RECEIVE_DATA
                 if (nfcunit_listener_wakeup_) {
@@ -1999,11 +2014,14 @@ private:
             }
 
             const uint16_t payload_len = (nfcunit_listener_mode_f_ || nfcunit_listener_mfclassic_raw_rx_) ? fifo_cnt : static_cast<uint16_t>(fifo_cnt - 2);
-            const uint16_t to_read = std::min<uint16_t>(payload_len, 96);
+            // Drain CRC bytes too: leaving them in FIFO prefixes the next
+            // AUTH frame with stale selection data.
+            const uint16_t to_read = std::min<uint16_t>(fifo_cnt, 96);
             uint8_t raw[96] = {0};
             if (st25r_fifo_read(raw, static_cast<uint8_t>(to_read))) {
+                nfcunit_listener_trace_bytes("active fifo", raw, to_read);
                 nfcunit_listener_data_flag_ = true;
-                frame.assign(raw, raw + to_read);
+                frame.assign(raw, raw + std::min<uint16_t>(payload_len, to_read));
                 nfcunit_listener_trace("rx frame bytes", static_cast<uint32_t>(to_read));
                 if (!frame.empty()) return true;
             }
